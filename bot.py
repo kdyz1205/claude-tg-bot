@@ -34,6 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress httpx INFO noise (getUpdates polling every 10s fills the log)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # Auth filter
 auth_filter = filters.User(user_id=config.AUTHORIZED_USER_ID)
 
@@ -104,6 +107,7 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     claude_agent._pending_messages.pop(chat_id, None)
     # Force-release the lock by clearing the session (new messages will start fresh)
     claude_agent._claude_sessions.pop(chat_id, None)
+    claude_agent._save_sessions()
     # Kill any claude.cmd child processes
     try:
         import subprocess
