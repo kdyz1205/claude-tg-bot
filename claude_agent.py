@@ -266,7 +266,7 @@ async def _run_claude_cli(
         if err:
             logger.error(f"Claude CLI stderr: {err[:500]}")
             # Don't show raw errors to user unless there's nothing else
-            if "error" in err.lower() or "Error" in err:
+            if "error" in err.lower():
                 response = f"⚠️ {err[:500]}"
             else:
                 response = "✅ 任务已执行。"
@@ -364,7 +364,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
             _save_sessions()
             logger.info(f"Chat {chat_id}: session_id = {new_session_id[:12]}...")
         else:
-            logger.warning(f"Chat {chat_id}: no session_id returned")
+            logger.debug(f"Chat {chat_id}: no session_id returned (rate-limited or empty response)")
 
         await _send_response(chat_id, response, context)
 

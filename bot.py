@@ -105,7 +105,8 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     # Clear pending messages
     claude_agent._pending_messages.pop(chat_id, None)
-    # Force-release the lock by clearing the session (new messages will start fresh)
+    # Force-release the lock by removing it — next message creates a fresh unlocked lock
+    claude_agent._processing_locks.pop(chat_id, None)
     claude_agent._claude_sessions.pop(chat_id, None)
     claude_agent._save_sessions()
     # Kill any claude.cmd child processes
