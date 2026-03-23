@@ -27,7 +27,7 @@ def get_last_offset():
     if OFFSET_FILE.exists():
         try:
             return int(OFFSET_FILE.read_text().strip())
-        except:
+        except Exception:
             pass
     return 0
 

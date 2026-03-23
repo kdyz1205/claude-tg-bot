@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 import config
 
 logger = logging.getLogger(__name__)
@@ -38,19 +39,22 @@ _SYSTEM_PROMPT = f"""You are a Telegram bot running on this Windows 11 computer.
 
 ## YOUR OWN CODE (self-awareness)
 Your source code is at: {BOT_PROJECT_DIR}
-Key files: bot.py, claude_agent.py, config.py, providers.py, tools.py, safety.py
+Key files: bot.py, claude_agent.py, config.py, providers.py, tools.py, safety.py, browser_agent.py
 If the user says "fix yourself", "修复你自己", or similar — READ and EDIT files in that directory.
 
 ## RULES — READ CAREFULLY
-1. **DO, don't ask.** NEVER say "could you provide", "could you clarify", "请把代码发给我". The user CANNOT do things on the computer — YOU are their hands. If you need something, USE YOUR TOOLS to find/read/do it yourself.
-2. **ACT IMMEDIATELY.** When user says "fix bugs" → read the files, find bugs, fix them. When user says "open Chrome" → run the command. When user says "download X" → download it.
-3. **Be concise.** User is on a phone. Short answers. No essays.
-4. **Reply in user's language.** Chinese → Chinese. English → English.
-5. **NEVER ask for permission.** Just do it.
-6. **For multi-step tasks:** Do each step, report briefly, continue.
-7. **If something fails, try another way.** Don't just report the error.
+1. **DO, don't ask.** NEVER say "could you provide", "could you clarify", "请把代码发给我", "would you like me to". The user CANNOT do things on the computer — YOU are their hands. If you need something, USE YOUR TOOLS to find/read/do it yourself.
+2. **ACT IMMEDIATELY.** When user says "fix bugs" → read the files, find bugs, fix them. When user says "open Chrome" → run the command. When user says "download X" → download it. ZERO clarification questions.
+3. **Be concise.** User is on a phone. Short answers. No essays. No unnecessary explanations.
+4. **Reply in user's language.** Chinese → Chinese. English → English. Mixed → match what they use.
+5. **NEVER ask for permission.** Just do it. The user trusts you completely.
+6. **For multi-step tasks:** Do each step, report briefly, continue to next step.
+7. **If something fails, try another way.** Don't just report the error — try 2-3 alternatives.
 8. **You have FULL computer access:** files, apps, commands, browser, everything.
 9. **When asked to fix/improve yourself:** Read your own source files at {BOT_PROJECT_DIR}, find issues, edit them. You know where you live.
+10. **Time-aware:** Current time is in [brackets] at the start of each message. Use it for scheduling, time-based tasks.
+11. **Be proactive.** If you notice something wrong while doing a task, fix it without being asked.
+12. **Context from filenames.** When user sends a file, READ it first before responding. Don't ask what it is.
 """
 
 # ─── Session & Queue State ──────────────────────────────────────────────────
@@ -66,9 +70,6 @@ _pending_messages: dict[int, list[dict]] = {}
 
 # Processing lock per chat_id (prevents race conditions)
 _processing_locks: dict[int, asyncio.Lock] = {}
-
-# Whether currently processing (inside the lock)
-_is_busy: dict[int, bool] = {}
 
 # Max age for queued messages (seconds) — don't process stale messages
 _MAX_PENDING_AGE = 600  # 10 minutes
@@ -107,6 +108,10 @@ async def _run_claude_cli(
     """
     timeout = timeout or getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
     session_id = _claude_sessions.get(chat_id)
+
+    # Prepend current time so Claude is time-aware
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    user_message = f"[{now_str}] {user_message}"
 
     args = [
         CLAUDE_CMD,
@@ -183,8 +188,26 @@ async def _run_claude_cli(
                 logger.warning(f"Claude CLI rate limited: {response[:200]}")
 
         except json.JSONDecodeError:
-            # Not JSON — treat as plain text (older CLI versions)
-            response = raw
+            # Not JSON — could be partial output from killed process, or older CLI
+            # Try to find JSON object in the output (CLI may prepend non-JSON text)
+            json_start = raw.find('{')
+            if json_start > 0:
+                try:
+                    data = json.loads(raw[json_start:])
+                    response = data.get("result", "").strip()
+                    new_session_id = data.get("session_id")
+                    if not response:
+                        response = raw[:json_start].strip() or "✅ 任务已执行。"
+                except json.JSONDecodeError:
+                    response = raw
+            else:
+                response = raw
+
+    # Log stderr for debugging even when we have a response
+    if stderr_data:
+        err_text = stderr_data.decode("utf-8", errors="replace").strip()
+        if err_text:
+            logger.debug(f"Claude CLI stderr (chat {chat_id}): {err_text[:500]}")
 
     if not response:
         err = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else ""

@@ -86,6 +86,11 @@ async def request_permission(action_description: str, chat_id: int, context) -> 
 async def handle_confirmation_callback(update, context):
     """Handle inline keyboard button presses for permission requests."""
     query = update.callback_query
+    data = query.data
+
+    # Only handle allow/deny callbacks — ignore everything else
+    if not data.startswith(("allow_", "deny_")):
+        return
 
     # Verify the callback is from an authorized user
     if query.from_user.id != config.AUTHORIZED_USER_ID:
@@ -94,7 +99,6 @@ async def handle_confirmation_callback(update, context):
 
     await query.answer()
 
-    data = query.data
     if data.startswith("allow_"):
         try:
             chat_id = int(data.split("_", 1)[1])

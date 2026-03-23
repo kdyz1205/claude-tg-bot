@@ -2,6 +2,8 @@
 Bridge Worker: Watches for Telegram messages and prints them.
 Run this alongside Claude Code so it can see incoming messages.
 
+Requires: requests (pip install requests)
+
 Usage: python bridge_worker.py
 """
 import json
@@ -30,7 +32,7 @@ def _read_json(path):
         return []
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except:
+    except Exception:
         return []
 
 
@@ -44,7 +46,7 @@ def send_telegram(text):
     try:
         resp = requests.post(url, json={"chat_id": CHAT_ID, "text": text})
         return resp.status_code == 200
-    except:
+    except Exception:
         return False
 
 
@@ -59,7 +61,7 @@ def send_telegram_photo(photo_path, caption=None):
                 data["caption"] = caption
             resp = requests.post(url, data=data, files=files)
         return resp.status_code == 200
-    except:
+    except Exception:
         return False
 
 

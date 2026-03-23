@@ -49,6 +49,11 @@ DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 LOG_FILE = os.path.join(Path(__file__).parent, "bot.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+# ─── Validation ──────────────────────────────────────────────────────────
+# Create required directories at import time so they always exist
+os.makedirs(TELEGRAM_FILES_DIR, exist_ok=True)
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
 # ─── Safety ───────────────────────────────────────────────────────────────────
 # Patterns that trigger a permission prompt in API mode.
 # In CLI mode (Bridge), Claude Code handles its own permissions.

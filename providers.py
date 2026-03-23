@@ -113,16 +113,17 @@ TOOL_GROUPS = {
                       "fix", "bug", "debug", "error", "issue", "crash", "broken",
                       "修复", "错误", "问题", "调试", "install", "setup", "build",
                       "test", "npm", "pip", "python", "node", "compile",
-                      "modify", "改", "update", "create", "创建"],
+                      "modify", "改", "update", "create", "创建",
+                      "download", "下载"],
         "tools": {"list_files", "read_file", "write_file", "edit_file",
-                  "search_files", "find_files"},
+                  "search_files", "find_files", "download_file"},
     },
     "system": {
         "keywords": ["系统", "system", "进程", "process", "内存", "memory", "cpu",
                       "磁盘", "disk", "运行", "running", "kill", "任务管理器",
                       "install", "setup", "build", "test", "run", "start", "stop",
                       "安装", "启动", "停止", "重启", "restart"],
-        "tools": {"get_system_info", "manage_processes"},
+        "tools": {"get_system_info", "manage_processes", "download_file"},
     },
     "clipboard": {
         "keywords": ["剪贴板", "clipboard", "复制", "copy", "粘贴", "paste", "中文"],
@@ -243,8 +244,18 @@ async def _run_tool(tool_name, tool_input, chat_id, context):
 async def _send_text(text, chat_id, context, parse_mode=None):
     if not text or not text.strip():
         return
-    while text:
-        chunk, text = text[:4000], text[4000:]
+    remaining = text
+    while remaining:
+        if len(remaining) <= 4000:
+            chunk = remaining
+            remaining = ""
+        else:
+            # Try to break at a newline near the limit
+            break_pos = remaining.rfind("\n", 3000, 4000)
+            if break_pos == -1:
+                break_pos = 4000
+            chunk = remaining[:break_pos]
+            remaining = remaining[break_pos:]
         kwargs = {"chat_id": chat_id, "text": chunk}
         if parse_mode:
             kwargs["parse_mode"] = parse_mode
@@ -276,7 +287,7 @@ async def process_claude(messages, chat_id, context, selected_tools=None):
         try:
             response = client.messages.create(
                 model=config.CLAUDE_MODEL,
-                max_tokens=8096,
+                max_tokens=8192,
                 system=SYSTEM_PROMPT,
                 tools=tools,
                 messages=messages,
@@ -363,7 +374,7 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
                 model=config.OPENAI_MODEL,
                 messages=oai_msgs,
                 tools=_tools_openai(selected_tools),
-                max_tokens=8096,
+                max_tokens=8192,
             )
         except Exception as e:
             err = str(e).lower()

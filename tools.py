@@ -699,6 +699,9 @@ async def execute_run_command(command: str, shell: str = "powershell",
         timeout = min(timeout or config.COMMAND_TIMEOUT, 300)
         cwd = working_directory or os.path.expanduser("~")
 
+        if not os.path.isdir(cwd):
+            return f"Error: working directory does not exist: {cwd}"
+
         if shell == "powershell":
             args = ["powershell", "-NoProfile", "-Command", command]
         else:
@@ -810,8 +813,9 @@ async def execute_list_windows() -> str:
 async def execute_focus_window(title: str) -> str:
     """Focus a window by title."""
     try:
+        safe_title = title.replace("'", "''")
         ps_cmd = (
-            f'$w = Get-Process | Where-Object {{$_.MainWindowTitle -like "*{title}*"}} | Select-Object -First 1; '
+            f'$w = Get-Process | Where-Object {{$_.MainWindowTitle -like "*{safe_title}*"}} | Select-Object -First 1; '
             f'if ($w) {{ '
             f'  Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; '
             f'  public class Win32 {{ [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); '
@@ -819,7 +823,7 @@ async def execute_focus_window(title: str) -> str:
             f'  [Win32]::ShowWindow($w.MainWindowHandle, 9); '
             f'  [Win32]::SetForegroundWindow($w.MainWindowHandle); '
             f'  "Focused: $($w.MainWindowTitle)" '
-            f'}} else {{ "No window found matching: {title}" }}'
+            f'}} else {{ "No window found matching: {safe_title}" }}'
         )
         result = await execute_run_command(ps_cmd)
         return result
@@ -931,6 +935,8 @@ async def execute_get_clipboard() -> str:
 def execute_list_files(directory: str, recursive: bool = False, pattern: str = None) -> str:
     """List files in a directory."""
     try:
+        if not os.path.isdir(directory):
+            return f"Error: directory does not exist: {directory}"
         import fnmatch
         from datetime import datetime
         entries = []
@@ -1011,6 +1017,8 @@ def execute_read_file(path: str, start_line: int = 1, end_line: int = None) -> s
         if end < total:
             content += f"\n... ({total - end} more lines)"
         return header + content or "(empty file)"
+    except FileNotFoundError:
+        return f"Error: file not found: {path}"
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -1018,6 +1026,8 @@ def execute_read_file(path: str, start_line: int = 1, end_line: int = None) -> s
 def execute_write_file(path: str, content: str) -> str:
     """Write content to a file."""
     try:
+        if not path or not path.strip():
+            return "Error: file path cannot be empty."
         # Create directories if needed
         dir_path = os.path.dirname(path)
         if dir_path:
@@ -1059,6 +1069,8 @@ async def execute_search_files(directory: str, pattern: str,
     """Search for text in files."""
     try:
         import re
+        import fnmatch
+        compiled = re.compile(pattern)
         results = []
         count = 0
 
@@ -1067,7 +1079,6 @@ async def execute_search_files(directory: str, pattern: str,
                        ('node_modules', '__pycache__', '.git', 'venv', '.venv', 'dist', 'build')]
             for fname in files:
                 if file_pattern:
-                    import fnmatch
                     if not fnmatch.fnmatch(fname, file_pattern):
                         continue
                 # Skip binary files
@@ -1079,7 +1090,7 @@ async def execute_search_files(directory: str, pattern: str,
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         for line_num, line in enumerate(f, 1):
                             try:
-                                if re.search(pattern, line):
+                                if compiled.search(line):
                                     rel = os.path.relpath(fpath, directory)
                                     results.append(f"{rel}:{line_num}: {line.rstrip()}")
                                     count += 1

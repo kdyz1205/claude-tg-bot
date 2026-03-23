@@ -73,6 +73,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear - 清除对话(开始新会话)\n"
         "/screenshot - 截图\n"
         "/status - 状态\n"
+        "/ping - 延迟测试\n"
+        "/model - 切换模型\n"
+        "/provider - 切换AI服务\n"
+        "/bridge - 切换CLI/API模式\n"
+        "/help - 帮助\n"
         "/q - 快捷操作面板"
     )
 
@@ -331,7 +336,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         photo = update.message.photo[-1]  # Largest resolution
         file = await context.bot.get_file(photo.file_id)
-        save_dir = os.path.join(os.path.expanduser("~"), "Desktop", "telegram_files")
+        save_dir = config.TELEGRAM_FILES_DIR
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, f"photo_{photo.file_id}.jpg")
         await file.download_to_drive(save_path)
@@ -391,28 +396,37 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Gemini transcription failed: {e}")
 
-        # Fallback: tell Claude about the voice file
+        # Fallback: save voice file and tell Claude about it
         if not transcription:
-            save_dir = os.path.join(os.path.expanduser("~"), "Desktop", "telegram_files")
+            save_dir = config.TELEGRAM_FILES_DIR
             os.makedirs(save_dir, exist_ok=True)
             import shutil
             save_path = os.path.join(save_dir, f"voice_{voice.file_id}.ogg")
             shutil.copy2(tmp, save_path)
-            await update.message.reply_text(f"🎙 语音已保存: {save_path}\n(无法转录，请发文字)")
+            await update.message.reply_text(f"🎙 语音已保存: {save_path}")
+            # Still notify Claude so it can try to process the audio file
+            await claude_agent.process_message(
+                f"用户发送了一条语音消息，已保存到: {save_path}\n(无法自动转录，请尝试用其他方式处理)",
+                chat_id, context
+            )
             return
 
         await update.message.reply_text(f"🎙 「{transcription}」")
         await claude_agent.process_message(transcription, chat_id, context)
 
-        # Cleanup temp file
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-
     except Exception as e:
         logger.error(f"Voice handling error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ 语音处理失败: {e}")
+        try:
+            await update.message.reply_text(f"❌ 语音处理失败: {e}")
+        except Exception:
+            pass
+    finally:
+        # Always cleanup temp file
+        try:
+            if 'tmp' in locals() and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -422,8 +436,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         doc = update.message.document
+        if not doc:
+            await update.message.reply_text("📁 无法获取文件。")
+            return
         file = await context.bot.get_file(doc.file_id)
-        save_dir = os.path.join(os.path.expanduser("~"), "Desktop", "telegram_files")
+        save_dir = config.TELEGRAM_FILES_DIR
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, doc.file_name or f"file_{doc.file_id}")
         await file.download_to_drive(save_path)
