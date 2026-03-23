@@ -7,6 +7,8 @@ Routes all messages through claude_agent.py → Claude Code CLI.
 import logging
 import asyncio
 import os
+import sys
+import signal
 import traceback
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -532,6 +534,48 @@ async def handle_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+# ─── PID Lock (prevent dual instances) ────────────────────────────────────────
+
+_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.pid")
+
+def _acquire_pid_lock():
+    """Check for existing bot instance and kill it before starting."""
+    # Check if another instance is running
+    if os.path.exists(_PID_FILE):
+        try:
+            old_pid = int(open(_PID_FILE, "r").read().strip())
+            # Check if process is still alive
+            try:
+                os.kill(old_pid, 0)  # signal 0 = test if process exists
+                # Process exists — kill it so we can take over
+                logger.warning(f"Killing previous bot instance (PID {old_pid})")
+                print(f"Killing previous bot instance (PID {old_pid})")
+                try:
+                    os.kill(old_pid, signal.SIGTERM)
+                    import time as _t
+                    _t.sleep(2)  # Give it time to shut down
+                except Exception:
+                    pass
+            except OSError:
+                pass  # Process already dead
+        except (ValueError, IOError):
+            pass  # Corrupt PID file, ignore
+
+    # Write our PID
+    with open(_PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+def _release_pid_lock():
+    """Remove PID file on clean exit."""
+    try:
+        if os.path.exists(_PID_FILE):
+            pid_in_file = int(open(_PID_FILE, "r").read().strip())
+            if pid_in_file == os.getpid():
+                os.remove(_PID_FILE)
+    except Exception:
+        pass
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -540,6 +584,8 @@ def main():
         return
     if config.AUTHORIZED_USER_ID == 0:
         print("NOTE: AUTHORIZED_USER_ID not set. Send any message to get your ID.")
+
+    _acquire_pid_lock()
 
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
 
@@ -587,7 +633,10 @@ def main():
 
     print(f"Bot started! Mode: {'CLI (Plan tokens)' if config.BRIDGE_MODE else 'API'}")
     print("Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    finally:
+        _release_pid_lock()
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ Thumbs.db
 
 # Runtime state
 .sessions.json
+.bot.pid
 
 # Temp
 *.tmp
