@@ -89,7 +89,8 @@ TOOL_GROUPS = {
         "keywords": ["网页", "网站", "浏览器", "搜索", "google", "search", "website", "browse",
                       "click", "点击", "登录", "login", "sign", "form", "表单", "tradingview",
                       "youtube", "github", "reddit", "twitter", "facebook", "amazon",
-                      "browser", "page", "页面", "链接", "link", "url"],
+                      "browser", "page", "页面", "链接", "link", "url", "playwright",
+                      "zillow", "房子", "house", "apartment", "real estate"],
         "tools": {"browser_navigate", "browser_click", "browser_type",
                   "browser_screenshot", "browser_get_text", "browser_get_elements",
                   "browser_scroll", "browser_go_back", "browser_tabs",
@@ -111,7 +112,8 @@ TOOL_GROUPS = {
                       "folder", "directory", "项目", "project", "git", "代码",
                       "fix", "bug", "debug", "error", "issue", "crash", "broken",
                       "修复", "错误", "问题", "调试", "install", "setup", "build",
-                      "test", "npm", "pip", "python", "node", "compile"],
+                      "test", "npm", "pip", "python", "node", "compile",
+                      "modify", "改", "update", "create", "创建"],
         "tools": {"list_files", "read_file", "write_file", "edit_file",
                   "search_files", "find_files"},
     },
@@ -201,14 +203,15 @@ def _tools_gemini(tool_defs=None):
                 )
                 p["items"] = gtypes.Schema(type=item_type)
             props[name] = gtypes.Schema(**p)
+        # Guard: if tool has no properties, pass None to avoid empty dict issues
+        param_kwargs = {"type": "OBJECT"}
+        if props:
+            param_kwargs["properties"] = props
+            param_kwargs["required"] = schema.get("required", [])
         declarations.append(gtypes.FunctionDeclaration(
             name=t["name"],
             description=t["description"],
-            parameters=gtypes.Schema(
-                type="OBJECT",
-                properties=props,
-                required=schema.get("required", []),
-            ),
+            parameters=gtypes.Schema(**param_kwargs),
         ))
     return [gtypes.Tool(function_declarations=declarations)]
 
@@ -337,7 +340,7 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
     # from other providers (Claude's native format uses list content)
     oai_msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     skip_next = False
-    for m in messages:
+    for i, m in enumerate(messages):
         content = m["content"]
         if skip_next:
             skip_next = False
@@ -349,7 +352,10 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
             # and also skip the next message if it's a tool_result response to avoid
             # unpaired tool_call messages that would cause OpenAI API errors
             if m["role"] == "assistant":
-                skip_next = True  # skip the paired tool_result user message
+                # Only skip the next message if it is also a list (tool_result pair).
+                # If the next message is a plain string, it should not be skipped.
+                if i + 1 < len(messages) and isinstance(messages[i + 1]["content"], list):
+                    skip_next = True
 
     for _ in range(config.MAX_TOOL_ITERATIONS):
         try:
@@ -432,11 +438,14 @@ async def process_gemini(messages, chat_id, context, selected_tools=None):
         tools=_tools_gemini(selected_tools),
     )
 
+    loop = asyncio.get_running_loop()
     for _ in range(config.MAX_TOOL_ITERATIONS):
         try:
-            loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
+                # Note: the default arg `c=contents` captures the list reference.
+                # Since `contents` is mutated in-place (appended to each iteration),
+                # the lambda always sees the latest state, which is the intended behavior.
                 lambda c=contents: client.models.generate_content(
                     model=config.GEMINI_MODEL,
                     contents=c,
@@ -520,7 +529,13 @@ async def process_gemini(messages, chat_id, context, selected_tools=None):
         else:
             # Text response — send to user
             text_parts = [p.text for p in parts if hasattr(p, 'text') and p.text]
-            text = "\n".join(text_parts) if text_parts else response.text
+            if text_parts:
+                text = "\n".join(text_parts)
+            else:
+                try:
+                    text = response.text
+                except (ValueError, AttributeError):
+                    text = None
             if text:
                 await _send_text(text, chat_id, context)
             return True, None

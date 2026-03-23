@@ -96,7 +96,8 @@ async def _keep_typing(chat_id, context, stop_event):
 # ─── Claude CLI Runner ────────────────────────────────────────────────────────
 
 async def _run_claude_cli(
-    user_message: str, chat_id: int, context, timeout: int = 300
+    user_message: str, chat_id: int, context,
+    timeout: int = None,
 ) -> tuple[str, str | None]:
     """Run claude CLI and return (response_text, session_id).
 
@@ -104,6 +105,7 @@ async def _run_claude_cli(
     Uses --resume <session_id> so Claude maintains real conversation state.
     Always includes --append-system-prompt so Claude never loses identity.
     """
+    timeout = timeout or getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
     session_id = _claude_sessions.get(chat_id)
 
     args = [
@@ -389,11 +391,6 @@ async def process_message(user_message: str, chat_id: int, context):
             success = await process_with_auto_fallback(history, chat_id, context)
 
             if not success:
-                await _send_response(
-                    chat_id,
-                    "❌ 所有 AI 服务都不可用。请检查 Plan 订阅和 API keys。",
-                    context,
-                )
                 return
 
             # Clean up non-text messages from history (tool use artifacts)

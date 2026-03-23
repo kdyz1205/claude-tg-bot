@@ -1,8 +1,16 @@
+# Core
 python-telegram-bot>=22.0
+python-dotenv>=1.0
+
+# AI Providers (all optional - CLI mode doesn't need these)
 anthropic>=0.80.0
 openai>=1.30.0
 google-genai>=1.0.0
+
+# System control
 pyautogui>=0.9.54
 Pillow>=10.0
-python-dotenv>=1.0
 psutil>=5.9
+
+# Browser automation (optional - install playwright browsers: playwright install chromium)
+playwright>=1.40.0

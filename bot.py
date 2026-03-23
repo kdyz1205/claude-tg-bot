@@ -23,10 +23,14 @@ import bridge
 from safety import handle_confirmation_callback
 from providers import PROVIDER_DISPLAY
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
+# ─── Logging (console + file) ─────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(config.LOG_FILE, encoding="utf-8", errors="replace"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status - 状态\n"
         "/q - 快捷操作面板"
     )
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick health check — responds instantly."""
+    import time
+    start = time.time()
+    msg = await update.message.reply_text("🏓")
+    latency = (time.time() - start) * 1000
+    await msg.edit_text(f"🏓 Pong! ({latency:.0f}ms)")
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -313,6 +326,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
         # Save photo to disk so Claude can reference it
+        if not update.message.photo:
+            await update.message.reply_text("📸 无法获取图片。")
+            return
         photo = update.message.photo[-1]  # Largest resolution
         file = await context.bot.get_file(photo.file_id)
         save_dir = os.path.join(os.path.expanduser("~"), "Desktop", "telegram_files")
@@ -344,6 +360,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         voice = update.message.voice or update.message.audio
+        if not voice:
+            await update.message.reply_text("🎙 无法获取音频。")
+            return
         file = await context.bot.get_file(voice.file_id)
         import tempfile
         tmp = os.path.join(tempfile.gettempdir(), f"voice_{voice.file_id}.ogg")
@@ -452,6 +471,7 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", start, filters=auth_filter))
     app.add_handler(CommandHandler("help", help_command, filters=auth_filter))
+    app.add_handler(CommandHandler("ping", ping, filters=auth_filter))
     app.add_handler(CommandHandler("clear", clear, filters=auth_filter))
     app.add_handler(CommandHandler("screenshot", quick_screenshot, filters=auth_filter))
     app.add_handler(CommandHandler("model", model_command, filters=auth_filter))

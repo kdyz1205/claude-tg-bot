@@ -633,6 +633,25 @@ TOOL_DEFINITIONS = [
             "required": ["selector"],
         },
     },
+    # === File Download ===
+    {
+        "name": "download_file",
+        "description": "Download a file from a URL to a local path using PowerShell. Supports HTTP/HTTPS. Good for fetching installers, assets, data files, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to download from",
+                },
+                "destination": {
+                    "type": "string",
+                    "description": "Local file path to save to (e.g. C:\\Users\\user\\Downloads\\file.zip)",
+                },
+            },
+            "required": ["url", "destination"],
+        },
+    },
 ]
 
 # App name -> executable mapping
@@ -728,7 +747,7 @@ async def execute_open_application(app_name: str) -> str:
     """Open an application by name or path."""
     try:
         resolved = APP_ALIASES.get(app_name.lower(), app_name)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: os.startfile(resolved))
         return f"Opened '{app_name}' (resolved to '{resolved}')."
     except Exception as e:
@@ -882,6 +901,7 @@ def execute_mouse_drag(start_x: int, start_y: int, end_x: int, end_y: int,
 
 async def execute_set_clipboard(text: str) -> str:
     """Set clipboard content via PowerShell."""
+    tmp_path = None
     try:
         # Write to temp file to avoid escaping issues
         import tempfile
@@ -891,10 +911,12 @@ async def execute_set_clipboard(text: str) -> str:
         await execute_run_command(
             f'Get-Content -Path "{tmp_path}" -Raw | Set-Clipboard',
         )
-        os.unlink(tmp_path)
         return f"Clipboard set ({len(text)} chars). Use Ctrl+V to paste."
     except Exception as e:
         return f"Error setting clipboard: {e}"
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 async def execute_get_clipboard() -> str:
@@ -929,7 +951,7 @@ def execute_list_files(directory: str, recursive: bool = False, pattern: str = N
                         size = _format_size(stat.st_size)
                         mtime = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
                         entries.append(f"  {size:>10s}  {mtime}  {rel}")
-                    except:
+                    except Exception:
                         entries.append(f"{'':>10s}  {'':16s}  {rel}")
                     count += 1
                     if count >= 200:
@@ -947,7 +969,7 @@ def execute_list_files(directory: str, recursive: bool = False, pattern: str = N
                     size = "<DIR>" if is_dir else _format_size(stat.st_size)
                     mtime = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
                     entries.append(f"  {size:>10s}  {mtime}  {name}")
-                except:
+                except Exception:
                     entries.append(f"{'':>10s}  {'':16s}  {name}")
 
         if not entries:
@@ -968,6 +990,10 @@ def _format_size(size_bytes):
 def execute_read_file(path: str, start_line: int = 1, end_line: int = None) -> str:
     """Read a text file with optional line range."""
     try:
+        # Guard against huge files that could OOM
+        file_size = os.path.getsize(path)
+        if file_size > 10 * 1024 * 1024:  # 10 MB
+            return f"Error: file is too large ({file_size / (1024*1024):.1f} MB). Skipping to avoid memory issues. Max supported size: 10 MB."
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             all_lines = f.readlines()
 
@@ -1052,14 +1078,17 @@ async def execute_search_files(directory: str, pattern: str,
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         for line_num, line in enumerate(f, 1):
-                            if re.search(pattern, line):
-                                rel = os.path.relpath(fpath, directory)
-                                results.append(f"{rel}:{line_num}: {line.rstrip()}")
-                                count += 1
-                                if count >= max_results:
-                                    results.append(f"\n... (max {max_results} results reached)")
-                                    return "\n".join(results)
-                except:
+                            try:
+                                if re.search(pattern, line):
+                                    rel = os.path.relpath(fpath, directory)
+                                    results.append(f"{rel}:{line_num}: {line.rstrip()}")
+                                    count += 1
+                                    if count >= max_results:
+                                        results.append(f"\n... (max {max_results} results reached)")
+                                        return "\n".join(results)
+                            except re.error as e:
+                                return f"Invalid regex pattern '{pattern}': {e}"
+                except Exception:
                     pass
 
         if not results:
@@ -1141,7 +1170,12 @@ async def execute_wait(seconds: float, reason: str = None) -> str:
 
 
 def execute_get_system_info() -> str:
-    """Get system information."""
+    """Get system information.
+
+    NOTE: psutil.cpu_percent(interval=1) is a blocking call that sleeps for 1 second.
+    This function should be called from an executor (e.g. loop.run_in_executor) when
+    used from async context to avoid blocking the event loop.
+    """
     try:
         cpu_pct = psutil.cpu_percent(interval=1)
         mem = psutil.virtual_memory()
@@ -1170,6 +1204,28 @@ def execute_get_system_info() -> str:
         return "\n".join(info)
     except Exception as e:
         return f"Error getting system info: {e}"
+
+
+async def execute_download_file(url: str, destination: str) -> str:
+    """Download a file from a URL to a local path via PowerShell."""
+    try:
+        # Create destination directory if needed
+        dest_dir = os.path.dirname(destination)
+        if dest_dir:
+            os.makedirs(dest_dir, exist_ok=True)
+        # Use PowerShell Invoke-WebRequest for the download
+        ps_cmd = (
+            f'Invoke-WebRequest -Uri "{url}" -OutFile "{destination}" '
+            f'-UseBasicParsing -ErrorAction Stop'
+        )
+        result = await execute_run_command(ps_cmd, timeout=120)
+        if os.path.exists(destination):
+            size = os.path.getsize(destination)
+            return f"Downloaded '{url}' to '{destination}' ({size} bytes). {result}".strip()
+        else:
+            return f"Download may have failed. PowerShell output: {result}"
+    except Exception as e:
+        return f"Error downloading file: {e}"
 
 
 # Screenshot sentinel for the agent loop
@@ -1283,7 +1339,14 @@ async def execute_tool(tool_name: str, tool_input: dict):
             tool_input.get("reason"),
         )
     elif tool_name == "get_system_info":
-        result = execute_get_system_info()
+        # Run in executor since psutil.cpu_percent(interval=1) blocks for 1 second
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, execute_get_system_info)
+    elif tool_name == "download_file":
+        result = await execute_download_file(
+            tool_input["url"],
+            tool_input["destination"],
+        )
     # === Browser Automation (Playwright) ===
     elif tool_name == "browser_navigate":
         result = await browser_agent.browser_navigate(tool_input["url"])
@@ -1331,7 +1394,9 @@ async def execute_tool(tool_name: str, tool_input: dict):
     else:
         result = f"Unknown tool: {tool_name}"
 
-    # Truncate very long results
+    # Guard against None result and truncate very long results
+    if result is None:
+        result = "(no output)"
     if len(result) > 15000:
         result = result[:15000] + "\n... (output truncated)"
 
