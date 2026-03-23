@@ -238,9 +238,15 @@ async def _run_claude_cli(
 async def _send_response(chat_id: int, response: str, context):
     """Send response to Telegram, splitting into chunks if needed.
     Handles Markdown parse errors gracefully.
+    Very long responses (>16K chars) get a truncation notice.
     """
     if not response or not response.strip():
         return
+
+    # Cap extremely long responses — user is on phone, can't read 20 pages
+    MAX_TOTAL = 16000
+    if len(response) > MAX_TOTAL:
+        response = response[:MAX_TOTAL] + "\n\n... (输出过长，已截断。需要完整内容请说。)"
 
     # Split into chunks, trying to break at newlines
     remaining = response
@@ -297,6 +303,14 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
     """Process message using Claude Code CLI. Returns True on success."""
     try:
         response, new_session_id = await _run_claude_cli(user_message, chat_id, context)
+
+        # Session recovery: if response indicates session error, retry without resume
+        if response and ("session" in response.lower() and "error" in response.lower()
+                         or "invalid session" in response.lower()
+                         or "could not find" in response.lower() and "session" in response.lower()):
+            logger.warning(f"Chat {chat_id}: session error detected, starting fresh")
+            _claude_sessions.pop(chat_id, None)
+            response, new_session_id = await _run_claude_cli(user_message, chat_id, context)
 
         # Store session_id for conversation continuity
         if new_session_id:

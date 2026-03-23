@@ -485,6 +485,34 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ 文件处理失败: {e}")
 
 
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle video/animation — save to disk and tell Claude."""
+    chat_id = update.effective_chat.id
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        video = update.message.video or update.message.animation
+        if not video:
+            return
+        file = await context.bot.get_file(video.file_id)
+        save_dir = config.TELEGRAM_FILES_DIR
+        os.makedirs(save_dir, exist_ok=True)
+        ext = ".mp4" if update.message.video else ".gif"
+        save_path = os.path.join(save_dir, f"video_{video.file_id}{ext}")
+        await file.download_to_drive(save_path)
+        caption = update.message.caption or ""
+        msg = f"用户发送了视频/动图，已保存到: {save_path}"
+        if caption:
+            msg += f"\n用户说: {caption}"
+        await update.message.reply_text(f"🎬 已保存: {save_path}")
+        await claude_agent.process_message(msg, chat_id, context)
+    except Exception as e:
+        logger.error(f"Video handling error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 视频处理失败: {e}")
+        except Exception:
+            pass
+
+
 async def handle_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -535,6 +563,18 @@ def main():
     app.add_handler(MessageHandler(auth_filter & filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(auth_filter & (filters.VOICE | filters.AUDIO), handle_voice))
     app.add_handler(MessageHandler(auth_filter & filters.Document.ALL, handle_document))
+
+    # Stickers — acknowledge but don't process
+    app.add_handler(MessageHandler(
+        auth_filter & filters.Sticker.ALL,
+        lambda u, c: u.message.reply_text("😄👍") if u.message else None
+    ))
+
+    # Video/animation — save and notify Claude
+    app.add_handler(MessageHandler(
+        auth_filter & (filters.VIDEO | filters.ANIMATION),
+        handle_video
+    ))
 
     # Unauthorized
     app.add_handler(MessageHandler(~auth_filter, handle_unauthorized))

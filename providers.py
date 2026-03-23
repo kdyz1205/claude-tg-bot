@@ -491,6 +491,9 @@ async def process_gemini(messages, chat_id, context, selected_tools=None):
             elif ("api_key_invalid" in err or "api key not valid" in err or
                     "permission_denied" in err):
                 return False, "auth"
+            elif "not found" in err or "model" in err and "not" in err:
+                logger.error(f"Gemini model error: {e}")
+                return False, f"Model {config.GEMINI_MODEL} not available: {str(e)[:200]}"
             else:
                 return False, str(e)
 
