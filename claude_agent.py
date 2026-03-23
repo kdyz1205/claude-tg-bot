@@ -100,7 +100,12 @@ async def _keep_typing(chat_id, context, stop_event):
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         except Exception:
             pass
-        await asyncio.sleep(4)
+        # Use wait with timeout instead of sleep — responds to stop_event faster
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4)
+            break  # stop_event was set
+        except asyncio.TimeoutError:
+            pass  # 4 seconds elapsed, send typing again
 
 
 # ─── Claude CLI Runner ────────────────────────────────────────────────────────
@@ -127,13 +132,14 @@ async def _run_claude_cli(
         "-p",
         "--output-format", "json",
         "--dangerously-skip-permissions",
+        "--model", config.CLAUDE_MODEL,
         "--append-system-prompt", _SYSTEM_PROMPT,
     ]
     if session_id:
         args.extend(["--resume", session_id])
-        logger.info(f"Chat {chat_id}: resuming session {session_id[:12]}...")
+        logger.info(f"Chat {chat_id}: resuming session {session_id[:12]}... (model: {config.CLAUDE_MODEL})")
     else:
-        logger.info(f"Chat {chat_id}: new session")
+        logger.info(f"Chat {chat_id}: new session (model: {config.CLAUDE_MODEL})")
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_keep_typing(chat_id, context, stop_typing))
@@ -175,6 +181,10 @@ async def _run_claude_cli(
         except asyncio.CancelledError:
             pass
 
+    # Log exit code for debugging
+    if proc.returncode != 0:
+        logger.warning(f"Claude CLI exited with code {proc.returncode}")
+
     # Parse JSON response
     raw = stdout_data.decode("utf-8", errors="replace").strip()
     new_session_id = None
@@ -192,9 +202,10 @@ async def _run_claude_cli(
                 else:
                     response = "✅ 任务已执行（无文字输出）。"
 
-            # Check for rate limit
-            if "hit your limit" in response.lower() or "rate limit" in response.lower():
+            # Check for rate limit — notify user but don't retry (they can resend)
+            if response and ("hit your limit" in response.lower() or "rate limit" in response.lower()):
                 logger.warning(f"Claude CLI rate limited: {response[:200]}")
+                response = "⏳ Claude 达到速率限制。请稍等几分钟后再试。"
 
         except json.JSONDecodeError:
             # Not JSON — could be partial output from killed process, or older CLI
@@ -305,9 +316,12 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         response, new_session_id = await _run_claude_cli(user_message, chat_id, context)
 
         # Session recovery: if response indicates session error, retry without resume
-        if response and ("session" in response.lower() and "error" in response.lower()
-                         or "invalid session" in response.lower()
-                         or "could not find" in response.lower() and "session" in response.lower()):
+        resp_lower = response.lower() if response else ""
+        if response and (
+            ("session" in resp_lower and "error" in resp_lower)
+            or "invalid session" in resp_lower
+            or ("could not find" in resp_lower and "session" in resp_lower)
+        ):
             logger.warning(f"Chat {chat_id}: session error detected, starting fresh")
             _claude_sessions.pop(chat_id, None)
             response, new_session_id = await _run_claude_cli(user_message, chat_id, context)

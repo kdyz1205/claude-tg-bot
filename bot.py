@@ -130,6 +130,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 状态\n\n"
         f"模式: Claude Code CLI (Plan tokens)\n"
+        f"模型: {config.CLAUDE_MODEL}\n"
         f"Session: {session_id}\n"
         f"队列: {queue_size} 条待处理\n"
         f"处理中: {'是' if is_busy else '否'}\n"
