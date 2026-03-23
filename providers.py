@@ -129,6 +129,12 @@ TOOL_GROUPS = {
         "keywords": ["剪贴板", "clipboard", "复制", "copy", "粘贴", "paste", "中文"],
         "tools": {"set_clipboard", "get_clipboard", "press_key"},
     },
+    "navigation": {
+        "keywords": ["打开", "open", "go to", "navigate", "visit", "看看", "show me",
+                      "给我看", "帮我打开", "跳转", "网址"],
+        "tools": {"browser_navigate", "browser_screenshot", "browser_get_text",
+                  "browser_click", "browser_type"},
+    },
 }
 
 

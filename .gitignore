@@ -20,7 +20,11 @@ Thumbs.db
 # Temp
 *.tmp
 *.log
+*.log.*
 screenshots/
 bridge_data/
+telegram_files/
 test_screenshot.jpg
 *.jpg
+*.png
+*.ogg

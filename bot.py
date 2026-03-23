@@ -77,6 +77,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/model - 切换模型\n"
         "/provider - 切换AI服务\n"
         "/bridge - 切换CLI/API模式\n"
+        "/kill - 终止卡住的任务\n"
         "/help - 帮助\n"
         "/q - 快捷操作面板"
     )
@@ -94,6 +95,28 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     claude_agent.clear_history(update.effective_chat.id)
     await update.message.reply_text("✅ 对话已清空，新会话已开始。")
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kill any stuck Claude CLI process and clear the queue."""
+    chat_id = update.effective_chat.id
+    # Clear pending messages
+    claude_agent._pending_messages.pop(chat_id, None)
+    # Force-release the lock by clearing the session (new messages will start fresh)
+    claude_agent._claude_sessions.pop(chat_id, None)
+    # Kill any claude.cmd child processes
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Process claude -ErrorAction SilentlyContinue | Stop-Process -Force"],
+            capture_output=True, text=True, timeout=10,
+        )
+        await update.message.reply_text(
+            "🔪 已终止 Claude 进程并清空队列。\n发新消息重新开始。"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"🔪 队列已清空。进程终止: {e}")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,7 +415,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ])
                     ],
                 )
-                transcription = resp.text.strip()
+                text = resp.text.strip() if resp.text else ""
+                if text and len(text) > 1:  # Ignore single-char noise
+                    transcription = text
+            except (ValueError, AttributeError) as e:
+                logger.warning(f"Gemini transcription response error: {e}")
             except Exception as e:
                 logger.warning(f"Gemini transcription failed: {e}")
 
@@ -495,6 +522,7 @@ def main():
     app.add_handler(CommandHandler("provider", provider_command, filters=auth_filter))
     app.add_handler(CommandHandler("status", status_command, filters=auth_filter))
     app.add_handler(CommandHandler("bridge", bridge_command, filters=auth_filter))
+    app.add_handler(CommandHandler("kill", kill_command, filters=auth_filter))
     app.add_handler(CommandHandler("q", quick_action, filters=auth_filter))
     app.add_handler(CommandHandler("quick", quick_action, filters=auth_filter))
 

@@ -32,6 +32,19 @@ async def _ensure_browser():
             _page = await _context.new_page()
             return _page
 
+        # Clean up stale instances before re-launching
+        if _browser is not None:
+            logger.warning("Browser disconnected — cleaning up before restart")
+            for obj, action in [
+                (_page, None), (_context, "close"), (_browser, "close"), (_playwright, "stop")
+            ]:
+                try:
+                    if obj is not None and action:
+                        await getattr(obj, action)()
+                except Exception:
+                    pass
+            _page = _context = _browser = _playwright = None
+
         _playwright = await async_playwright().start()
         _browser = await _playwright.chromium.launch(
             headless=False,  # Visible browser so user can see
@@ -62,6 +75,19 @@ async def browser_navigate(url: str) -> str:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             title = await page.title()
+            # Detect certificate / blocked-page errors
+            _error_indicators = [
+                "privacy error", "your connection is not private",
+                "err_", "this site can", "not secure",
+                "certificate error", "security warning",
+            ]
+            title_lower = title.lower()
+            if any(ind in title_lower for ind in _error_indicators):
+                return (
+                    f"WARNING: Possible certificate/security error at {url}\n"
+                    f"Page title: {title}\n"
+                    "The page may be blocked or showing a security warning."
+                )
             return f"Navigated to: {url}\nPage title: {title}"
         except PlaywrightTimeoutError:
             # Page may have partially loaded; report what we have
@@ -190,7 +216,7 @@ async def browser_get_text() -> str:
         except Exception as e:
             return f"Browser init error: {e}"
         try:
-            text = await page.inner_text("body")
+            text = await asyncio.wait_for(page.inner_text("body"), timeout=5.0)
             # Truncate
             if len(text) > 8000:
                 text = text[:8000] + "\n... (truncated)"
@@ -375,6 +401,19 @@ async def browser_wait_for(selector: str, timeout: int = 10000) -> str:
             return f"Element found: {selector}"
         except Exception as e:
             return f"Wait timeout: {e}"
+
+
+async def browser_current_url() -> str:
+    """Return the current page URL (useful for debugging/status)."""
+    async with _browser_lock:
+        try:
+            page = await _ensure_browser()
+        except Exception as e:
+            return f"Browser init error: {e}"
+        try:
+            return page.url
+        except Exception as e:
+            return f"Error getting URL: {e}"
 
 
 async def browser_close_all() -> str:
