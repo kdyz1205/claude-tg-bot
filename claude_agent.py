@@ -504,14 +504,20 @@ def _queue_message(chat_id: int, text: str):
 
 # ─── Main Processing Logic ────────────────────────────────────────────────────
 
-async def _process_with_web_ai(user_message: str, chat_id: int, context) -> bool:
-    """Fallback: process message using browser-based free AI. Returns True on success."""
+async def _process_with_web_ai(user_message: str, chat_id: int, context, silent: bool = False) -> bool:
+    """Process message using browser-based free AI. Returns True on success.
+
+    Args:
+        silent: If True, don't send status messages (caller handles it)
+    """
     orch = _init_harness()
     if not orch:
+        logger.debug("Harness not available")
         return False
 
     try:
-        await _send_response(chat_id, "🌐 Claude 限速中，切换到免费 AI (浏览器模式)...", context)
+        if not silent:
+            await _send_response(chat_id, "🌐 正在通过浏览器 AI 处理...", context)
 
         # Use orchestrator to dispatch to best available platform
         result = await asyncio.wait_for(
@@ -528,8 +534,9 @@ async def _process_with_web_ai(user_message: str, chat_id: int, context) -> bool
 
     except asyncio.TimeoutError:
         logger.warning("Web AI timed out")
-        await _send_response(chat_id, "⏰ 浏览器 AI 超时。请稍后重试。", context)
-        return True  # Don't cascade to API fallback
+        if not silent:
+            await _send_response(chat_id, "⏰ 浏览器 AI 超时。", context)
+        return False
     except Exception as e:
         logger.error(f"Web AI error: {e}", exc_info=True)
         return False
@@ -757,15 +764,21 @@ async def process_message(user_message: str, chat_id: int, context, image_data: 
             except Exception as e:
                 logger.debug(f"Dispatcher status failed: {e}")
 
-            # Try web AI
-            web_ok = await _process_with_web_ai(user_message, chat_id, context)
+            # Try web AI (silent=True since we already showed the dispatch status)
+            web_ok = await _process_with_web_ai(user_message, chat_id, context, silent=True)
             if web_ok:
                 return
             logger.warning("Web AI failed, falling back")
 
-            # Web AI failed — try Claude CLI as backup (it can answer anything)
+            # Web AI failed — try Claude CLI as backup
             if not is_rate_limited():
                 logger.info(f"Chat {chat_id}: web AI failed, trying Claude CLI")
+                fallback_name = locals().get("pname", "Web AI")
+                await _send_response(
+                    chat_id,
+                    f"🔄 {fallback_name} 不可用，切换 Claude CLI...",
+                    context,
+                )
                 success = await _process_with_claude_cli(user_message, chat_id, context)
                 if success:
                     return
