@@ -645,21 +645,118 @@ async def process_gemini(messages, chat_id, context, selected_tools=None):
     return True, None
 
 
+# ─── Web AI Provider (parallel browser-based, no API key needed) ──────────────
+
+# Complexity signals: long messages, code, multi-step tasks → use parallel web AI
+_COMPLEXITY_KEYWORDS = [
+    "分析", "解释", "帮我写", "写一个", "实现", "设计", "优化", "重构",
+    "analyze", "explain", "implement", "design", "optimize", "refactor",
+    "write a", "help me", "create a", "generate", "code", "algorithm",
+    "architecture", "compare", "review", "debug", "fix", "improve",
+]
+
+def _is_complex_task(message: str) -> bool:
+    """Heuristic: is this task complex enough to benefit from multiple AI opinions?"""
+    if len(message) > 200:
+        return True
+    msg_lower = message.lower()
+    return any(kw in msg_lower for kw in _COMPLEXITY_KEYWORDS)
+
+
+async def process_web_ai(messages, chat_id, context, selected_tools=None):
+    """Query browser-based free AI web interfaces. No API key required.
+
+    For complex tasks: queries all platforms in PARALLEL and combines results.
+    For simple tasks: races platforms and returns the fastest response.
+    Returns (success: bool, error_type: str|None).
+    """
+    from web_ai import query_web_ai_parallel, query_web_ai_race, _available_platforms, PLATFORM_DISPLAY
+
+    # Check if any platforms are available
+    if not _available_platforms():
+        return False, "no_platforms"
+
+    # Get the latest user message
+    user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            user_msg = m["content"]
+            break
+    if not user_msg:
+        return False, "empty"
+
+    is_complex = _is_complex_task(user_msg)
+
+    try:
+        if is_complex:
+            # Parallel: query all platforms simultaneously, collect all responses
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🌐 复杂任务 — 同时询问多个 AI 网页...",
+            )
+            results = await query_web_ai_parallel(user_msg)
+
+            if not results:
+                return False, "no_response"
+
+            if len(results) == 1:
+                response, platform = results[0]
+                messages.append({"role": "assistant", "content": response})
+                header = f"**{PLATFORM_DISPLAY.get(platform, platform)}:**\n\n"
+                await _send_text(header + response, chat_id, context, parse_mode="Markdown")
+            else:
+                # Multiple responses — send each with platform label
+                combined_parts = []
+                for response, platform in results:
+                    label = PLATFORM_DISPLAY.get(platform, platform)
+                    combined_parts.append(f"**[{label}]**\n{response}")
+
+                combined = "\n\n---\n\n".join(combined_parts)
+                messages.append({"role": "assistant", "content": combined})
+                await _send_text(combined, chat_id, context, parse_mode="Markdown")
+
+        else:
+            # Race: return first platform that responds
+            response, platform = await query_web_ai_race(user_msg)
+
+            if not response:
+                return False, "no_response"
+
+            label = PLATFORM_DISPLAY.get(platform, platform)
+            messages.append({"role": "assistant", "content": response})
+            await _send_text(f"**[{label}]** {response}", chat_id, context, parse_mode="Markdown")
+
+        return True, None
+
+    except Exception as e:
+        logger.error(f"process_web_ai error: {e}")
+        return False, str(e)
+
+
 # ─── Auto-switching router ────────────────────────────────────────────────────
 
 PROVIDER_FNS = {
     "claude": process_claude,
     "openai": process_openai,
     "gemini": process_gemini,
+    "web_ai": process_web_ai,
 }
+
+PROVIDER_DISPLAY["web_ai"] = "Web AI (免费网页)"
 
 
 async def process_with_auto_fallback(messages, chat_id, context):
-    """Try providers in priority order. Auto-switch on billing/auth errors."""
+    """Try providers in priority order. Auto-switch on billing/auth errors.
+
+    Falls back to free browser-based web AI if all API providers fail.
+    """
     cost_order = ["gemini", "claude", "openai"]
     priority = [config.CURRENT_PROVIDER] + [
         p for p in cost_order if p != config.CURRENT_PROVIDER
     ]
+    # web_ai is always last resort (no API key, but text-only, no tool_use)
+    if "web_ai" not in priority:
+        priority.append("web_ai")
 
     # Smart tool selection based on latest user message
     user_msg = ""
@@ -681,28 +778,23 @@ async def process_with_auto_fallback(messages, chat_id, context):
 
         if success:
             if provider != config.CURRENT_PROVIDER:
-                old = config.CURRENT_PROVIDER
                 config.CURRENT_PROVIDER = provider
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"✅ 已自动切换到 {PROVIDER_DISPLAY[provider]}",
+                    text=f"✅ 已自动切换到 {PROVIDER_DISPLAY.get(provider, provider)}",
                 )
             return True
 
         tried.append(provider)
 
-        if error == "no_key":
-            logger.info(f"{provider}: no API key, skipping")
-            continue
-
-        if error == "no_package":
-            logger.info(f"{provider}: package not installed, skipping")
+        if error in ("no_key", "no_package", "no_platforms"):
+            logger.info(f"{provider}: unavailable ({error}), skipping")
             continue
 
         if error in ("billing", "auth"):
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"⚠️ {PROVIDER_DISPLAY[provider]} 无法使用（{'余额不足' if error == 'billing' else '认证失败'}），自动切换...",
+                text=f"⚠️ {PROVIDER_DISPLAY.get(provider, provider)} 无法使用（{'余额不足' if error == 'billing' else '认证失败'}），自动切换...",
             )
             continue
 
@@ -710,11 +802,11 @@ async def process_with_auto_fallback(messages, chat_id, context):
         logger.error(f"{provider} error: {error}")
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ {PROVIDER_DISPLAY[provider]} 出错，尝试下一个...",
+            text=f"⚠️ {PROVIDER_DISPLAY.get(provider, provider)} 出错，尝试下一个...",
         )
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="❌ 所有 AI 服务都不可用。\n请检查 .env 里的 API key 和账户余额。",
+        text="❌ 所有 AI 服务（含免费网页）都不可用。\n请确认 Chrome 已登录 ChatGPT/Claude.ai/Gemini。",
     )
     return False

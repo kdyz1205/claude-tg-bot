@@ -28,6 +28,7 @@ class BrowserConfig:
     screenshot_on_error: bool = True
     screenshot_dir: str = "./screenshots"
     chrome_path: str = ""        # Custom Chrome/Edge path if needed
+    cdp_url: str = ""            # Connect to running Chrome via CDP (e.g. http://localhost:9222)
 
 
 @dataclass
@@ -59,10 +60,37 @@ class BrowserAgent(ABC):
         self._page = None
 
     async def launch(self):
-        """Launch the browser."""
+        """Launch or connect to a browser.
+
+        Priority:
+        1. CDP connection (cdp_url) — connects to already-running Chrome with all logins
+        2. Persistent context (user_data_dir) — opens Chrome profile (fails if Chrome running)
+        3. Fresh browser — no login sessions
+        """
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
+
+        # Option 1: Connect to running Chrome via CDP
+        # This is the BEST option — uses user's existing Chrome with all logins intact
+        if self.config.cdp_url:
+            try:
+                self._browser = await self._playwright.chromium.connect_over_cdp(
+                    self.config.cdp_url,
+                    slow_mo=self.config.slow_mo,
+                )
+                contexts = self._browser.contexts
+                if contexts:
+                    self._context = contexts[0]
+                    # Open a new tab for our work (don't mess with user's existing tabs)
+                    self._page = await self._context.new_page()
+                else:
+                    self._context = await self._browser.new_context()
+                    self._page = await self._context.new_page()
+                logger.info(f"[{self.PLATFORM_NAME}] Connected to Chrome via CDP")
+                return
+            except Exception as e:
+                logger.warning(f"[{self.PLATFORM_NAME}] CDP connection failed: {e}, trying other methods")
 
         launch_args = {
             "headless": self.config.headless,
@@ -71,19 +99,24 @@ class BrowserAgent(ABC):
         if self.config.chrome_path:
             launch_args["executable_path"] = self.config.chrome_path
 
-        # Use persistent context to reuse login sessions
+        # Option 2: Persistent context (reuse login sessions from Chrome profile)
         if self.config.user_data_dir:
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                self.config.user_data_dir,
-                **launch_args,
-            )
-            self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-        else:
-            self._browser = await self._playwright.chromium.launch(**launch_args)
-            self._context = await self._browser.new_context()
-            self._page = await self._context.new_page()
+            try:
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    self.config.user_data_dir,
+                    **launch_args,
+                )
+                self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+                logger.info(f"[{self.PLATFORM_NAME}] Browser launched with persistent profile")
+                return
+            except Exception as e:
+                logger.warning(f"[{self.PLATFORM_NAME}] Persistent context failed (Chrome already running?): {e}")
 
-        logger.info(f"[{self.PLATFORM_NAME}] Browser launched")
+        # Option 3: Fresh browser (no logins — will likely fail)
+        self._browser = await self._playwright.chromium.launch(**launch_args)
+        self._context = await self._browser.new_context()
+        self._page = await self._context.new_page()
+        logger.info(f"[{self.PLATFORM_NAME}] Browser launched (fresh, no logins)")
 
     async def close(self):
         """Close browser and cleanup."""

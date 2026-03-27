@@ -183,11 +183,18 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     valid = list(PROVIDER_DISPLAY.keys())
     if not context.args:
         lines = ["AI Provider 状态:\n"]
+        key_map = {"claude": config.ANTHROPIC_API_KEY, "openai": config.OPENAI_API_KEY, "gemini": config.GEMINI_API_KEY}
         for p, name in PROVIDER_DISPLAY.items():
-            has_key = bool({"claude": config.ANTHROPIC_API_KEY, "openai": config.OPENAI_API_KEY, "gemini": config.GEMINI_API_KEY}.get(p))
-            active = "✅ 当前" if p == config.CURRENT_PROVIDER else ("🔑 可用" if has_key else "❌ 无key")
-            lines.append(f"{active} — {name}")
-        lines.append(f"\n用法: `/provider claude|openai|gemini`")
+            if p == config.CURRENT_PROVIDER:
+                status = "✅ 当前"
+            elif p == "web_ai":
+                status = "🌐 免费"
+            elif key_map.get(p):
+                status = "🔑 可用"
+            else:
+                status = "❌ 无key"
+            lines.append(f"{status} — {name}")
+        lines.append(f"\n用法: `/provider claude|openai|gemini|web_ai`")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 

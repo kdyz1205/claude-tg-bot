@@ -27,36 +27,105 @@ logger = logging.getLogger(__name__)
 _orchestrator = None
 _harness_available = False
 
+CDP_PORT = 9222  # Chrome remote debugging port
+
+async def _ensure_chrome_cdp():
+    """Ensure Chrome is running with remote debugging enabled.
+    If not, launch it with --remote-debugging-port."""
+    import subprocess
+    import socket
+
+    # Check if CDP port is already open
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect(("127.0.0.1", CDP_PORT))
+        s.close()
+        logger.info(f"Chrome CDP already running on port {CDP_PORT}")
+        return True
+    except (ConnectionRefusedError, OSError, socket.timeout):
+        pass
+
+    # Launch Chrome with remote debugging
+    chrome_paths = [
+        os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Google", "Chrome", "Application", "chrome.exe"),
+    ]
+    chrome_exe = None
+    for p in chrome_paths:
+        if os.path.exists(p):
+            chrome_exe = p
+            break
+
+    if not chrome_exe:
+        logger.warning("Chrome not found, cannot start CDP")
+        return False
+
+    chrome_profile = os.path.join(
+        os.path.expanduser("~"), "AppData", "Local", "Google", "Chrome", "User Data"
+    )
+
+    try:
+        subprocess.Popen(
+            [chrome_exe,
+             f"--remote-debugging-port={CDP_PORT}",
+             f"--user-data-dir={chrome_profile}",
+             "--no-first-run",
+             "--restore-last-session"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Wait for Chrome to start
+        for _ in range(10):
+            await asyncio.sleep(1)
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                s.connect(("127.0.0.1", CDP_PORT))
+                s.close()
+                logger.info(f"Chrome started with CDP on port {CDP_PORT}")
+                return True
+            except (ConnectionRefusedError, OSError, socket.timeout):
+                pass
+        logger.warning("Chrome started but CDP port not responding")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to start Chrome: {e}")
+        return False
+
+
 def _init_harness():
-    """Lazy-init the harness orchestrator for browser-based AI fallback."""
+    """Lazy-init the harness orchestrator for browser-based AI."""
     global _orchestrator, _harness_available
     if _orchestrator is not None:
         return _orchestrator
     try:
         from pipeline.orchestrator import Orchestrator
+        from browser_agents.base import BrowserConfig
         from tracker.quota import QuotaTracker
         from tracker.session_store import SessionStore
 
-        chrome_profile = os.path.join(
-            os.path.expanduser("~"), "AppData", "Local",
-            "Google", "Chrome", "User Data"
+        browser_cfg = BrowserConfig(
+            headless=False,
+            cdp_url=f"http://127.0.0.1:{CDP_PORT}",
+            user_data_dir=os.path.join(
+                os.path.expanduser("~"), "AppData", "Local",
+                "Google", "Chrome", "User Data"
+            ),
+            timeout_ms=120000,
         )
-        browser_cfg = {
-            "headless": False,
-            "user_data_dir": chrome_profile if os.path.isdir(chrome_profile) else "",
-            "timeout_ms": 120000,
-        }
         _orchestrator = Orchestrator(
             repo_dir=os.path.dirname(os.path.abspath(__file__)),
-            browser_config=type("BrowserConfig", (), browser_cfg)(),
+            browser_config=browser_cfg,
             quota_tracker=QuotaTracker(),
             session_store=SessionStore(),
         )
         _harness_available = True
-        logger.info("Harness orchestrator initialized (browser AI fallback ready)")
+        logger.info("Harness orchestrator initialized (CDP browser AI ready)")
         return _orchestrator
     except Exception as e:
-        logger.warning(f"Harness init failed (browser fallback unavailable): {e}")
+        logger.warning(f"Harness init failed: {e}")
         _harness_available = False
         return None
 
@@ -507,9 +576,21 @@ def _queue_message(chat_id: int, text: str):
 async def _process_with_web_ai(user_message: str, chat_id: int, context, silent: bool = False) -> bool:
     """Process message using browser-based free AI. Returns True on success.
 
+    Flow:
+    1. Ensure Chrome is running with CDP (remote debugging)
+    2. Connect to Chrome → open AI site tab → type prompt → get response
+    3. All AI site logins are reused from user's Chrome session
+
     Args:
         silent: If True, don't send status messages (caller handles it)
     """
+    # Step 1: Ensure Chrome CDP is available
+    cdp_ok = await _ensure_chrome_cdp()
+    if not cdp_ok:
+        logger.warning("Chrome CDP not available, cannot use web AI")
+        return False
+
+    # Step 2: Init harness
     orch = _init_harness()
     if not orch:
         logger.debug("Harness not available")
@@ -519,7 +600,7 @@ async def _process_with_web_ai(user_message: str, chat_id: int, context, silent:
         if not silent:
             await _send_response(chat_id, "🌐 正在通过浏览器 AI 处理...", context)
 
-        # Use orchestrator to dispatch to best available platform
+        # Step 3: Execute via orchestrator → browser agent → AI website
         result = await asyncio.wait_for(
             orch.execute(user_message),
             timeout=180,  # 3 minutes max for browser AI
@@ -529,7 +610,12 @@ async def _process_with_web_ai(user_message: str, chat_id: int, context, silent:
             await _send_response(chat_id, result.summary, context)
             return True
         else:
-            logger.warning("Web AI returned no result")
+            error_info = ""
+            if result and result.agent_results:
+                errors = [r.error for r in result.agent_results if r.error]
+                if errors:
+                    error_info = f" ({errors[0][:100]})"
+            logger.warning(f"Web AI returned no result{error_info}")
             return False
 
     except asyncio.TimeoutError:
