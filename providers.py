@@ -81,6 +81,7 @@ TOOLS_NEEDING_SAFETY_CHECK = {"run_command"}
 # Core tools always available
 CORE_TOOLS = {
     "run_command", "take_screenshot", "open_url", "open_application",
+    "web_search",
 }
 
 # Tool groups activated by keyword matching
@@ -134,6 +135,12 @@ TOOL_GROUPS = {
                       "给我看", "帮我打开", "跳转", "网址"],
         "tools": {"browser_navigate", "browser_screenshot", "browser_get_text",
                   "browser_click", "browser_type"},
+    },
+    "search": {
+        "keywords": ["搜索", "search", "google", "查找", "find", "look up", "查一下",
+                      "最新", "latest", "news", "新闻", "价格", "price", "天气", "weather",
+                      "wiki", "how to", "怎么", "什么是", "what is"],
+        "tools": {"web_search", "browser_navigate", "browser_get_text"},
     },
 }
 
@@ -247,6 +254,45 @@ async def _run_tool(tool_name, tool_input, chat_id, context):
     return result_text
 
 
+def _sanitize_telegram_markdown(text: str) -> str:
+    """Sanitize text for Telegram Markdown parsing.
+    Preserves code blocks and inline code.
+    """
+    # Extract code blocks first to protect them
+    code_blocks = []
+    def _save_code_block(m):
+        code_blocks.append(m.group(0))
+        return f"\x00CODEBLOCK{len(code_blocks)-1}\x00"
+
+    # Protect triple-backtick code blocks
+    text = re.sub(r'```[\s\S]*?```', _save_code_block, text)
+    # Protect inline code
+    text = re.sub(r'`[^`]+`', _save_code_block, text)
+
+    # Fix remaining unmatched backticks
+    if text.count('`') % 2 != 0:
+        text = text.replace('`', '')
+
+    # Fix unmatched bold markers — remove last unmatched instead of appending
+    if text.count('*') % 2 != 0:
+        idx = text.rfind('*')
+        if idx >= 0:
+            text = text[:idx] + text[idx+1:]
+
+    # Fix unmatched underscores (but not in URLs)
+    parts = re.split(r'(https?://\S+)', text)
+    for i, part in enumerate(parts):
+        if not part.startswith('http') and part.count('_') % 2 != 0:
+            parts[i] = part.replace('_', '\\_')
+    text = ''.join(parts)
+
+    # Restore code blocks
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"\x00CODEBLOCK{i}\x00", block)
+
+    return text
+
+
 async def _send_text(text, chat_id, context, parse_mode=None):
     if not text or not text.strip():
         return
@@ -262,6 +308,11 @@ async def _send_text(text, chat_id, context, parse_mode=None):
                 break_pos = 4000
             chunk = remaining[:break_pos]
             remaining = remaining[break_pos:]
+
+        # Sanitize markdown if needed
+        if parse_mode == "Markdown":
+            chunk = _sanitize_telegram_markdown(chunk)
+
         kwargs = {"chat_id": chat_id, "text": chunk}
         if parse_mode:
             kwargs["parse_mode"] = parse_mode
@@ -306,15 +357,18 @@ async def process_claude(messages, chat_id, context, selected_tools=None):
                 return False, "auth"
             return False, str(e)
 
-        messages.append({"role": "assistant", "content": response.content})
-
         if response.stop_reason == "end_turn":
-            for block in response.content:
-                if block.type == "text" and block.text.strip():
-                    await _send_text(block.text, chat_id, context, parse_mode="Markdown")
+            text_parts = [b.text for b in response.content if b.type == "text" and b.text.strip()]
+            if text_parts:
+                text_combined = "\n".join(text_parts)
+                # Store as string so it survives the history cleanup in claude_agent.py
+                messages.append({"role": "assistant", "content": text_combined})
+                await _send_text(text_combined, chat_id, context, parse_mode="Markdown")
             return True, None
 
         elif response.stop_reason == "tool_use":
+            # Append list format required by Anthropic API for tool_use turns
+            messages.append({"role": "assistant", "content": response.content})
             tool_results = []
             for block in response.content:
                 if block.type == "text" and block.text.strip():
@@ -337,6 +391,20 @@ async def process_claude(messages, chat_id, context, selected_tools=None):
                 })
             messages.append({"role": "user", "content": tool_results})
 
+        elif response.stop_reason == "max_tokens":
+            # Partial response due to token limit — send what we have
+            text_parts = [b.text for b in response.content if b.type == "text" and b.text.strip()]
+            if text_parts:
+                text_combined = "\n".join(text_parts)
+                messages.append({"role": "assistant", "content": text_combined})
+                await _send_text(text_combined + "\n\n_(回复被截断，继续说话获取更多)_", chat_id, context)
+            return True, None
+
+        else:
+            logger.warning(f"Claude unexpected stop_reason: {response.stop_reason}")
+            break
+
+    await _send_text("⚠️ 达到最大工具调用次数，任务可能未完成。", chat_id, context)
     return True, None
 
 
@@ -396,6 +464,7 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
 
         if finish == "stop":
             if msg.content:
+                messages.append({"role": "assistant", "content": msg.content})
                 await _send_text(msg.content, chat_id, context)
             return True, None
 
@@ -424,6 +493,17 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
                 })
             oai_msgs.extend(tool_msgs)
 
+        elif finish == "length":
+            if msg.content:
+                messages.append({"role": "assistant", "content": msg.content})
+                await _send_text(msg.content + "\n\n_(回复被截断，继续说话获取更多)_", chat_id, context)
+            return True, None
+
+        else:
+            logger.warning(f"OpenAI unexpected finish_reason: {finish}")
+            break
+
+    await _send_text("⚠️ 达到最大工具调用次数，任务可能未完成。", chat_id, context)
     return True, None
 
 
@@ -557,9 +637,11 @@ async def process_gemini(messages, chat_id, context, selected_tools=None):
                 except (ValueError, AttributeError):
                     text = None
             if text:
+                messages.append({"role": "assistant", "content": text})
                 await _send_text(text, chat_id, context)
             return True, None
 
+    await _send_text("⚠️ 达到最大工具调用次数，任务可能未完成。", chat_id, context)
     return True, None
 
 

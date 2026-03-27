@@ -83,6 +83,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/provider - 切换AI服务\n"
         "/bridge - 切换CLI/API模式\n"
         "/kill - 终止卡住的任务\n"
+        "/quota - AI平台用量\n"
+        "/sessions - 会话状态\n"
         "/help - 帮助\n"
         "/q - 快捷操作面板"
     )
@@ -134,9 +136,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     queue_size = len(claude_agent._pending_messages.get(chat_id, []))
     is_busy = claude_agent._get_lock(chat_id).locked()
 
+    mode_str = "Claude Code CLI (Plan tokens)" if config.BRIDGE_MODE else f"API ({config.CURRENT_PROVIDER})"
     await update.message.reply_text(
         f"📊 状态\n\n"
-        f"模式: Claude Code CLI (Plan tokens)\n"
+        f"模式: {mode_str}\n"
         f"模型: {config.CLAUDE_MODEL}\n"
         f"Session: {session_id}\n"
         f"队列: {queue_size} 条待处理\n"
@@ -197,6 +200,36 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔧 安装软件、Git操作\n\n"
         "直接说就行，不用客气。"
     )
+
+
+async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show quota status for all AI platforms."""
+    try:
+        from tracker.quota import QuotaTracker
+        qt = QuotaTracker()
+        report = qt.status_report()
+        rate_info = ""
+        if claude_agent.is_rate_limited():
+            remaining = int(claude_agent._rate_limited_until - __import__('time').time())
+            rate_info = f"\n⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
+        await update.message.reply_text(f"📊 AI 平台用量\n{rate_info}\n{report}")
+    except Exception as e:
+        rate_info = ""
+        if claude_agent.is_rate_limited():
+            remaining = int(claude_agent._rate_limited_until - __import__('time').time())
+            rate_info = f"⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
+        await update.message.reply_text(f"📊 Quota\n{rate_info}\nHarness 未初始化 (首次限速时自动启动)")
+
+
+async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show active/paused sessions."""
+    try:
+        from tracker.session_store import SessionStore
+        ss = SessionStore()
+        report = ss.status_report()
+        await update.message.reply_text(f"📋 Sessions\n\n{report}")
+    except Exception as e:
+        await update.message.reply_text(f"📋 Sessions\nHarness 未初始化: {e}")
 
 
 async def bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -354,14 +387,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photos — save to disk and tell Claude about it."""
+    """Handle photos — save to disk and pass to Claude with vision support in API mode."""
     chat_id = update.effective_chat.id
     caption = update.message.caption or ""
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-        # Save photo to disk so Claude can reference it
+        # Save photo to disk
         if not update.message.photo:
             await update.message.reply_text("📸 无法获取图片。")
             return
@@ -372,6 +405,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_path = os.path.join(save_dir, f"photo_{photo.file_id}.jpg")
         await file.download_to_drive(save_path)
 
+        # In API mode with vision enabled, read as base64
+        image_data = None
+        if config.ENABLE_VISION and not config.BRIDGE_MODE:
+            try:
+                with open(save_path, "rb") as f:
+                    import base64
+                    image_data = base64.b64encode(f.read()).decode("utf-8")
+            except Exception as e:
+                logger.warning(f"Failed to read image as base64: {e}")
+
         msg = f"用户发送了一张图片，已保存到: {save_path}"
         if caption:
             msg += f"\n用户说: {caption}"
@@ -379,7 +422,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "\n(无附加说明)"
 
         await update.message.reply_text(f"📸 图片已保存: {save_path}")
-        await claude_agent.process_message(msg, chat_id, context)
+        await claude_agent.process_message(msg, chat_id, context, image_data=image_data)
 
     except Exception as e:
         logger.error(f"Photo handling error: {e}", exc_info=True)
@@ -543,7 +586,8 @@ def _acquire_pid_lock():
     # Check if another instance is running
     if os.path.exists(_PID_FILE):
         try:
-            old_pid = int(open(_PID_FILE, "r").read().strip())
+            with open(_PID_FILE, "r") as _pf:
+                old_pid = int(_pf.read().strip())
             # Check if process is still alive
             try:
                 os.kill(old_pid, 0)  # signal 0 = test if process exists
@@ -569,7 +613,8 @@ def _release_pid_lock():
     """Remove PID file on clean exit."""
     try:
         if os.path.exists(_PID_FILE):
-            pid_in_file = int(open(_PID_FILE, "r").read().strip())
+            with open(_PID_FILE, "r") as _pf:
+                pid_in_file = int(_pf.read().strip())
             if pid_in_file == os.getpid():
                 os.remove(_PID_FILE)
     except Exception:
@@ -603,6 +648,8 @@ def main():
     app.add_handler(CommandHandler("status", status_command, filters=auth_filter))
     app.add_handler(CommandHandler("bridge", bridge_command, filters=auth_filter))
     app.add_handler(CommandHandler("kill", kill_command, filters=auth_filter))
+    app.add_handler(CommandHandler("quota", quota_command, filters=auth_filter))
+    app.add_handler(CommandHandler("sessions", sessions_command, filters=auth_filter))
     app.add_handler(CommandHandler("q", quick_action, filters=auth_filter))
     app.add_handler(CommandHandler("quick", quick_action, filters=auth_filter))
 
@@ -617,10 +664,10 @@ def main():
     app.add_handler(MessageHandler(auth_filter & filters.Document.ALL, handle_document))
 
     # Stickers — acknowledge but don't process
-    app.add_handler(MessageHandler(
-        auth_filter & filters.Sticker.ALL,
-        lambda u, c: u.message.reply_text("😄👍") if u.message else None
-    ))
+    async def _handle_sticker(u, c):
+        if u.message:
+            await u.message.reply_text("😄👍")
+    app.add_handler(MessageHandler(auth_filter & filters.Sticker.ALL, _handle_sticker))
 
     # Video/animation — save and notify Claude
     app.add_handler(MessageHandler(

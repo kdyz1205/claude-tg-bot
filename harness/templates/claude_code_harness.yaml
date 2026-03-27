@@ -1,0 +1,52 @@
+# Claude Code Session Harness Template
+#
+# This template is designed for Claude Code sessions.
+# Each session runs as an agent, communicating via git.
+#
+# Usage:
+#   1. Copy this template to your project
+#   2. Modify agent roles and capabilities
+#   3. Each Claude Code session loads the config and acts as its assigned agent
+#   4. Agents push/pull handoffs through git branches
+
+name: claude-code-session-harness
+
+channel:
+  type: git
+  config:
+    repo_dir: "."
+    remote: origin
+    branch_prefix: agent
+
+loop:
+  mode: ping_pong
+  max_iterations: 10
+  convergence_threshold: 0.9
+
+agents:
+  # Session 1: Writes code
+  - name: session-coder
+    role: coder
+    description: >
+      Claude Code session that generates and modifies code.
+      Reads instructions from handoff, writes code files,
+      pushes to agent/session-coder branch.
+    capabilities:
+      - python
+      - javascript
+      - react
+      - css
+    working_dir: ./src
+
+  # Session 2: Reviews and integrates
+  - name: session-reviewer
+    role: reviewer
+    description: >
+      Claude Code session that reviews code from session-coder.
+      Pulls from agent/session-coder, reviews, provides feedback,
+      pushes to agent/session-reviewer branch.
+    capabilities:
+      - code_review
+      - testing
+      - integration
+    working_dir: ./src

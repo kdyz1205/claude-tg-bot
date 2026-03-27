@@ -20,6 +20,8 @@ Thumbs.db
 # Runtime state
 .sessions.json
 .bot.pid
+.harness_state/
+.handoffs/
 
 # Temp
 *.tmp

@@ -652,6 +652,25 @@ TOOL_DEFINITIONS = [
             "required": ["url", "destination"],
         },
     },
+    # === Web Search ===
+    {
+        "name": "web_search",
+        "description": "Search the web using DuckDuckGo. Returns top results with titles, URLs, and snippets. Use this when you need current information, prices, news, documentation, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Number of results to return (default: 5, max: 10)",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 # App name -> executable mapping
@@ -1239,6 +1258,48 @@ async def execute_download_file(url: str, destination: str) -> str:
         return f"Error downloading file: {e}"
 
 
+async def execute_web_search(query: str, max_results: int = 5) -> str:
+    """Search the web using DuckDuckGo."""
+    try:
+        import urllib.parse
+        import re
+        max_results = min(max_results or 5, 10)
+        encoded = urllib.parse.quote_plus(query)
+        url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        loop = asyncio.get_running_loop()
+
+        def _fetch():
+            import requests
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            return resp.text
+
+        html = await loop.run_in_executor(None, _fetch)
+
+        # Parse results
+        results = []
+        # Find result blocks (simplified pattern - DuckDuckGo HTML structure)
+        blocks = re.findall(r'<a rel="nofollow" class="result__a" href="(.*?)".*?>(.*?)</a>.*?<a class="result__snippet".*?>(.*?)</a>', html, re.DOTALL)
+
+        for i, (href, title, snippet) in enumerate(blocks[:max_results]):
+            # Clean HTML tags
+            title = re.sub(r'<.*?>', '', title).strip()
+            snippet = re.sub(r'<.*?>', '', snippet).strip()
+            # Decode URL
+            if href.startswith("//duckduckgo.com/l/?uddg="):
+                try:
+                    href = urllib.parse.unquote(href.split("uddg=")[1].split("&")[0])
+                except (IndexError, ValueError):
+                    pass
+            results.append(f"[{i+1}] {title}\n    {href}\n    {snippet}\n")
+
+        if not results:
+            return f"No results found for: {query}"
+        return f"Search results for '{query}':\n\n" + "\n".join(results)
+    except Exception as e:
+        return f"Search error: {e}"
+
+
 # Screenshot sentinel for the agent loop
 SCREENSHOT_SENTINEL = "__SCREENSHOT__"
 
@@ -1357,6 +1418,11 @@ async def execute_tool(tool_name: str, tool_input: dict):
         result = await execute_download_file(
             tool_input["url"],
             tool_input["destination"],
+        )
+    elif tool_name == "web_search":
+        result = await execute_web_search(
+            tool_input["query"],
+            tool_input.get("max_results", 5),
         )
     # === Browser Automation (Playwright) ===
     elif tool_name == "browser_navigate":

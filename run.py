@@ -55,12 +55,12 @@ def main():
                 exit_code = proc.wait()
         except KeyboardInterrupt:
             print("\nStopped by user.")
-            if 'proc' in dir() and proc.poll() is None:
+            if 'proc' in locals() and proc.poll() is None:
                 proc.terminate()
             break
         except SystemExit:
             print("\nSystemExit caught. Shutting down.")
-            if 'proc' in dir() and proc.poll() is None:
+            if 'proc' in locals() and proc.poll() is None:
                 proc.terminate()
             break
         except Exception as e:

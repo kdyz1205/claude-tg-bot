@@ -70,3 +70,7 @@ DANGEROUS_PATTERNS = [
     r"Remove-Item.*-Recurse.*[\\\/]Windows",  # Recursive delete Windows
     r"Remove-Item.*-Recurse.*[\\\/]Program Files",  # Recursive delete Program Files
 ]
+
+# ─── AI Capabilities ───────────────────────────────────────────────────────────
+ENABLE_VISION = True
+ENABLE_WEB_SEARCH = True

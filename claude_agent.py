@@ -1,12 +1,11 @@
 """
-claude_agent.py — Routes messages to Claude Code CLI (Plan tokens).
+claude_agent.py — Smart message router for the Telegram bot.
 
 Architecture:
-  User (Telegram) → bot.py → claude_agent.py → claude -p --resume <session>
-                                                  ↓
-                                              Full computer access
-                                              Uses Plan tokens (free)
-                                              Persistent conversations
+  User (Telegram) → bot.py → claude_agent.py → routing decision:
+    1. Simple Q&A → Gemini API (free, fast)
+    2. Computer tasks → Claude Code CLI (--resume session)
+    3. Rate-limited → Web AI fallback (browser automation, free)
 
 Message Queue:
 - While processing a task, new messages are queued
@@ -23,6 +22,43 @@ from pathlib import Path
 import config
 
 logger = logging.getLogger(__name__)
+
+# ─── Harness Integration (browser-based free AI fallback) ────────────────────
+_orchestrator = None
+_harness_available = False
+
+def _init_harness():
+    """Lazy-init the harness orchestrator for browser-based AI fallback."""
+    global _orchestrator, _harness_available
+    if _orchestrator is not None:
+        return _orchestrator
+    try:
+        from pipeline.orchestrator import Orchestrator
+        from tracker.quota import QuotaTracker
+        from tracker.session_store import SessionStore
+
+        chrome_profile = os.path.join(
+            os.path.expanduser("~"), "AppData", "Local",
+            "Google", "Chrome", "User Data"
+        )
+        browser_cfg = {
+            "headless": False,
+            "user_data_dir": chrome_profile if os.path.isdir(chrome_profile) else "",
+            "timeout_ms": 120000,
+        }
+        _orchestrator = Orchestrator(
+            repo_dir=os.path.dirname(os.path.abspath(__file__)),
+            browser_config=type("BrowserConfig", (), browser_cfg)(),
+            quota_tracker=QuotaTracker(),
+            session_store=SessionStore(),
+        )
+        _harness_available = True
+        logger.info("Harness orchestrator initialized (browser AI fallback ready)")
+        return _orchestrator
+    except Exception as e:
+        logger.warning(f"Harness init failed (browser fallback unavailable): {e}")
+        _harness_available = False
+        return None
 
 # Full path to claude CLI (npm global install)
 CLAUDE_CMD = os.path.join(
@@ -58,14 +94,21 @@ Key files: bot.py, claude_agent.py, config.py, providers.py, tools.py, safety.py
 GitHub: https://github.com/kdyz1205/claude-tg-bot
 If user mentions "bug", "fix", "修复", "改进", "improve" → READ these files and fix issues. No questions asked.
 
+## CAPABILITIES
+- 📸 **Vision**: When user sends images, you can see and analyze them. Image understanding is enabled.
+- 🔍 **Web Search**: Use web_search tool to find current information, prices, news, documentation. Always search for latest data when appropriate.
+- 💻 **Full Computer Control**: All tools available (files, apps, commands, browser, mouse, keyboard, clipboard).
+- 🎨 **Browser Automation**: Can open websites, fill forms, click buttons, read pages with Playwright.
+- 📁 **File Operations**: Read, write, edit, find files. Full filesystem access.
+
 ## BEHAVIOR
 - ACT IMMEDIATELY. Zero clarification. Zero permission requests.
 - Be concise — user is on phone. Short answers, no essays.
 - Reply in user's language (Chinese→Chinese, English→English).
-- You have FULL computer access: files, apps, commands, browser, everything.
 - If something fails, try 2-3 alternatives silently.
 - Current time is in [brackets] at start of each message.
 - If you're unsure what user wants, make your BEST GUESS and do it. Never ask.
+- Use web_search for current info, prices, news, or technical documentation.
 """
 
 # ─── Session Persistence ─────────────────────────────────────────────────────
@@ -110,6 +153,19 @@ _processing_locks: dict[int, asyncio.Lock] = {}
 
 # Max age for queued messages (seconds) — don't process stale messages
 _MAX_PENDING_AGE = 600  # 10 minutes
+
+# Rate limit tracking — when CLI is rate-limited, use web AI fallback
+_rate_limited_until: float = 0.0  # timestamp when rate limit expires
+
+def is_rate_limited() -> bool:
+    """Check if Claude Code CLI is currently rate-limited."""
+    return time.time() < _rate_limited_until
+
+def _set_rate_limited(seconds: int = 300):
+    """Mark CLI as rate-limited for N seconds."""
+    global _rate_limited_until
+    _rate_limited_until = time.time() + seconds
+    logger.warning(f"Claude CLI rate-limited for {seconds}s")
 
 
 def _get_lock(chat_id: int) -> asyncio.Lock:
@@ -244,7 +300,8 @@ async def _run_claude_cli(
             # those sessions have no conversation content and poison the chain
             if response and ("hit your limit" in response.lower() or "rate limit" in response.lower()):
                 logger.warning(f"Claude CLI rate limited: {response[:200]}")
-                response = "⏳ Claude 达到速率限制。请稍等几分钟后再试。"
+                _set_rate_limited(300)  # 5 minutes cooldown
+                response = None  # Signal to caller to try fallback
                 new_session_id = None  # Don't store this empty session!
 
         except json.JSONDecodeError:
@@ -284,6 +341,51 @@ async def _run_claude_cli(
     return response, new_session_id
 
 
+# ─── Markdown Sanitization ────────────────────────────────────────────────────
+
+def _sanitize_telegram_markdown(text: str) -> str:
+    """Sanitize text for Telegram Markdown parsing.
+    Fixes common issues that cause parse failures.
+    Preserves code blocks (``` ... ```) and inline code (` ... `).
+    """
+    import re
+
+    # Extract code blocks first to protect them
+    code_blocks = []
+    def _save_code_block(m):
+        code_blocks.append(m.group(0))
+        return f"\x00CODEBLOCK{len(code_blocks)-1}\x00"
+
+    # Protect triple-backtick code blocks
+    text = re.sub(r'```[\s\S]*?```', _save_code_block, text)
+    # Protect inline code
+    text = re.sub(r'`[^`]+`', _save_code_block, text)
+
+    # Now fix remaining unmatched backticks (outside code blocks)
+    if text.count('`') % 2 != 0:
+        text = text.replace('`', '')
+
+    # Fix unmatched bold markers — but don't just append, strip them
+    if text.count('*') % 2 != 0:
+        # Remove the last unmatched asterisk instead of appending a random one
+        idx = text.rfind('*')
+        if idx >= 0:
+            text = text[:idx] + text[idx+1:]
+
+    # Fix unmatched underscores (but not in URLs)
+    parts = re.split(r'(https?://\S+)', text)
+    for i, part in enumerate(parts):
+        if not part.startswith('http') and part.count('_') % 2 != 0:
+            parts[i] = part.replace('_', '\\_')
+    text = ''.join(parts)
+
+    # Restore code blocks
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"\x00CODEBLOCK{i}\x00", block)
+
+    return text
+
+
 # ─── Response Sender ──────────────────────────────────────────────────────────
 
 async def _send_response(chat_id: int, response: str, context):
@@ -311,7 +413,10 @@ async def _send_response(chat_id: int, response: str, context):
             if break_pos == -1:
                 break_pos = 4000
             chunk = remaining[:break_pos]
-            remaining = remaining[break_pos:]
+            remaining = remaining[break_pos:].lstrip('\n')
+
+        # Sanitize markdown before sending
+        chunk = _sanitize_telegram_markdown(chunk)
 
         try:
             await context.bot.send_message(
@@ -323,6 +428,55 @@ async def _send_response(chat_id: int, response: str, context):
                 await context.bot.send_message(chat_id=chat_id, text=chunk)
             except Exception as e:
                 logger.error(f"Failed to send message to {chat_id}: {e}")
+
+
+# ─── File Sending ─────────────────────────────────────────────────────────────
+
+async def _send_files_from_response(response: str, chat_id: int, context):
+    """Scan response for file paths and send them back to Telegram.
+
+    Only sends files that were explicitly created/saved/generated by Claude,
+    not every file path mentioned in conversation.
+    """
+    import re
+
+    # Only match paths preceded by action keywords (saved, created, written, etc.)
+    # This prevents sending random files just because their path appears in text
+    action_patterns = [
+        r'(?:saved|created|written|generated|downloaded|exported|output)\s*(?:to|at|:)\s*["\']?([A-Z]:\\[^\s\n"\'<>|]+\.\w{2,5})',
+        r'(?:保存|创建|生成|输出|导出|写入).*?[：:]\s*["\']?([A-Z]:\\[^\s\n"\'<>|]+\.\w{2,5})',
+    ]
+
+    paths = []
+    for pattern in action_patterns:
+        paths += re.findall(pattern, response, re.IGNORECASE)
+
+    # Skip source code files and logs — only send user-facing output files
+    SKIP_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.log', '.json', '.yaml',
+                       '.yml', '.toml', '.cfg', '.ini', '.env', '.sh', '.bat', '.cmd',
+                       '.pid', '.lock', '.gitignore'}
+
+    sent = set()
+    for path in paths:
+        path = path.strip().rstrip('.')
+        if path in sent or not os.path.exists(path):
+            continue
+        ext = os.path.splitext(path)[1].lower()
+        if ext in SKIP_EXTENSIONS:
+            continue
+        sent.add(path)
+        try:
+            if ext in ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'):
+                with open(path, 'rb') as f:
+                    await context.bot.send_photo(chat_id=chat_id, photo=f)
+            elif ext in ('.mp4', '.avi', '.mov', '.webm'):
+                with open(path, 'rb') as f:
+                    await context.bot.send_video(chat_id=chat_id, video=f)
+            elif os.path.getsize(path) < 50 * 1024 * 1024:  # 50MB limit
+                with open(path, 'rb') as f:
+                    await context.bot.send_document(chat_id=chat_id, document=f)
+        except Exception as e:
+            logger.warning(f"Failed to send file {path}: {e}")
 
 
 # ─── Queue Helpers ────────────────────────────────────────────────────────────
@@ -350,10 +504,51 @@ def _queue_message(chat_id: int, text: str):
 
 # ─── Main Processing Logic ────────────────────────────────────────────────────
 
+async def _process_with_web_ai(user_message: str, chat_id: int, context) -> bool:
+    """Fallback: process message using browser-based free AI. Returns True on success."""
+    orch = _init_harness()
+    if not orch:
+        return False
+
+    try:
+        await _send_response(chat_id, "🌐 Claude 限速中，切换到免费 AI (浏览器模式)...", context)
+
+        # Use orchestrator to dispatch to best available platform
+        result = await asyncio.wait_for(
+            orch.execute(user_message),
+            timeout=180,  # 3 minutes max for browser AI
+        )
+
+        if result and result.success and result.summary:
+            await _send_response(chat_id, result.summary, context)
+            return True
+        else:
+            logger.warning("Web AI returned no result")
+            return False
+
+    except asyncio.TimeoutError:
+        logger.warning("Web AI timed out")
+        await _send_response(chat_id, "⏰ 浏览器 AI 超时。请稍后重试。", context)
+        return True  # Don't cascade to API fallback
+    except Exception as e:
+        logger.error(f"Web AI error: {e}", exc_info=True)
+        return False
+
+
 async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> bool:
     """Process message using Claude Code CLI. Returns True on success."""
     try:
         response, new_session_id = await _run_claude_cli(user_message, chat_id, context)
+
+        # Rate-limited — response is None, try web AI fallback
+        if response is None:
+            logger.info(f"Chat {chat_id}: CLI rate-limited, trying web AI fallback")
+            web_ok = await _process_with_web_ai(user_message, chat_id, context)
+            if web_ok:
+                return True
+            # Web AI also failed — tell user to wait
+            await _send_response(chat_id, "⏳ Claude 达到速率限制，浏览器 AI 也不可用。请稍等几分钟后再试。", context)
+            return True  # Don't cascade to API (which costs money)
 
         # Session recovery: if response indicates session error, retry without resume
         resp_lower = response.lower() if response else ""
@@ -376,6 +571,10 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
 
         await _send_response(chat_id, response, context)
 
+        # Try to send any files mentioned in the response
+        if response:
+            await _send_files_from_response(response, chat_id, context)
+
         # Process any messages that arrived during this processing
         pending = _drain_pending(chat_id)
         while pending:
@@ -397,6 +596,8 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
                     _claude_sessions[chat_id] = followup_sid
                     _save_sessions()
                 await _send_response(chat_id, followup_resp, context)
+                if followup_resp:
+                    await _send_files_from_response(followup_resp, chat_id, context)
             except asyncio.TimeoutError:
                 await _send_response(
                     chat_id, "⏰ 追加任务超时(5分钟)。发新消息继续。", context
@@ -438,11 +639,17 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         return False
 
 
-async def process_message(user_message: str, chat_id: int, context):
+async def process_message(user_message: str, chat_id: int, context, image_data: str | None = None):
     """Process a user message with queue support and proper locking.
 
     If already processing for this chat, queue the message.
     Otherwise, acquire lock and start processing.
+
+    Args:
+        user_message: The user's text message
+        chat_id: Telegram chat ID
+        context: Telegram context
+        image_data: Optional base64-encoded image data for vision support
     """
     lock = _get_lock(chat_id)
 
@@ -463,8 +670,16 @@ async def process_message(user_message: str, chat_id: int, context):
 
     # Acquire lock and process
     async with lock:
-        # Bridge mode (default): use Claude Code CLI with Plan tokens
-        if getattr(config, "BRIDGE_MODE", True):
+        # If rate-limited, go straight to web AI fallback (skip CLI entirely)
+        if is_rate_limited() and getattr(config, "BRIDGE_MODE", True):
+            logger.info(f"Chat {chat_id}: CLI rate-limited, routing to web AI directly")
+            web_ok = await _process_with_web_ai(user_message, chat_id, context)
+            if web_ok:
+                return
+            # Web AI also failed — fall through to API providers
+
+        # Bridge mode (default): use Claude Code CLI
+        elif getattr(config, "BRIDGE_MODE", True):
             success = await _process_with_claude_cli(user_message, chat_id, context)
             if success:
                 return
@@ -485,7 +700,23 @@ async def process_message(user_message: str, chat_id: int, context):
                 combined = user_message + "\n" + "\n".join(m["text"] for m in pending)
             else:
                 combined = user_message
-            history.append({"role": "user", "content": combined})
+
+            # Build message with vision content if image provided
+            if image_data:
+                msg_content = [
+                    {"type": "text", "text": combined},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_data,
+                        },
+                    },
+                ]
+                history.append({"role": "user", "content": msg_content})
+            else:
+                history.append({"role": "user", "content": combined})
 
             while len(history) > config.MAX_CONVERSATION_HISTORY:
                 history.pop(0)
@@ -495,10 +726,20 @@ async def process_message(user_message: str, chat_id: int, context):
             if not success:
                 return
 
-            # Clean up non-text messages from history (tool use artifacts)
+            # Clean up tool use artifacts from history, but keep vision messages
+            def _keep_message(m):
+                content = m.get("content")
+                if isinstance(content, str):
+                    return True
+                # Keep vision messages (list with image blocks from user)
+                if isinstance(content, list) and m.get("role") == "user":
+                    return any(
+                        isinstance(b, dict) and b.get("type") in ("text", "image")
+                        for b in content
+                    )
+                return False
             conversations[chat_id] = [
-                m for m in conversations[chat_id]
-                if isinstance(m.get("content"), str)
+                m for m in conversations[chat_id] if _keep_message(m)
             ]
 
         except Exception as e:
