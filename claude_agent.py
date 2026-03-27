@@ -66,6 +66,51 @@ async def _ensure_chrome_cdp():
         os.path.expanduser("~"), "AppData", "Local", "Google", "Chrome", "User Data"
     )
 
+    # If Chrome is running WITHOUT CDP, we need to restart it WITH CDP.
+    # Otherwise the new instance will conflict on the profile lock.
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Process chrome -ErrorAction SilentlyContinue | Select-Object -First 1 | Format-List Id"],
+            capture_output=True, text=True, timeout=5,
+        )
+        chrome_running = "Id" in result.stdout
+    except Exception:
+        chrome_running = False
+
+    if chrome_running:
+        logger.info("Chrome is running without CDP — restarting with --remote-debugging-port")
+        try:
+            # Gracefully close Chrome (it will save session state)
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-Process chrome -ErrorAction SilentlyContinue | "
+                 "ForEach-Object { $_.CloseMainWindow() | Out-Null }"],
+                capture_output=True, text=True, timeout=10,
+            )
+            # Wait for Chrome to close
+            for _ in range(10):
+                await asyncio.sleep(1)
+                check = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-Process chrome -ErrorAction SilentlyContinue).Count"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                count = check.stdout.strip()
+                if not count or count == "0":
+                    break
+            else:
+                # Force kill if graceful close didn't work
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                await asyncio.sleep(2)
+        except Exception as e:
+            logger.warning(f"Failed to close Chrome: {e}")
+
+    # Now launch Chrome with CDP
     try:
         subprocess.Popen(
             [chrome_exe,
@@ -76,8 +121,8 @@ async def _ensure_chrome_cdp():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # Wait for Chrome to start
-        for _ in range(10):
+        # Wait for Chrome CDP to become available
+        for _ in range(15):
             await asyncio.sleep(1)
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
