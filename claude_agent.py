@@ -639,17 +639,54 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         return False
 
 
+# ─── Smart Router (Harness Mode) ──────────────────────────────────────────────
+# Keywords that indicate the task needs LOCAL computer control (Claude CLI only)
+_COMPUTER_CONTROL_KEYWORDS = [
+    # Chinese
+    "打开", "截图", "截屏", "运行", "执行", "安装", "启动", "关闭", "停止",
+    "重启", "下载", "上传", "复制文件", "移动文件", "删除文件", "创建文件",
+    "编辑文件", "打开文件", "锁屏", "音量", "亮度", "wifi", "蓝牙",
+    "鼠标", "键盘", "点击", "滚动", "输入", "窗口", "桌面", "进程",
+    "任务管理器", "命令行", "终端", "powershell", "cmd", "屏幕",
+    "给我看", "拍照", "录屏", "系统信息", "电脑", "电脑上",
+    # English
+    "open", "launch", "run command", "execute", "install", "screenshot",
+    "start", "stop", "restart", "download", "upload", "click", "scroll",
+    "type", "mouse", "keyboard", "window", "desktop", "process",
+    "terminal", "powershell", "screen", "take screenshot", "system info",
+    "on my computer", "on the computer", "on this machine",
+    # Specific apps / computer actions
+    "chrome", "vscode", "vs code", "explorer", "notepad", "browser",
+    "git push", "git commit", "git pull", "npm", "pip install",
+]
+
+# Keywords for tasks about THIS bot's own code (also needs CLI)
+_SELF_REFERENCE_KEYWORDS = [
+    "修复bug", "fix bug", "修复", "debug", "改进", "improve",
+    "你的代码", "your code", "bot代码", "tgbot", "这个bot",
+    "源代码", "source code",
+]
+
+
+def _needs_computer_control(message: str) -> bool:
+    """Does this message require local computer access (tools)?"""
+    msg_lower = message.lower()
+    for kw in _COMPUTER_CONTROL_KEYWORDS:
+        if kw in msg_lower:
+            return True
+    for kw in _SELF_REFERENCE_KEYWORDS:
+        if kw in msg_lower:
+            return True
+    return False
+
+
 async def process_message(user_message: str, chat_id: int, context, image_data: str | None = None):
-    """Process a user message with queue support and proper locking.
+    """Main entry point: smart routing through harness dispatcher.
 
-    If already processing for this chat, queue the message.
-    Otherwise, acquire lock and start processing.
-
-    Args:
-        user_message: The user's text message
-        chat_id: Telegram chat ID
-        context: Telegram context
-        image_data: Optional base64-encoded image data for vision support
+    Routing priority:
+    1. Needs computer control? → Claude CLI (only option with tools)
+    2. Pure Q&A / code? → Harness dispatcher → free web AI
+    3. Rate-limited / all failed? → API fallback (Gemini free → Claude → OpenAI)
     """
     lock = _get_lock(chat_id)
 
@@ -658,7 +695,6 @@ async def process_message(user_message: str, chat_id: int, context, image_data: 
         _queue_message(chat_id, user_message)
         queue_size = len(_pending_messages.get(chat_id, []))
         logger.info(f"Chat {chat_id}: queued message ({queue_size} pending)")
-
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -668,24 +704,80 @@ async def process_message(user_message: str, chat_id: int, context, image_data: 
             pass
         return
 
-    # Acquire lock and process
     async with lock:
-        # If rate-limited, go straight to web AI fallback (skip CLI entirely)
-        if is_rate_limited() and getattr(config, "BRIDGE_MODE", True):
-            logger.info(f"Chat {chat_id}: CLI rate-limited, routing to web AI directly")
+        needs_tools = _needs_computer_control(user_message) or bool(image_data)
+        harness_mode = getattr(config, "HARNESS_MODE", True)
+
+        # ── Route 1: Computer control tasks → Claude CLI ──
+        if needs_tools:
+            logger.info(f"Chat {chat_id}: needs computer control → Claude CLI")
+
+            if is_rate_limited():
+                # CLI rate-limited — can't do computer tasks without it
+                await _send_response(
+                    chat_id,
+                    "⏳ Claude CLI 限速中，电脑操控功能暂时不可用。\n"
+                    "纯问答/代码任务仍可通过免费 AI 处理。",
+                    context,
+                )
+                return
+
+            success = await _process_with_claude_cli(user_message, chat_id, context)
+            if success:
+                return
+            logger.warning("Claude CLI failed for computer control task")
+            # Fall through to API providers (they also have tools)
+
+        # ── Route 2: Harness mode — dispatch to free web AI ──
+        elif harness_mode:
+            logger.info(f"Chat {chat_id}: harness mode → dispatching to free AI")
+
+            # Show dispatch plan
+            try:
+                from dispatcher import Dispatcher
+                from tracker.quota import QuotaTracker
+                dispatcher = Dispatcher(quota_tracker=QuotaTracker())
+                route = dispatcher.dispatch(user_message)
+                platform_names = {
+                    "gpt": "ChatGPT", "grok": "Grok",
+                    "claude_web": "Claude.ai", "claude_code": "Claude Code",
+                    "codex": "Codex",
+                }
+                pname = platform_names.get(route.platform, route.platform)
+                logger.info(
+                    f"Chat {chat_id}: dispatched to {pname} "
+                    f"(Level {route.difficulty}, {route.metadata.get('estimated_files', 1)} files)"
+                )
+                # Brief status to user
+                await _send_response(
+                    chat_id,
+                    f"🧠 Level {route.difficulty} → {pname}",
+                    context,
+                )
+            except Exception as e:
+                logger.debug(f"Dispatcher status failed: {e}")
+
+            # Try web AI
             web_ok = await _process_with_web_ai(user_message, chat_id, context)
             if web_ok:
                 return
-            # Web AI also failed — fall through to API providers
+            logger.warning("Web AI failed, falling back")
 
-        # Bridge mode (default): use Claude Code CLI
+            # Web AI failed — try Claude CLI as backup (it can answer anything)
+            if not is_rate_limited():
+                logger.info(f"Chat {chat_id}: web AI failed, trying Claude CLI")
+                success = await _process_with_claude_cli(user_message, chat_id, context)
+                if success:
+                    return
+
+        # ── Route 3: Legacy bridge mode (Claude CLI primary) ──
         elif getattr(config, "BRIDGE_MODE", True):
             success = await _process_with_claude_cli(user_message, chat_id, context)
             if success:
                 return
             logger.warning("Claude CLI failed, falling back to API providers")
 
-        # API provider fallback
+        # ── Route 4: API provider fallback (costs money) ──
         try:
             from providers import process_with_auto_fallback
 
@@ -693,15 +785,11 @@ async def process_message(user_message: str, chat_id: int, context, image_data: 
                 conversations[chat_id] = []
 
             history = conversations[chat_id]
-
-            # Include any queued messages
             pending = _drain_pending(chat_id)
+            combined = user_message
             if pending:
-                combined = user_message + "\n" + "\n".join(m["text"] for m in pending)
-            else:
-                combined = user_message
+                combined += "\n" + "\n".join(m["text"] for m in pending)
 
-            # Build message with vision content if image provided
             if image_data:
                 msg_content = [
                     {"type": "text", "text": combined},
@@ -722,16 +810,13 @@ async def process_message(user_message: str, chat_id: int, context, image_data: 
                 history.pop(0)
 
             success = await process_with_auto_fallback(history, chat_id, context)
-
             if not success:
                 return
 
-            # Clean up tool use artifacts from history, but keep vision messages
             def _keep_message(m):
                 content = m.get("content")
                 if isinstance(content, str):
                     return True
-                # Keep vision messages (list with image blocks from user)
                 if isinstance(content, list) and m.get("role") == "user":
                     return any(
                         isinstance(b, dict) and b.get("type") in ("text", "image")

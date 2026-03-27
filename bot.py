@@ -9,6 +9,7 @@ import asyncio
 import os
 import sys
 import signal
+import time
 import traceback
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -136,15 +137,26 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     queue_size = len(claude_agent._pending_messages.get(chat_id, []))
     is_busy = claude_agent._get_lock(chat_id).locked()
 
-    mode_str = "Claude Code CLI (Plan tokens)" if config.BRIDGE_MODE else f"API ({config.CURRENT_PROVIDER})"
+    if config.HARNESS_MODE:
+        mode_str = "🧠 Harness (免费AI优先)"
+    elif config.BRIDGE_MODE:
+        mode_str = "🔗 Claude CLI (直连)"
+    else:
+        mode_str = f"💰 API ({config.CURRENT_PROVIDER})"
+
+    rate_info = ""
+    if claude_agent.is_rate_limited():
+        remaining = int(claude_agent._rate_limited_until - time.time())
+        rate_info = f"\n⚠️ CLI限速: 还剩 {remaining}s"
+
     await update.message.reply_text(
         f"📊 状态\n\n"
         f"模式: {mode_str}\n"
         f"模型: {config.CLAUDE_MODEL}\n"
         f"Session: {session_id}\n"
         f"队列: {queue_size} 条待处理\n"
-        f"处理中: {'是' if is_busy else '否'}\n"
-        f"Bridge: {'✅' if config.BRIDGE_MODE else '❌'}",
+        f"处理中: {'是' if is_busy else '否'}"
+        f"{rate_info}",
     )
 
 
@@ -234,24 +246,37 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        status = "✅ 开启" if config.BRIDGE_MODE else "❌ 关闭"
+        harness = "✅ 开启" if config.HARNESS_MODE else "❌ 关闭"
+        bridge = "✅ 开启" if config.BRIDGE_MODE else "❌ 关闭"
         await update.message.reply_text(
-            f"Bridge Mode: {status}\n"
-            "on = 用 Claude Code CLI (Plan tokens)\n"
-            "off = 用 API (消耗token)\n"
-            "用法: /bridge on|off"
+            f"🧠 Harness Mode: {harness}\n"
+            f"🔗 Bridge Mode: {bridge}\n\n"
+            "Harness = 免费AI优先 (浏览器自动化)\n"
+            "  纯问答→ChatGPT/Grok, 代码→Claude.ai\n"
+            "  电脑操控→Claude CLI (唯一有工具的)\n\n"
+            "Bridge = Claude CLI 直连 (消耗token)\n\n"
+            "用法: /bridge harness|on|off"
         )
         return
     action = context.args[0].lower()
-    if action == "on":
+    if action == "harness":
+        config.HARNESS_MODE = True
+        config.BRIDGE_MODE = True
+        await update.message.reply_text(
+            "✅ Harness Mode 开启\n"
+            "免费AI优先，Claude CLI仅用于电脑操控"
+        )
+    elif action == "on":
+        config.HARNESS_MODE = False
         config.BRIDGE_MODE = True
         bridge.clear_bridge()
-        await update.message.reply_text("✅ Bridge Mode 开启 (Plan tokens)")
+        await update.message.reply_text("✅ Bridge Mode 开启 (Claude CLI 直连)")
     elif action == "off":
+        config.HARNESS_MODE = False
         config.BRIDGE_MODE = False
-        await update.message.reply_text("✅ Bridge Mode 关闭 (API mode)")
+        await update.message.reply_text("✅ API Mode (直接调API，最贵)")
     else:
-        await update.message.reply_text("用法: /bridge on|off")
+        await update.message.reply_text("用法: /bridge harness|on|off")
 
 
 # ─── Screenshot & Quick Actions ───────────────────────────────────────────────

@@ -30,6 +30,9 @@ CURRENT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "claude")
 
 # ─── Claude Code CLI Settings ────────────────────────────────────────────────
 BRIDGE_MODE = os.getenv("BRIDGE_MODE", "true").lower() == "true"
+# Harness mode: use browser AI as PRIMARY, CLI only for computer control
+# When True, overrides BRIDGE_MODE for non-tool tasks
+HARNESS_MODE = os.getenv("HARNESS_MODE", "true").lower() == "true"
 CLAUDE_CLI_TIMEOUT = int(os.getenv("CLAUDE_CLI_TIMEOUT", "300"))  # 5 min default
 
 # ─── Conversation & Processing ────────────────────────────────────────────────
