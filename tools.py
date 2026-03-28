@@ -709,6 +709,20 @@ APP_ALIASES = {
 }
 
 
+# ─── PowerShell Escaping ─────────────────────────────────────────────────────
+
+def _ps_escape_single(s: str) -> str:
+    """Escape a string for use inside PowerShell single quotes.
+    Single quotes in PS are escaped by doubling them: ' → ''"""
+    return s.replace("'", "''")
+
+
+def _ps_escape_double(s: str) -> str:
+    """Escape a string for use inside PowerShell double quotes.
+    Escape backticks, dollars, and double quotes."""
+    return s.replace('`', '``').replace('"', '`"').replace('$', '`$')
+
+
 # ─── Tool Implementations ────────────────────────────────────────────────────
 
 async def execute_run_command(command: str, shell: str = "powershell",
@@ -774,7 +788,7 @@ async def execute_open_application(app_name: str) -> str:
         return f"Opened '{app_name}' (resolved to '{resolved}')."
     except Exception as e:
         try:
-            result = await execute_run_command(f"Start-Process '{app_name}'")
+            result = await execute_run_command(f"Start-Process '{_ps_escape_single(app_name)}'")
             return f"Opened '{app_name}' via Start-Process. {result}"
         except Exception as e2:
             return f"Failed to open '{app_name}': {e} | {e2}"
@@ -787,7 +801,7 @@ async def execute_open_url(url: str) -> str:
         url = "https://" + url
     try:
         # Use Start-Process which reliably opens AND focuses the browser on Windows
-        result = await execute_run_command(f'Start-Process "{url}"')
+        result = await execute_run_command(f'Start-Process "{_ps_escape_double(url)}"')
         # Give the browser a moment to open
         await asyncio.sleep(1.5)
         return f"Opened URL in browser: {url}"
@@ -832,7 +846,7 @@ async def execute_list_windows() -> str:
 async def execute_focus_window(title: str) -> str:
     """Focus a window by title."""
     try:
-        safe_title = title.replace("'", "''")
+        safe_title = _ps_escape_single(title).replace('[', '`[').replace(']', '`]').replace('*', '`*').replace('?', '`?')
         ps_cmd = (
             f'$w = Get-Process | Where-Object {{$_.MainWindowTitle -like "*{safe_title}*"}} | Select-Object -First 1; '
             f'if ($w) {{ '
@@ -932,7 +946,7 @@ async def execute_set_clipboard(text: str) -> str:
             f.write(text)
             tmp_path = f.name
         await execute_run_command(
-            f'Get-Content -Path "{tmp_path}" -Raw | Set-Clipboard',
+            f"Get-Content -Path '{_ps_escape_single(tmp_path)}' -Raw | Set-Clipboard",
         )
         return f"Clipboard set ({len(text)} chars). Use Ctrl+V to paste."
     except Exception as e:
@@ -1245,7 +1259,7 @@ async def execute_download_file(url: str, destination: str) -> str:
             os.makedirs(dest_dir, exist_ok=True)
         # Use PowerShell Invoke-WebRequest for the download
         ps_cmd = (
-            f'Invoke-WebRequest -Uri "{url}" -OutFile "{destination}" '
+            f"Invoke-WebRequest -Uri '{_ps_escape_single(url)}' -OutFile '{_ps_escape_single(destination)}' "
             f'-UseBasicParsing -ErrorAction Stop'
         )
         result = await execute_run_command(ps_cmd, timeout=120)

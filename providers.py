@@ -307,7 +307,7 @@ async def _send_text(text, chat_id, context, parse_mode=None):
             if break_pos == -1:
                 break_pos = 4000
             chunk = remaining[:break_pos]
-            remaining = remaining[break_pos:]
+            remaining = remaining[break_pos:].lstrip('\n')
 
         # Sanitize markdown if needed
         if parse_mode == "Markdown":
@@ -473,7 +473,8 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
             for tc in msg.tool_calls or []:
                 try:
                     tool_input = json.loads(tc.function.arguments)
-                except Exception:
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"[OpenAI] Failed to parse tool args for {tc.function.name}: {e}")
                     tool_input = {}
 
                 if not await _safety_ok(tc.function.name, tool_input, chat_id, context):
@@ -607,7 +608,11 @@ async def process_gemini(messages, chat_id, context, selected_tools=None):
             for fn_part in fn_parts:
                 fc = fn_part.function_call
                 tool_name = fc.name
-                tool_input = dict(fc.args) if fc.args else {}
+                try:
+                    tool_input = dict(fc.args) if fc.args else {}
+                except (TypeError, ValueError) as e:
+                    logger.warning(f"[Gemini] Failed to convert tool args for {fc.name}: {e}")
+                    tool_input = {}
 
                 logger.info(f"[Gemini] Tool: {tool_name}({json.dumps(tool_input, ensure_ascii=False)[:200]})")
 

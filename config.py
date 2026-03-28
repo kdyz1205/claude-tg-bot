@@ -21,9 +21,16 @@ try:
     AUTHORIZED_USER_ID = int(_raw_user_id)
 except ValueError:
     AUTHORIZED_USER_ID = 0
+if AUTHORIZED_USER_ID == 0:
+    import warnings
+    warnings.warn(
+        "AUTHORIZED_USER_ID is 0 (unset). Bot will reject ALL messages. "
+        "Set AUTHORIZED_USER_ID in .env to your Telegram user ID.",
+        stacklevel=1,
+    )
 
 # ─── AI Models ────────────────────────────────────────────────────────────────
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL = "claude-opus-4-6"
 OPENAI_MODEL = "gpt-4o"
 GEMINI_MODEL = "gemini-2.5-flash"
 CURRENT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "claude")
@@ -33,7 +40,7 @@ BRIDGE_MODE = os.getenv("BRIDGE_MODE", "true").lower() == "true"
 # Harness mode: use browser AI as PRIMARY, CLI only for computer control
 # When True, overrides BRIDGE_MODE for non-tool tasks
 HARNESS_MODE = os.getenv("HARNESS_MODE", "true").lower() == "true"
-CLAUDE_CLI_TIMEOUT = int(os.getenv("CLAUDE_CLI_TIMEOUT", "300"))  # 5 min default
+CLAUDE_CLI_TIMEOUT = int(os.getenv("CLAUDE_CLI_TIMEOUT", "1800"))  # 30 min default
 
 # ─── Conversation & Processing ────────────────────────────────────────────────
 MAX_CONVERSATION_HISTORY = 80
@@ -49,7 +56,7 @@ TELEGRAM_FILES_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "telegram_
 DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-LOG_FILE = os.path.join(Path(__file__).parent, "bot.log")
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # ─── Validation ──────────────────────────────────────────────────────────
