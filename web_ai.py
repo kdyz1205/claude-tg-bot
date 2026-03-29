@@ -18,7 +18,6 @@ import asyncio
 import logging
 import os
 import time
-from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +27,19 @@ CHROME_USER_DATA = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Go
 # Singleton browser (separate from browser_agent.py's Playwright instance)
 _pw = None
 _browser = None
-_contexts: dict[str, object] = {}  # platform_name -> context
 _pages: dict[str, object] = {}     # platform_name -> page
 
 # Per-platform locks — allows concurrent queries across different platforms
-_browser_init_lock = asyncio.Lock()  # only for browser init
+_browser_init_lock: asyncio.Lock | None = None  # only for browser init
 _platform_locks: dict[str, asyncio.Lock] = {}  # lazily created per platform
+
+
+def _get_browser_init_lock() -> asyncio.Lock:
+    """Get or create the browser init lock for the current event loop."""
+    global _browser_init_lock
+    if _browser_init_lock is None:
+        _browser_init_lock = asyncio.Lock()
+    return _browser_init_lock
 
 
 def _get_platform_lock(platform: str) -> asyncio.Lock:
@@ -46,48 +52,64 @@ async def _get_page(platform: str, url: str):
     """Get or create a browser page for a platform, using Chrome profile."""
     global _pw, _browser
 
-    if platform in _pages:
-        page = _pages[platform]
-        if not page.is_closed():
-            return page
+    # Per-platform lock prevents duplicate page creation for the same platform
+    async with _get_platform_lock(platform):
+        # Re-check under lock (another coroutine may have created it)
+        if platform in _pages:
+            page = _pages[platform]
+            if not page.is_closed():
+                return page
+            else:
+                del _pages[platform]  # Clean up stale entry
 
-    # Connect to running Chrome via CDP (reuses all login sessions)
-    # Falls back to persistent context if CDP not available
-    async with _browser_init_lock:
-        if _browser is None or not _browser.is_connected():
-            from playwright.async_api import async_playwright
-            _pw = await async_playwright().start()
+        # Connect to running Chrome via CDP (reuses all login sessions)
+        # Falls back to persistent context if CDP not available
+        async with _get_browser_init_lock():
+            if _browser is None or not _browser.is_connected():
+                from playwright.async_api import async_playwright
+                _pw = await async_playwright().start()
 
-            # Try CDP first (connects to user's running Chrome)
+                # Try CDP first (connects to user's running Chrome)
+                try:
+                    import socket
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        s.settimeout(1)
+                        s.connect(("127.0.0.1", 9222))
+                    finally:
+                        s.close()
+                    _browser = await _pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                    logger.info("web_ai: connected to Chrome via CDP")
+                except Exception:
+                    # Fallback: launch with persistent context
+                    logger.info("web_ai: CDP not available, launching persistent context")
+                    _browser = await _pw.chromium.launch_persistent_context(
+                        user_data_dir=CHROME_USER_DATA,
+                        headless=False,
+                        channel="chrome",
+                        args=["--start-maximized", "--no-first-run"],
+                        no_viewport=True,
+                        timeout=30000,
+                    )
+
+        # Create new page for this platform (under platform lock — prevents duplicates)
+        # CDP browser has contexts; persistent context IS the context
+        if hasattr(_browser, 'contexts') and _browser.contexts:
+            page = await _browser.contexts[0].new_page()
+        else:
+            page = await _browser.new_page()
+        _pages[platform] = page  # Register immediately to prevent orphans
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        except Exception:
+            # Clean up on navigation failure
+            _pages.pop(platform, None)
             try:
-                import socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(1)
-                s.connect(("127.0.0.1", 9222))
-                s.close()
-                _browser = await _pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-                logger.info("web_ai: connected to Chrome via CDP")
+                await page.close()
             except Exception:
-                # Fallback: launch with persistent context
-                logger.info("web_ai: CDP not available, launching persistent context")
-                _browser = await _pw.chromium.launch_persistent_context(
-                    user_data_dir=CHROME_USER_DATA,
-                    headless=False,
-                    channel="chrome",
-                    args=["--start-maximized", "--no-first-run"],
-                    no_viewport=True,
-                    timeout=30000,
-                )
-
-    # Create new page for this platform (outside init lock — each platform gets its own page)
-    # CDP browser has contexts; persistent context IS the context
-    if hasattr(_browser, 'contexts') and _browser.contexts:
-        page = await _browser.contexts[0].new_page()
-    else:
-        page = await _browser.new_page()
-    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-    _pages[platform] = page
-    return page
+                pass
+            raise
+        return page
 
 
 async def _wait_and_get_response(page, response_selector: str, timeout: float = 120.0) -> str:
@@ -103,10 +125,15 @@ async def _wait_and_get_response(page, response_selector: str, timeout: float = 
     # Wait for streaming to finish (text stops changing)
     last_text = ""
     stable_count = 0
+    consecutive_errors = 0
     while time.time() - start < timeout:
         await asyncio.sleep(2)
         try:
+            if page.is_closed():
+                logger.warning("Response poll: page closed mid-stream")
+                break
             elements = await page.query_selector_all(response_selector)
+            consecutive_errors = 0  # Reset on success
             if not elements:
                 continue
             # Get the LAST response element (newest reply)
@@ -119,10 +146,13 @@ async def _wait_and_get_response(page, response_selector: str, timeout: float = 
                 stable_count = 0
                 last_text = current_text
         except Exception as e:
-            logger.debug(f"Response poll error: {e}")
-            continue
+            consecutive_errors += 1
+            logger.debug(f"Response poll error ({consecutive_errors}): {e}")
+            if consecutive_errors >= 5:
+                logger.warning(f"Response poll: {consecutive_errors} consecutive errors, giving up")
+                break
 
-    # Timeout — return whatever we have
+    # Timeout or error — return whatever we have
     return last_text.strip() if last_text else None
 
 
@@ -326,7 +356,7 @@ async def query_web_ai_parallel(message: str) -> list[tuple[str, str]]:
     ]
 
     results = []
-    for coro in asyncio.as_completed([asyncio.shield(t) for t in tasks]):
+    for coro in asyncio.as_completed(tasks):
         try:
             response, name = await coro
             if response:
@@ -366,9 +396,16 @@ async def query_web_ai_race(message: str) -> tuple[str | None, str]:
                 if response:
                     winner = (response, name)
                     # Cancel remaining tasks
-                    for t in pending:
+                    cancelled = list(pending)
+                    for t in cancelled:
                         t.cancel()
                     pending.clear()
+                    # Await cancelled tasks to suppress "task destroyed but pending" warnings
+                    for t in cancelled:
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
                     break
             except Exception:
                 pass
@@ -377,23 +414,46 @@ async def query_web_ai_race(message: str) -> tuple[str | None, str]:
 
 
 async def close_web_ai():
-    """Close all web AI browser pages."""
-    global _pw, _browser
-    async with _browser_init_lock:
-        for name, page in _pages.items():
+    """Close all web AI browser pages and reset all state for clean restart."""
+    global _pw, _browser, _browser_init_lock
+    try:
+        lock = _get_browser_init_lock()
+        async with lock:
+            # Copy items to avoid RuntimeError from dict mutation during iteration
+            pages_snapshot = list(_pages.items())
+            _pages.clear()
+            for name, page in pages_snapshot:
+                try:
+                    if not page.is_closed():
+                        await page.close()
+                except Exception:
+                    pass
+
             try:
-                if not page.is_closed():
-                    await page.close()
+                if _browser:
+                    await _browser.close()
+                if _pw:
+                    await _pw.stop()
             except Exception:
                 pass
+            _browser = None
+            _pw = None
+    except RuntimeError:
+        # Lock from a dead event loop — force cleanup without lock
         _pages.clear()
-
         try:
             if _browser:
                 await _browser.close()
+        except Exception:
+            pass
+        try:
             if _pw:
                 await _pw.stop()
         except Exception:
             pass
         _browser = None
         _pw = None
+
+    # Reset locks so fresh ones are created on the new event loop
+    _browser_init_lock = None
+    _platform_locks.clear()

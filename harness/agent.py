@@ -117,6 +117,8 @@ class Agent:
         result = agent.process(handoff)
     """
 
+    MAX_HISTORY = 100  # Prevent unbounded memory growth
+
     def __init__(self, config: AgentConfig):
         self.config = config
         self.name = config.name
@@ -148,6 +150,9 @@ class Agent:
 
         result = self._handler(handoff)
         self._history.append(result)
+        # Prevent unbounded memory growth
+        if len(self._history) > self.MAX_HISTORY:
+            self._history = self._history[-self.MAX_HISTORY:]
         return result
 
     def create_handoff(self, target: str, instructions: str = "") -> Handoff:

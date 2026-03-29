@@ -54,25 +54,32 @@ def _read_json(path: Path):
 
 
 def _write_json(path: Path, data):
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".tmp", dir=str(path.parent), delete=False, encoding="utf-8",
-    )
+    tmp = None
+    tmp_name = None
     try:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".tmp", dir=str(path.parent), delete=False, encoding="utf-8",
+        )
+        tmp_name = tmp.name
         tmp.write(json.dumps(data, ensure_ascii=False, indent=2))
+        tmp.flush()
+        os.fsync(tmp.fileno())
         tmp.close()
+        tmp = None  # Mark as closed so cleanup doesn't double-close
         # On Windows, shutil.move may fail if target is locked — use replace
-        tmp_path = tmp.name
-        os.replace(tmp_path, str(path))
+        os.replace(tmp_name, str(path))
     except Exception as e:
         logger.error(f"Failed to write {path.name}: {e}")
-        try:
-            tmp.close()
-        except Exception:
-            pass
-        try:
-            os.unlink(tmp.name)
-        except Exception:
-            pass
+        if tmp is not None:
+            try:
+                tmp.close()
+            except Exception:
+                pass
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
         raise
 
 
@@ -99,17 +106,32 @@ def _write_to_inbox_locked(chat_id: int, user_message: str) -> int:
     return msg_id
 
 
-def read_response(message_id: int, timeout: int = 120) -> str | None:
-    """Bot waits for Claude Code's response."""
+async def read_response(message_id: int, timeout: int = 120) -> str | None:
+    """Bot waits for Claude Code's response.
+
+    This is async to avoid blocking the event loop with time.sleep().
+    Uses run_in_executor to avoid blocking the event loop with the threading lock.
+    """
+    import asyncio
+    loop = asyncio.get_running_loop()
     start = time.time()
     while time.time() - start < timeout:
+        result = await loop.run_in_executor(None, _check_outbox_for_response, message_id)
+        if result is not None:
+            return result
+        await asyncio.sleep(1)
+    return None
+
+
+def _check_outbox_for_response(message_id: int) -> str | None:
+    """Check outbox for a response (called from executor to avoid blocking event loop)."""
+    with _bridge_lock:
         responses = _read_json(OUTBOX)
         for r in responses:
             if r.get("reply_to_id") == message_id and not r.get("sent"):
                 r["sent"] = True
                 _write_json(OUTBOX, responses)
                 return r["response"]
-        time.sleep(1)
     return None
 
 
@@ -120,9 +142,18 @@ def check_inbox() -> list[dict]:
     with _bridge_lock:
         messages = _read_json(INBOX)
         unread = [m for m in messages if not m.get("read")]
-        for m in messages:
+        if not unread:
+            return []
+        for m in unread:
             m["read"] = True
-        _write_json(INBOX, messages)
+        try:
+            _write_json(INBOX, messages)
+        except Exception as e:
+            logger.error(f"Failed to mark messages as read: {e}")
+            # Revert read marks so messages aren't lost
+            for m in unread:
+                m["read"] = False
+            return []
         return unread
 
 
@@ -142,8 +173,9 @@ def send_response(message_id: int, chat_id: int, response: str):
 
 def clear_bridge():
     """Clear all bridge data."""
-    _write_json(INBOX, [])
-    _write_json(OUTBOX, [])
+    with _bridge_lock:
+        _write_json(INBOX, [])
+        _write_json(OUTBOX, [])
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────
@@ -153,12 +185,14 @@ if __name__ == "__main__":
         print("🔗 Bridge Watcher - watching for Telegram messages...")
         seen = set()
         while True:
-            pending = [m for m in _read_json(INBOX) if not m.get("read")]
+            with _bridge_lock:
+                pending = [m for m in _read_json(INBOX) if not m.get("read")]
             for msg in pending:
-                if msg["id"] not in seen:
-                    seen.add(msg["id"])
-                    print(f"\n📩 [{msg['id']}] {msg['timestamp']}")
-                    print(f"   {msg['message']}")
+                msg_id = msg.get("id")
+                if msg_id is not None and msg_id not in seen:
+                    seen.add(msg_id)
+                    print(f"\n📩 [{msg_id}] {msg.get('timestamp', '?')}")
+                    print(f"   {msg.get('message', '')}")
             time.sleep(2)
     elif len(sys.argv) > 1 and sys.argv[1] == "clear":
         clear_bridge()

@@ -16,6 +16,7 @@ When the platform comes back online, the orchestrator can:
 from __future__ import annotations
 
 import json
+import os
 import time
 import logging
 from dataclasses import dataclass, field
@@ -120,8 +121,11 @@ class SessionState:
 
     @classmethod
     def from_dict(cls, data: dict) -> SessionState:
-        data["status"] = SessionStatus(data.get("status", "active"))
-        return cls(**data)
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        filtered["status"] = SessionStatus(filtered.get("status", "active"))
+        return cls(**filtered)
 
 
 class SessionStore:
@@ -135,10 +139,25 @@ class SessionStore:
     def __init__(self, state_file: str = ".harness_state/sessions.json"):
         self.state_file = Path(state_file)
         self.sessions: dict[str, SessionState] = {}
+        self._save_lock = __import__("threading").Lock()
         self._load()
+
+    MAX_SESSIONS = 200  # Prevent unbounded memory growth
 
     def create(self, platform: str, task: str, conversation_url: str = "") -> SessionState:
         """Create a new session."""
+        # Auto-cleanup if too many sessions
+        if len(self.sessions) >= self.MAX_SESSIONS:
+            self.cleanup_old(max_age_hours=24)
+        if len(self.sessions) >= self.MAX_SESSIONS:
+            # Still too many — force remove oldest completed
+            completed = sorted(
+                [(sid, s) for sid, s in self.sessions.items()
+                 if s.status in (SessionStatus.COMPLETED, SessionStatus.FAILED)],
+                key=lambda x: x[1].created_at,
+            )
+            for sid, _ in completed[:50]:
+                del self.sessions[sid]
         session_id = f"{platform}_{int(time.time())}_{len(self.sessions)}"
         session = SessionState(
             session_id=session_id,
@@ -227,9 +246,18 @@ class SessionStore:
         return "\n".join(lines)
 
     def _save(self):
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        data = {sid: s.to_dict() for sid, s in self.sessions.items()}
-        self.state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        with self._save_lock:
+            try:
+                self.state_file.parent.mkdir(parents=True, exist_ok=True)
+                data = {sid: s.to_dict() for sid, s in self.sessions.items()}
+                tmp = self.state_file.with_suffix(".tmp")
+                with open(str(tmp), "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(str(tmp), str(self.state_file))
+            except OSError as e:
+                logger.error(f"Failed to save sessions: {e}")
 
     def _load(self):
         if not self.state_file.exists():
@@ -240,5 +268,5 @@ class SessionStore:
                 sid: SessionState.from_dict(s) for sid, s in data.items()
             }
             logger.info(f"Loaded {len(self.sessions)} sessions from disk")
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning(f"Failed to load sessions: {e}")

@@ -1,0 +1,67 @@
+{
+  "workflows": [
+    {
+      "task_type": "code_create",
+      "steps": [
+        "completed_successfully"
+      ],
+      "duration_ms": 10749,
+      "recorded_at": "2026-03-27T22:25:20.542490",
+      "use_count": 0
+    },
+    {
+      "task_type": "code_review",
+      "steps": [
+        "completed_successfully"
+      ],
+      "duration_ms": 8071,
+      "recorded_at": "2026-03-28T00:08:52.076774",
+      "use_count": 0
+    },
+    {
+      "task_type": "screenshot",
+      "steps": [
+        "completed_successfully"
+      ],
+      "duration_ms": 17584,
+      "recorded_at": "2026-03-28T08:03:21.688562",
+      "use_count": 0
+    },
+    {
+      "task_type": "general",
+      "steps": [
+        "completed_successfully"
+      ],
+      "duration_ms": 19332,
+      "recorded_at": "2026-03-29T00:39:48.122007",
+      "use_count": 0
+    },
+    {
+      "task_type": "code_fix",
+      "steps": [
+        "completed_successfully"
+      ],
+      "duration_ms": 49587,
+      "recorded_at": "2026-03-29T00:43:13.850745",
+      "use_count": 0
+    },
+    {
+      "task_type": "computer_control",
+      "steps": [
+        "completed_successfully"
+      ],
+      "duration_ms": 13457,
+      "recorded_at": "2026-03-29T00:44:29.331400",
+      "use_count": 0
+    }
+  ],
+  "failure_patterns": [
+    {
+      "task_type": "test_action",
+      "error": "timeout error",
+      "attempted_fix": "",
+      "recorded_at": "2026-03-28T22:10:06.009126",
+      "occurrences": 1
+    }
+  ]
+}

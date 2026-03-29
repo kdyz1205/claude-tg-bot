@@ -47,7 +47,9 @@ class FilePayload:
 
     @classmethod
     def from_dict(cls, data: dict) -> FilePayload:
-        return cls(**data)
+        # Only pass known fields to avoid TypeError on extra keys
+        valid_keys = {"path", "content", "language", "insert_point"}
+        return cls(**{k: v for k, v in data.items() if k in valid_keys})
 
 
 @dataclass
@@ -67,8 +69,11 @@ class Message:
 
     @classmethod
     def from_dict(cls, data: dict) -> Message:
+        data = dict(data)  # Don't mutate the caller's dict
         data["msg_type"] = MessageType(data["msg_type"])
-        return cls(**data)
+        # Only pass known fields to avoid TypeError on extra keys
+        valid_keys = {"msg_type", "sender", "receiver", "content", "timestamp", "metadata"}
+        return cls(**{k: v for k, v in data.items() if k in valid_keys})
 
 
 @dataclass
@@ -130,11 +135,13 @@ class Handoff:
 
     def to_json(self, indent: int = 2) -> str:
         d = asdict(self)
-        # Convert enums in messages
+        # asdict() converts Enum values to their .value automatically in
+        # modern Python, but guard against older dataclasses behaviour.
         for msg in d.get("messages", []):
-            if isinstance(msg.get("msg_type"), MessageType):
-                msg["msg_type"] = msg["msg_type"].value
-        return json.dumps(d, indent=indent, ensure_ascii=False)
+            mt = msg.get("msg_type")
+            if isinstance(mt, MessageType):
+                msg["msg_type"] = mt.value
+        return json.dumps(d, indent=indent, ensure_ascii=False, default=str)
 
     def save(self, path: str | Path):
         path = Path(path)
@@ -144,15 +151,25 @@ class Handoff:
     @classmethod
     def load(cls, path: str | Path) -> Handoff:
         path = Path(path)
-        data = json.loads(path.read_text(encoding="utf-8"))
-        # Reconstruct nested objects
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            raise ValueError(f"Failed to load handoff from {path}: {e}") from e
         data["files"] = [FilePayload.from_dict(f) for f in data.get("files", [])]
         data["messages"] = [Message.from_dict(m) for m in data.get("messages", [])]
-        return cls(**data)
+        # Filter to only known fields to prevent TypeError on unexpected keys
+        import dataclasses as _dc
+        valid_keys = {f.name for f in _dc.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered)
 
     @classmethod
     def from_json(cls, json_str: str) -> Handoff:
         data = json.loads(json_str)
         data["files"] = [FilePayload.from_dict(f) for f in data.get("files", [])]
         data["messages"] = [Message.from_dict(m) for m in data.get("messages", [])]
-        return cls(**data)
+        # Filter to only known fields to prevent TypeError on unexpected keys
+        import dataclasses as _dc
+        valid_keys = {f.name for f in _dc.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered)

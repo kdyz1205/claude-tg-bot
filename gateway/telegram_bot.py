@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Lightweight Telegram Bot — no heavy dependencies, just urllib
 import urllib.request
-import urllib.parse
+import urllib.error
 
 
 @dataclass
@@ -72,26 +72,55 @@ class TelegramBot:
         else:
             req = urllib.request.Request(url)
 
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode()
+                return json.loads(body)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = int(e.headers.get("Retry-After", 30))
+                logger.warning(f"Telegram API rate limited, waiting {retry_after}s...")
+                import time
+                time.sleep(min(retry_after, 120))
+                # Retry once
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read().decode())
+            raise
 
     def send_message(self, chat_id: int, text: str, parse_mode: str = "Markdown"):
         """Send a message back to the user."""
+        if not text:
+            text = "(empty response)"
         # Truncate if too long for Telegram (4096 char limit)
         if len(text) > 4000:
             text = text[:4000] + "\n\n... (truncated)"
-        self._api_call("sendMessage", {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode,
-        })
+        try:
+            self._api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+            })
+        except Exception:
+            # Markdown parsing can fail on arbitrary text; retry without parse_mode
+            try:
+                self._api_call("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": text,
+                })
+            except Exception as e:
+                logger.error(f"Failed to send message to {chat_id}: {e}")
 
     def send_status(self, chat_id: int, status: str):
-        """Send a status update (typing indicator + message)."""
-        self._api_call("sendChatAction", {
-            "chat_id": chat_id,
-            "action": "typing",
-        })
+        """Send a status update (typing indicator + optional message)."""
+        try:
+            self._api_call("sendChatAction", {
+                "chat_id": chat_id,
+                "action": "typing",
+            })
+        except Exception as e:
+            logger.debug(f"Failed to send typing indicator: {e}")
+        if status and status != "typing":
+            self.send_message(chat_id, status)
 
     def _parse_update(self, update: dict) -> TelegramMessage | None:
         """Parse a Telegram update into our message format."""
@@ -101,20 +130,33 @@ class TelegramBot:
             return None
 
         user = msg.get("from", {})
+        chat = msg.get("chat")
+        if not chat or "id" not in chat:
+            return None
+        # Only handle private chats; ignore groups/channels
+        chat_type = chat.get("type", "private")
+        if chat_type not in ("private",):
+            logger.debug(f"Ignoring message from {chat_type} chat {chat.get('id')}")
+            return None
         return TelegramMessage(
-            chat_id=msg["chat"]["id"],
+            chat_id=chat["id"],
             text=text,
             user_id=user.get("id", 0),
             username=user.get("username", "unknown"),
             message_id=msg.get("message_id", 0),
         )
 
+    async def _async_api_call(self, method: str, params: dict = None) -> dict:
+        """Non-blocking wrapper around _api_call for use in async context."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._api_call, method, params)
+
     async def poll(self):
         """Long-polling loop to receive messages."""
         logger.info("Telegram bot started. Waiting for messages...")
         while True:
             try:
-                result = self._api_call("getUpdates", {
+                result = await self._async_api_call("getUpdates", {
                     "offset": self._offset,
                     "timeout": 30,
                 })
@@ -122,13 +164,15 @@ class TelegramBot:
                     self._offset = update["update_id"] + 1
                     msg = self._parse_update(update)
                     if msg and self._handler:
-                        self.send_status(msg.chat_id, "typing")
+                        # send_status uses blocking urllib — run in executor
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, self.send_status, msg.chat_id, "typing")
                         try:
                             response = await self._handler(msg)
-                            self.send_message(msg.chat_id, response)
+                            await loop.run_in_executor(None, self.send_message, msg.chat_id, response)
                         except Exception as e:
                             logger.error(f"Handler error: {e}")
-                            self.send_message(msg.chat_id, f"Error: {e}")
+                            await loop.run_in_executor(None, self.send_message, msg.chat_id, f"Error: {e}")
             except Exception as e:
                 logger.error(f"Polling error: {e}")
                 await asyncio.sleep(5)

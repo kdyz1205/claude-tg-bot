@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Telegram Bot (auto-restart)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["run.py"],
+      "port": 0
+    },
+    {
+      "name": "Telegram Bot (direct)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["bot.py"],
+      "port": 0
+    },
+    {
+      "name": "Crypto Analysis Server",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-u", "../crypto-analysis-/run.py"],
+      "port": 8001
+    },
+    {
+      "name": "OKX Pump Alert Monitor",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-u", "../crypto-analysis-/okx_pump_alert.py"],
+      "port": 0
+    }
+  ]
+}

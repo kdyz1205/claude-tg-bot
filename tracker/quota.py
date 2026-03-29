@@ -299,6 +299,8 @@ class QuotaTracker:
 
     def _cleanup_old_records(self):
         """Remove usage records older than the longest window."""
+        if not self.quotas:
+            return
         max_window = max(q.window_seconds for q in self.quotas.values())
         cutoff = time.time() - (max_window * 2)  # Keep 2x window for safety
         for platform in self.usage:
@@ -329,7 +331,33 @@ class QuotaTracker:
             },
             "saved_at": time.time(),
         }
-        self.state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        try:
+            import os as _os
+            import tempfile
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(self.state_file.parent), suffix=".tmp"
+            )
+            fd_closed = False
+            try:
+                with _os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    fd_closed = True  # fdopen took ownership
+                    json.dump(state, f, indent=2)
+                    f.flush()
+                    _os.fsync(f.fileno())
+                _os.replace(tmp_path, str(self.state_file))
+            except BaseException:
+                if not fd_closed:
+                    try:
+                        _os.close(tmp_fd)
+                    except OSError:
+                        pass
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            logger.error(f"Failed to save quota state: {e}")
 
     def _load_state(self):
         """Load persisted state from disk."""
@@ -366,5 +394,5 @@ class QuotaTracker:
             self._cleanup_old_records()
             logger.info("Quota state restored from disk")
 
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning(f"Failed to load quota state: {e}")

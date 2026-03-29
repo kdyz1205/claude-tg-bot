@@ -55,6 +55,7 @@ class BrowserAgent(ABC):
 
     def __init__(self, config: BrowserConfig | None = None):
         self.config = config or BrowserConfig()
+        self._playwright = None
         self._browser = None
         self._context = None
         self._page = None
@@ -67,6 +68,13 @@ class BrowserAgent(ABC):
         2. Persistent context (user_data_dir) — opens Chrome profile (fails if Chrome running)
         3. Fresh browser — no login sessions
         """
+        # Clean up any previous launch that wasn't properly closed
+        if self._playwright is not None:
+            try:
+                await self.close()
+            except Exception:
+                pass
+
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
@@ -120,16 +128,31 @@ class BrowserAgent(ABC):
 
     async def close(self):
         """Close browser and cleanup."""
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-        logger.info(f"[{self.PLATFORM_NAME}] Browser closed")
+        try:
+            # When connected via CDP, only close our page — don't close the user's browser
+            if self.config.cdp_url:
+                if self._page:
+                    await self._page.close()
+            else:
+                if self._context:
+                    await self._context.close()
+                if self._browser:
+                    await self._browser.close()
+        except Exception as e:
+            logger.warning(f"[{self.PLATFORM_NAME}] Error during close: {e}")
+        finally:
+            if self._playwright:
+                await self._playwright.stop()
+            self._playwright = None
+            self._browser = None
+            self._context = None
+            self._page = None
+            logger.info(f"[{self.PLATFORM_NAME}] Browser closed")
 
     async def navigate(self):
         """Navigate to the AI platform URL."""
+        if self._page is None:
+            raise RuntimeError(f"[{self.PLATFORM_NAME}] Browser page not initialized. Call launch() first.")
         await self._page.goto(self.URL, wait_until="networkidle")
         logger.info(f"[{self.PLATFORM_NAME}] Navigated to {self.URL}")
 
@@ -183,11 +206,14 @@ class BrowserAgent(ABC):
         except Exception as e:
             logger.error(f"[{self.PLATFORM_NAME}] Error: {e}")
             if self.config.screenshot_on_error and self._page:
-                ss_dir = Path(self.config.screenshot_dir)
-                ss_dir.mkdir(parents=True, exist_ok=True)
-                ss_path = ss_dir / f"{self.PLATFORM_NAME}_error_{int(time.time())}.png"
-                await self._page.screenshot(path=str(ss_path))
-                logger.info(f"Error screenshot saved: {ss_path}")
+                try:
+                    ss_dir = Path(self.config.screenshot_dir)
+                    ss_dir.mkdir(parents=True, exist_ok=True)
+                    ss_path = ss_dir / f"{self.PLATFORM_NAME}_error_{int(time.time())}.png"
+                    await self._page.screenshot(path=str(ss_path))
+                    logger.info(f"Error screenshot saved: {ss_path}")
+                except Exception as ss_err:
+                    logger.warning(f"[{self.PLATFORM_NAME}] Failed to capture error screenshot: {ss_err}")
 
             return AgentResult(
                 success=False,
@@ -206,6 +232,8 @@ class BrowserAgent(ABC):
 
     async def _type_human_like(self, selector: str, text: str):
         """Type text character by character (more human-like, avoids detection)."""
+        if self._page is None:
+            raise RuntimeError("Browser page not initialized. Call launch() first.")
         element = await self._page.wait_for_selector(selector, timeout=10_000)
         # Use clipboard paste for speed — Playwright fill() is too fast
         await element.click()
@@ -216,6 +244,8 @@ class BrowserAgent(ABC):
         Wait for the AI to stop generating.
         Polls the response element until its text stops changing.
         """
+        if self._page is None:
+            raise RuntimeError("Browser page not initialized. Call launch() first.")
         last_text = ""
         stable_count = 0
 

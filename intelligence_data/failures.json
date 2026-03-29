@@ -1,0 +1,12 @@
+[
+  {
+    "ts": "2026-03-28T22:10:05.995281",
+    "action": "test_action",
+    "error": "timeout error",
+    "error_norm": "timeout error",
+    "category": "timeout",
+    "context": {
+      "msg": "hello"
+    }
+  }
+]

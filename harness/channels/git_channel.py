@@ -31,14 +31,18 @@ class GitChannel:
         self.handoff_dir = self.repo_dir / ".handoffs"
         self.handoff_dir.mkdir(parents=True, exist_ok=True)
 
-    def _run_git(self, *args, check: bool = True) -> subprocess.CompletedProcess:
+    def _run_git(self, *args, check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess:
         """Run a git command in the repo directory."""
-        result = subprocess.run(
-            ["git"] + list(args),
-            cwd=self.repo_dir,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["git"] + list(args),
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Git command timed out after {timeout}s: git {' '.join(args)}")
         if check and result.returncode != 0:
             raise RuntimeError(f"Git command failed: git {' '.join(args)}\n{result.stderr}")
         return result
@@ -68,22 +72,24 @@ class GitChannel:
         current_branch = self._run_git("branch", "--show-current").stdout.strip()
         source_branch = self._agent_branch(source)
 
-        self._run_git("checkout", source_branch)
-        self._run_git("add", str(filepath))
-        self._run_git(
-            "commit", "-m",
-            f"handoff: {source} -> {handoff.target_agent} [{handoff.handoff_id}]"
-        )
+        try:
+            self._run_git("checkout", source_branch)
+            self._run_git("add", str(filepath))
+            self._run_git(
+                "commit", "-m",
+                f"handoff: {source} -> {handoff.target_agent} [{handoff.handoff_id}]"
+            )
 
-        # Push to remote (with retry)
-        for attempt in range(4):
-            result = self._run_git("push", "-u", self.remote, source_branch, check=False)
-            if result.returncode == 0:
-                break
-            time.sleep(2 ** (attempt + 1))
-
-        # Return to original branch
-        self._run_git("checkout", current_branch)
+            # Push to remote (with retry)
+            for attempt in range(4):
+                result = self._run_git("push", "-u", self.remote, source_branch, check=False)
+                if result.returncode == 0:
+                    break
+                time.sleep(2 ** (attempt + 1))
+        finally:
+            # Always return to original branch, even on error
+            if current_branch.strip():
+                self._run_git("checkout", current_branch, check=False)
 
     def receive(self, agent_name: str) -> Handoff | None:
         """Fetch and read the latest handoff addressed to this agent."""
@@ -139,4 +145,4 @@ class GitChannel:
         """List all agent branches."""
         result = self._run_git("branch", "-a")
         branches = result.stdout.strip().split("\n")
-        return [b.strip().lstrip("* ") for b in branches if self.branch_prefix in b]
+        return [b.strip().lstrip("*").strip() for b in branches if self.branch_prefix in b]

@@ -39,6 +39,7 @@ class GitMerger:
             capture_output=True,
             text=True,
             check=check,
+            timeout=60,
         )
 
     def fetch_all(self):
@@ -52,10 +53,13 @@ class GitMerger:
 
     def list_agent_branches(self, prefix: str = "agent/") -> list[str]:
         """List all agent branches."""
-        result = self._git("branch", "-r")
+        result = self._git("branch", "-r", check=False)
         branches = []
-        for line in result.stdout.strip().split("\n"):
-            branch = line.strip().lstrip("* ")
+        output = result.stdout.strip()
+        if not output:
+            return branches
+        for line in output.split("\n"):
+            branch = line.strip().removeprefix("* ").strip()
             if prefix in branch:
                 branches.append(branch)
         return branches
@@ -78,7 +82,15 @@ class GitMerger:
         merged = []
 
         # Checkout target
-        self._git("checkout", target_branch, check=False)
+        checkout_result = self._git("checkout", target_branch, check=False)
+        if checkout_result.returncode != 0:
+            return MergeResult(
+                success=False,
+                target_branch=target_branch,
+                merged_branches=[],
+                conflicts=[],
+                message=f"Failed to checkout {target_branch}: {checkout_result.stderr.strip()}",
+            )
 
         for branch in branches:
             # Clean branch name (remove remote prefix)
@@ -100,20 +112,25 @@ class GitMerger:
 
         success = len(conflicts) == 0
 
+        push_ok = False
         if merged:
             # Push the merged result
             for attempt in range(4):
                 r = self._git("push", "-u", self.remote, target_branch, check=False)
                 if r.returncode == 0:
+                    push_ok = True
                     break
                 time.sleep(2 ** (attempt + 1))
+            if not push_ok:
+                logger.error(f"Failed to push {target_branch} after 4 attempts")
 
+        push_msg = "" if push_ok or not merged else " (WARNING: push failed)"
         return MergeResult(
-            success=success,
+            success=success and (push_ok or not merged),
             target_branch=target_branch,
             merged_branches=merged,
             conflicts=conflicts,
-            message=f"Merged {len(merged)} branches. {len(conflicts)} conflicts."
+            message=f"Merged {len(merged)} branches. {len(conflicts)} conflicts.{push_msg}"
         )
 
     def create_integration_branch(self, name: str = "") -> str:

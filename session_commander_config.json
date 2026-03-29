@@ -1,0 +1,30 @@
+{
+  "target_session": "Build TG Bot",
+  "reply_box": [
+    730,
+    878
+  ],
+  "sidebar_x_range": [
+    0,
+    220
+  ],
+  "sidebar_y_range": [
+    300,
+    750
+  ],
+  "prod_cooldown_seconds": 120,
+  "idle_threshold_seconds": 30,
+  "monitored_paths": [
+    "C:\\Users\\alexl\\Desktop\\claude tg bot"
+  ],
+  "prod_message": "Continue working. Do not stop. Keep going until the task is complete.",
+  "safe_click_y_min": 80,
+  "safe_click_y_max": 1030,
+  "dry_run": false,
+  "rate_limit_plan_requests_per_hour": 50,
+  "rate_limit_usage_log": "C:\\Users\\alexl\\Desktop\\claude tg bot\\_usage_timestamps.json",
+  "_cached_hash_build telegram bot": "75a8e55d",
+  "_cached_hash_crypto agent": "0fab29cb",
+  "_cached_hash_add cross-session": "23fd43ab",
+  "_cached_hash_smart money chain": "51c1034f"
+}

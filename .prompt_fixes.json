@@ -1,0 +1,46 @@
+[
+  {
+    "domain": "obedience",
+    "rounds": 3,
+    "score_trend": [
+      0.73,
+      0.83,
+      0.5
+    ],
+    "timestamp": "2026-03-27T23:07:53.899819"
+  },
+  {
+    "domain": "file_ops",
+    "rounds": 1,
+    "score_trend": [
+      0.67
+    ],
+    "timestamp": "2026-03-27T23:22:31.630465"
+  },
+  {
+    "domain": "file_ops",
+    "rounds": 1,
+    "score_trend": [
+      0.57
+    ],
+    "timestamp": "2026-03-27T23:23:55.513762"
+  },
+  {
+    "domain": "obedience",
+    "rounds": 3,
+    "score_trend": [
+      0.73,
+      0.8,
+      0.7
+    ],
+    "timestamp": "2026-03-27T23:24:02.968596"
+  },
+  {
+    "domain": "file_ops",
+    "rounds": 1,
+    "score_trend": [
+      0.7
+    ],
+    "timestamp": "2026-03-27T23:26:45.689857"
+  }
+]

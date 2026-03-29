@@ -152,7 +152,7 @@ class Dispatcher:
             return numbered
 
         # Look for "and" / "以及" / "还有" separators
-        parts = re.split(r"\band\b|以及|还有|同时|,\s*(?=\w)", task)
+        parts = re.split(r"\band\b|以及|还有|同时|,\s*(?=\S)", task)
         if len(parts) > 1:
             return [p.strip() for p in parts if p.strip()]
 
@@ -198,13 +198,18 @@ class Dispatcher:
         # Adaptive: replace exhausted platforms with available ones
         platforms = self._apply_quota_fallback(platforms)
 
+        # Ensure we always have at least one platform
+        if not platforms:
+            platforms = ["claude_web"]
+
         subtasks = self.split_task(task, difficulty)
 
         # Calculate wait time if all platforms are exhausted
         wait_seconds = 0
-        if self.quota and not any(self.quota.is_available(p) for p in platforms):
+        if self.quota and platforms and not any(self.quota.is_available(p) for p in platforms):
             wait_seconds = min(
-                self.quota.time_until_available(p) for p in platforms
+                (self.quota.time_until_available(p) for p in platforms),
+                default=0,
             )
 
         route = TaskRoute(
@@ -229,7 +234,7 @@ class Dispatcher:
         """Human-readable dispatch report."""
         route = self.dispatch(task)
         lines = [
-            f"Task: {route.task[:80]}...",
+            f"Task: {route.task[:80]}{'...' if len(route.task) > 80 else ''}",
             f"Difficulty: Level {route.difficulty} ({route.difficulty.name})",
             f"Primary Platform: {route.platform}",
             f"Estimated Files: {route.metadata['estimated_files']}",

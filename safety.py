@@ -40,6 +40,19 @@ async def request_permission(action_description: str, chat_id: int, context) -> 
         if not old_future.done():
             old_future.set_result(False)
 
+    if len(pending_confirmations) > 50:
+        # Snapshot keys to avoid mutation during iteration
+        snapshot = list(pending_confirmations.items())
+        for k, f in snapshot:
+            if f.done():
+                pending_confirmations.pop(k, None)
+        # If still too many, cancel oldest (except current chat_id)
+        if len(pending_confirmations) > 50:
+            for k in list(pending_confirmations.keys())[:25]:
+                f = pending_confirmations.pop(k, None)
+                if f and not f.done():
+                    f.set_result(False)
+
     future = asyncio.get_running_loop().create_future()
     pending_confirmations[chat_id] = future
 
@@ -86,6 +99,8 @@ async def request_permission(action_description: str, chat_id: int, context) -> 
 async def handle_confirmation_callback(update, context):
     """Handle inline keyboard button presses for permission requests."""
     query = update.callback_query
+    if not query or not query.data:
+        return
     data = query.data
 
     # Only handle allow/deny callbacks — ignore everything else
@@ -93,7 +108,7 @@ async def handle_confirmation_callback(update, context):
         return
 
     # Verify the callback is from an authorized user
-    if query.from_user.id != config.AUTHORIZED_USER_ID:
+    if not query.from_user or config.AUTHORIZED_USER_ID is None or query.from_user.id != config.AUTHORIZED_USER_ID:
         await query.answer("⛔ Unauthorized", show_alert=True)
         return
 
@@ -103,6 +118,10 @@ async def handle_confirmation_callback(update, context):
         try:
             chat_id = int(data.split("_", 1)[1])
         except (ValueError, IndexError):
+            return
+        # Verify the callback chat matches the confirmation context
+        if str(query.message.chat_id) != str(chat_id):
+            await query.answer("⛔ Invalid confirmation context", show_alert=True)
             return
         if chat_id in pending_confirmations:
             future = pending_confirmations[chat_id]
@@ -116,6 +135,10 @@ async def handle_confirmation_callback(update, context):
         try:
             chat_id = int(data.split("_", 1)[1])
         except (ValueError, IndexError):
+            return
+        # Verify the callback chat matches the confirmation context
+        if str(query.message.chat_id) != str(chat_id):
+            await query.answer("⛔ Invalid confirmation context", show_alert=True)
             return
         if chat_id in pending_confirmations:
             future = pending_confirmations[chat_id]

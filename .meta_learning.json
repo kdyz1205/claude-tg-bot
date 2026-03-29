@@ -1,0 +1,18 @@
+{
+  "total_experiments": 46,
+  "successful_experiments": 0,
+  "experiment_types_success": {
+    "prompt_tweak": {
+      "attempts": 15,
+      "successes": 0
+    },
+    "tool_improvement": {
+      "attempts": 31,
+      "successes": 0
+    }
+  },
+  "best_training_domains": [],
+  "optimal_idle_threshold": 2000,
+  "learning_rate": 0.3,
+  "last_meta_update": "2026-03-28T09:54:59.034246"
+}

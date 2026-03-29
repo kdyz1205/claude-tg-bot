@@ -116,8 +116,12 @@ class Harness:
     def from_config(cls, config_path: str | Path) -> Harness:
         """Create a Harness from a YAML config file."""
         path = Path(config_path)
-        with open(path) as f:
+        if not path.exists():
+            raise FileNotFoundError(f"Harness config not found: {path}")
+        with open(path, encoding="utf-8") as f:
             config = yaml.safe_load(f)
+        if not config:
+            raise ValueError(f"Empty or invalid YAML config: {path}")
 
         harness = cls(name=config.get("name", "harness"))
         harness.channel_type = config.get("channel", {}).get("type", "file")

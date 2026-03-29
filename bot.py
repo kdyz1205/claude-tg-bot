@@ -10,7 +10,6 @@ import os
 import sys
 import signal
 import time
-import traceback
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -24,15 +23,67 @@ import config
 import claude_agent
 import bridge
 from safety import handle_confirmation_callback
-from providers import PROVIDER_DISPLAY
+import psutil  # for health/system checks
+import datetime
+from self_monitor import self_monitor, action_memory
+from proactive_agent import proactive_agent
 
-# ─── Logging (console + file) ─────────────────────────────────────────────────
+try:
+    import session_learner as _sl
+    _session_learner_available = True
+except ImportError:
+    _sl = None
+    _session_learner_available = False
+
+try:
+    from skills.intelligence import IntelligenceSkill
+    _intel = IntelligenceSkill()
+    _intel_available = True
+except Exception:
+    _intel = None
+    _intel_available = False
+
+try:
+    from agents.autonomy import get_autonomy_engine
+    from agents.consciousness import get_self_awareness
+    from agents.reflexion import get_reflexion_engine
+    from agents.rag import get_solution_store
+    _autonomy_available = True
+except Exception:
+    _autonomy_available = False
+
+try:
+    from agents.sessions import SessionManager
+    _session_mgr = SessionManager()
+    _sessions_available = True
+except Exception:
+    _session_mgr = None
+    _sessions_available = False
+
+# Message counter for periodic session learning
+_message_counter = 0
+
+# Bot start time — used for uptime tracking
+_BOT_START_TIME = time.time()
+
+# providers.py removed — inline display names
+PROVIDER_DISPLAY = {"claude": "Claude (CLI)", "openai": "OpenAI", "gemini": "Gemini"}
+
+# ─── Logging (console + rotating file) ────────────────────────────────────────
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(config.LOG_FILE, encoding="utf-8", errors="replace"),
+        RotatingFileHandler(
+            config.LOG_FILE,
+            maxBytes=20 * 1024 * 1024,  # 20 MB per file
+            backupCount=3,              # Keep 3 rotated backups (60 MB total max)
+            encoding="utf-8",
+            errors="replace",
+        ),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -40,8 +91,30 @@ logger = logging.getLogger(__name__)
 # Suppress httpx INFO noise (getUpdates polling every 10s fills the log)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Auth filter
-auth_filter = filters.User(user_id=config.AUTHORIZED_USER_ID)
+# Auth filter — use a deny-all filter when AUTHORIZED_USER_ID is unset
+auth_filter = (
+    filters.User(user_id=config.AUTHORIZED_USER_ID)
+    if config.AUTHORIZED_USER_ID is not None
+    else filters.User(user_id=[])  # deny all until the ID is configured
+)
+
+
+def _is_authorized(user_id: int) -> bool:
+    """Check if a user ID is authorized. Safe when AUTHORIZED_USER_ID is None."""
+    return config.AUTHORIZED_USER_ID is not None and user_id == config.AUTHORIZED_USER_ID
+
+
+def _track_task(bot_data: dict, task: asyncio.Task) -> None:
+    """Register a background task with proper exception logging on completion."""
+    bot_data.setdefault("_background_tasks", set()).add(task)
+    def _on_done(t):
+        try:
+            if not t.cancelled():
+                t.result()
+        except Exception as e:
+            logger.error(f"Background task {t.get_name()} failed: {e}", exc_info=True)
+        bot_data.get("_background_tasks", set()).discard(t)
+    task.add_done_callback(_on_done)
 
 AVAILABLE_MODELS = {
     "sonnet": "claude-sonnet-4-6",
@@ -53,84 +126,896 @@ AVAILABLE_MODELS = {
 # ─── Error Handler ────────────────────────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Global error handler — logs errors and notifies user if possible."""
+    """Global error handler — logs errors and notifies user if possible.
+
+    Special handling for Conflict errors (two bot instances polling):
+    exits with code 42 so run.py can kill duplicates and retry cleanly.
+    """
+    err_str = str(context.error)[:500] if context.error else "Unknown error"
+
+    # Detect Conflict error: "terminated by other getUpdates request"
+    # This means another bot instance is running. Exit cleanly with special code.
+    if context.error and "Conflict" in type(context.error).__name__:
+        logger.error(f"CONFLICT ERROR: Another bot instance is polling. Exiting with code 42.")
+        logger.error(f"Details: {err_str}")
+        _release_pid_lock()
+        os._exit(42)
+    if context.error and "terminated by other getUpdates" in err_str.lower():
+        logger.error(f"CONFLICT ERROR (string match): Another bot instance is polling. Exiting with code 42.")
+        _release_pid_lock()
+        os._exit(42)
+
     logger.error(f"Exception while handling update: {context.error}", exc_info=context.error)
+
+    # Feed errors into monitoring systems
+    try:
+        self_monitor.record_error(err_str)
+    except Exception:
+        pass
+    try:
+        await proactive_agent.push_error("unhandled", err_str, source="error_handler")
+    except Exception:
+        pass
 
     # Try to notify the user
     if isinstance(update, Update) and update.effective_chat:
         try:
             err_msg = str(context.error)[:200] if context.error else "Unknown error"
+            # Strip chars that may cause Telegram to reject the message
+            import re as _re
+            err_msg = _re.sub(r'[<>&\x00-\x08\x0b\x0c\x0e-\x1f]', '', err_msg)
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"⚠️ 内部错误: {err_msg}\n\n发消息继续使用。",
             )
         except Exception:
-            pass
+            # Last resort: send without the error details
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="⚠️ 内部错误。发消息继续使用。",
+                )
+            except Exception:
+                pass
 
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Remote Controller v3.0\n\n"
-        "我是你的远程电脑控制器。\n"
-        "直接告诉我要做什么，我来操作。\n\n"
-        "Commands:\n"
-        "/clear - 清除对话(开始新会话)\n"
-        "/screenshot - 截图\n"
-        "/status - 状态\n"
-        "/ping - 延迟测试\n"
-        "/model - 切换模型\n"
-        "/provider - 切换AI服务\n"
-        "/bridge - 切换CLI/API模式\n"
-        "/kill - 终止卡住的任务\n"
-        "/quota - AI平台用量\n"
-        "/sessions - 会话状态\n"
-        "/help - 帮助\n"
-        "/q - 快捷操作面板"
-    )
+    try:
+        await update.message.reply_text(
+            "🤖 Remote Controller v3.0\n\n"
+            "我是你的远程电脑控制器。\n"
+            "直接告诉我要做什么，我来操作。\n\n"
+            "📋 /panel - Command panel (all commands)\n\n"
+            "Quick commands:\n"
+            "/status - 状态 + 系统健康\n"
+            "/health - 详细健康检查\n"
+            "/screenshot - 截图\n"
+            "/model - 切换模型\n"
+            "/score - Agent表现评分\n"
+            "/portfolio - 持仓\n"
+            "/signal - 信号\n"
+            "/risk - 风险指标\n"
+            "/kill - 终止卡住的任务\n"
+            "/q - 快捷操作面板\n"
+            "/help - 帮助"
+        )
+    except Exception as e:
+        logger.error(f"Start command error: {e}", exc_info=True)
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick health check — responds instantly."""
-    import time
-    start = time.time()
-    msg = await update.message.reply_text("🏓")
-    latency = (time.time() - start) * 1000
-    await msg.edit_text(f"🏓 Pong! ({latency:.0f}ms)")
+    try:
+        import time
+        start = time.time()
+        msg = await update.message.reply_text("🏓")
+        latency = (time.time() - start) * 1000
+        await msg.edit_text(f"🏓 Pong! ({latency:.0f}ms)")
+    except Exception as e:
+        logger.error(f"Ping command error: {e}", exc_info=True)
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    claude_agent.clear_history(update.effective_chat.id)
-    await update.message.reply_text("✅ 对话已清空，新会话已开始。")
+    try:
+        claude_agent.clear_history(update.effective_chat.id)
+        await update.message.reply_text("✅ 对话已清空，新会话已开始。")
+    except Exception as e:
+        logger.error(f"Clear command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 清空失败: {e}")
+        except Exception:
+            pass
 
 
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kill any stuck Claude CLI process and clear the queue."""
-    chat_id = update.effective_chat.id
-    # Clear pending messages
-    claude_agent._pending_messages.pop(chat_id, None)
-    # Force-release the lock by removing it — next message creates a fresh unlocked lock
-    claude_agent._processing_locks.pop(chat_id, None)
-    claude_agent._claude_sessions.pop(chat_id, None)
-    claude_agent._save_sessions()
-    # Kill any claude.cmd child processes
     try:
-        import subprocess
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-Process claude -ErrorAction SilentlyContinue | Stop-Process -Force"],
-            capture_output=True, text=True, timeout=10,
-        )
-        await update.message.reply_text(
-            "🔪 已终止 Claude 进程并清空队列。\n发新消息重新开始。"
-        )
+        chat_id = update.effective_chat.id
+        claude_agent._pending_messages.pop(chat_id, None)
+        logger.info(f"Kill requested for chat {chat_id}")
+        claude_agent._claude_sessions.pop(chat_id, None)
+        claude_agent._save_sessions()
+        # Kill any claude.cmd child processes (non-blocking)
+        try:
+            import subprocess
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-Process claude -ErrorAction SilentlyContinue | Stop-Process -Force"],
+                capture_output=True, text=True, timeout=10,
+            ))
+            await update.message.reply_text(
+                "🔪 已终止 Claude 进程并清空队列。\n发新消息重新开始。"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"🔪 队列已清空。进程终止: {e}")
     except Exception as e:
-        await update.message.reply_text(f"🔪 队列已清空。进程终止: {e}")
+        logger.error(f"Kill command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Kill 错误: {str(e)[:300]}")
+        except Exception:
+            pass
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await _send_status(context, update.effective_chat.id)
+    except Exception as e:
+        logger.error(f"Status command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Status error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not context.args:
+            await update.message.reply_text(
+                f"当前模型: `{config.CLAUDE_MODEL}`\n"
+                "用法: `/model sonnet|opus|haiku`",
+                parse_mode="Markdown",
+            )
+            return
+
+        name = context.args[0].lower()
+        if name not in AVAILABLE_MODELS:
+            await update.message.reply_text("可选: sonnet, opus, haiku")
+            return
+
+        config.CLAUDE_MODEL = AVAILABLE_MODELS[name]
+        claude_agent.clear_history(update.effective_chat.id)
+        await update.message.reply_text(f"✅ 已切换为 `{config.CLAUDE_MODEL}`", parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Model command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Model error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        valid = list(PROVIDER_DISPLAY.keys())
+        if not context.args:
+            lines = ["AI Provider 状态:\n"]
+            key_map = {"claude": config.ANTHROPIC_API_KEY, "openai": config.OPENAI_API_KEY, "gemini": config.GEMINI_API_KEY}
+            for p, name in PROVIDER_DISPLAY.items():
+                if p == config.CURRENT_PROVIDER:
+                    status = "✅ 当前"
+                elif key_map.get(p):
+                    status = "🔑 可用"
+                else:
+                    status = "❌ 无key"
+                lines.append(f"{status} — {name}")
+            lines.append(f"\n用法: `/provider claude|openai|gemini`")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            return
+
+        choice = context.args[0].lower()
+        if choice not in valid:
+            await update.message.reply_text(f"可选: {', '.join(valid)}")
+            return
+
+        config.CURRENT_PROVIDER = choice
+        claude_agent.clear_history(update.effective_chat.id)
+        await update.message.reply_text(f"✅ 已切换到 {PROVIDER_DISPLAY[choice]}")
+    except Exception as e:
+        logger.error(f"Provider command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Provider error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.reply_text(
+            "🤖 我能做什么:\n\n"
+            "💻 执行命令、打开应用\n"
+            "📁 文件操作、代码编辑\n"
+            "🌐 网页浏览、下载文件\n"
+            "🖱 鼠标键盘控制\n"
+            "📸 截图、GUI操作\n"
+            "🔧 安装软件、Git操作\n\n"
+            "直接说就行，不用客气。"
+        )
+    except Exception as e:
+        logger.error(f"Help command error: {e}", exc_info=True)
+
+
+async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show quota status for all AI platforms."""
+    try:
+        from tracker.quota import QuotaTracker
+        qt = QuotaTracker()
+        report = qt.status_report()
+        rate_info = ""
+        if claude_agent.is_rate_limited():
+            remaining = int(claude_agent._rate_limited_until - time.time())
+            rate_info = f"\n⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
+        await update.message.reply_text(f"📊 AI 平台用量\n{rate_info}\n{report}")
+    except Exception as e:
+        rate_info = ""
+        if claude_agent.is_rate_limited():
+            remaining = int(claude_agent._rate_limited_until - time.time())
+            rate_info = f"⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
+        await update.message.reply_text(f"📊 Quota\n{rate_info}\nHarness 未初始化 (首次限速时自动启动)")
+
+
+async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List Claude Code sessions and interact with them.
+
+    /sessions              - list all detected Claude Code sessions
+    /sessions ask <name> <question>  - ask a specific session a question
+    /sessions delegate <name> <task> - delegate task to a session
+    """
+    try:
+        return await _sessions_command_impl(update, context)
+    except Exception as e:
+        logger.error(f"Sessions command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Sessions error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+async def _sessions_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _session_learner_available:
+        await update.message.reply_text("session_learner module not available.")
+        return
+
+    args = context.args or []
+    learner = _sl.get_learner()
+
+    if not args:
+        # List all detected sessions
+        active = learner.get_active_sessions()
+        scanned = learner.scan_session_logs()
+
+        lines = ["📋 Claude Code Sessions\n"]
+        if active:
+            lines.append(f"Active ({len(active)}):")
+            for s in active[:15]:
+                pid = s.get("pid", "?")
+                sid = s.get("session_id", "?")[:12]
+                cwd = s.get("cwd", "")
+                cwd_short = os.path.basename(cwd) if cwd else "?"
+                lines.append(f"  PID {pid} | {sid}... | {cwd_short}")
+        else:
+            lines.append("No active sessions found.")
+
+        lines.append(f"\nSession logs found: {len(scanned)}")
+        if scanned:
+            lines.append("Recent:")
+            for s in scanned[:5]:
+                sid = s.get("session_id", "?")[:12]
+                proj = s.get("project", "?")
+                msgs = s.get("message_count", 0)
+                task = s.get("task_summary", "")[:60]
+                lines.append(f"  {sid}... | {proj} | {msgs} msgs | {task}")
+
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    action = args[0].lower()
+
+    if action == "ask" and len(args) >= 3:
+        session_name = args[1]
+        question = " ".join(args[2:])
+        msg = await update.message.reply_text(f"Asking session '{session_name}'...")
+        try:
+            response = await learner.ask_session(session_name, question)
+            if response:
+                await msg.edit_text(f"Response from '{session_name}':\n\n{response[:3500]}")
+            else:
+                await msg.edit_text(f"No response from session '{session_name}'. It may not be reachable.")
+        except Exception as e:
+            await msg.edit_text(f"Error asking session: {e}")
+
+    elif action == "delegate" and len(args) >= 3:
+        session_name = args[1]
+        task = " ".join(args[2:])
+        msg = await update.message.reply_text(f"Delegating to session '{session_name}'...")
+        try:
+            result = await learner.delegate_task(session_name, task)
+            status = result.get("status", "unknown")
+            resp = result.get("response", "")
+            duration = result.get("duration_seconds", 0)
+            text = (
+                f"Delegation result: {status}\n"
+                f"Duration: {duration}s\n"
+            )
+            if resp:
+                text += f"\nResponse:\n{resp[:3000]}"
+            if result.get("error"):
+                text += f"\nError: {result['error']}"
+            await msg.edit_text(text[:4000])
+        except Exception as e:
+            await msg.edit_text(f"Error delegating: {e}")
+
+    else:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/sessions - list sessions\n"
+            "/sessions ask <name> <question>\n"
+            "/sessions delegate <name> <task>"
+        )
+
+
+async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Session learning system.
+
+    /learn               - scan all session logs, learn patterns, show summary
+    /learn sessions      - list active sessions found
+    /learn from <id>     - learn from specific session
+    /learn report        - show intelligence report
+    /learn gaps          - show skill gaps and training curriculum
+    """
+    try:
+        return await _learn_command_impl(update, context)
+    except Exception as e:
+        logger.error(f"Learn command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Learn error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _session_learner_available:
+        await update.message.reply_text("session_learner module not available.")
+        return
+
+    if not config.SESSION_LEARNING_ENABLED:
+        await update.message.reply_text("Session learning is disabled. Set SESSION_LEARNING_ENABLED=true in .env")
+        return
+
+    args = context.args or []
+    learner = _sl.get_learner()
+
+    if not args:
+        # Full scan + learn + summary
+        msg = await update.message.reply_text("Scanning session logs...")
+        try:
+            result = learner.learn_from_all_recent(max_sessions=20)
+            summary_text = (
+                f"Session Learning Complete\n\n"
+                f"Sessions scanned: {result['sessions_scanned']}\n"
+                f"Sessions learned: {result['sessions_learned']}\n"
+                f"Errors: {result['errors']}\n"
+                f"Curriculum items: {result['curriculum_items']}\n"
+            )
+            knowledge_summary = result.get("knowledge_summary", "")
+            if knowledge_summary:
+                # Trim to fit Telegram message limit
+                remaining = 4000 - len(summary_text) - 10
+                if len(knowledge_summary) > remaining:
+                    knowledge_summary = knowledge_summary[:remaining] + "..."
+                summary_text += f"\n{knowledge_summary}"
+            await msg.edit_text(summary_text[:4096])
+        except Exception as e:
+            logger.error(f"Learn command failed: {e}", exc_info=True)
+            await msg.edit_text(f"Learning failed: {e}")
+        return
+
+    action = args[0].lower()
+
+    if action == "sessions":
+        active = learner.get_active_sessions()
+        if not active:
+            await update.message.reply_text("No active Claude Code sessions found.")
+            return
+        lines = [f"Active Claude Code Sessions ({len(active)}):\n"]
+        for s in active:
+            pid = s.get("pid", "?")
+            sid = s.get("session_id", "?")[:16]
+            cwd = s.get("cwd", "")
+            cwd_short = os.path.basename(cwd) if cwd else "?"
+            kind = s.get("kind", "")
+            lines.append(f"  PID {pid} | {sid}... | {cwd_short} | {kind}")
+        await update.message.reply_text("\n".join(lines))
+
+    elif action == "from" and len(args) >= 2:
+        session_id = args[1]
+        msg = await update.message.reply_text(f"Learning from session {session_id[:16]}...")
+        try:
+            result = learner.learn_from_session(session_id)
+            if "error" in result:
+                await msg.edit_text(f"Error: {result['error']}")
+                return
+            text = (
+                f"Learned from session {session_id[:16]}...\n\n"
+                f"Task: {result.get('task', '?')[:200]}\n"
+                f"Approaches tried: {result.get('approaches_tried', 0)}\n"
+                f"Successful: {len(result.get('successful_approaches', []))}\n"
+                f"Failed: {len(result.get('failed_approaches', []))}\n"
+                f"Strategies extracted: {len(result.get('reusable_strategies', []))}\n"
+                f"Patterns found: {result.get('patterns_found', 0)}"
+            )
+            await msg.edit_text(text[:4096])
+        except Exception as e:
+            await msg.edit_text(f"Error: {e}")
+
+    elif action == "report":
+        try:
+            summary = learner.get_session_summary()
+            # Split if too long for one message
+            if len(summary) <= 4096:
+                await update.message.reply_text(summary)
+            else:
+                for i in range(0, len(summary), 4000):
+                    await update.message.reply_text(summary[i:i+4000])
+        except Exception as e:
+            await update.message.reply_text(f"Report error: {e}")
+
+    elif action == "gaps":
+        try:
+            curriculum = learner.generate_training_curriculum()
+            if not curriculum:
+                await update.message.reply_text("No skill gaps identified. Run /learn first to analyze sessions.")
+                return
+            lines = ["Skill Gaps & Training Curriculum\n"]
+            for item in curriculum:
+                priority = item.get("priority", "?").upper()
+                skill = item.get("skill", "?")
+                gap = item.get("gap_description", "")
+                task = item.get("training_task", "")
+                evidence = item.get("evidence", "")
+                lines.append(f"[{priority}] {skill}")
+                lines.append(f"  Gap: {gap}")
+                lines.append(f"  Training: {task}")
+                lines.append(f"  Evidence: {evidence}")
+                lines.append("")
+            await update.message.reply_text("\n".join(lines)[:4096])
+        except Exception as e:
+            await update.message.reply_text(f"Gaps error: {e}")
+
+    else:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/learn - scan & learn from all sessions\n"
+            "/learn sessions - list active sessions\n"
+            "/learn from <session_id> - learn from one session\n"
+            "/learn report - show intelligence report\n"
+            "/learn gaps - show skill gaps & curriculum"
+        )
+
+
+async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show agent performance scores and insights."""
+    try:
+        import harness_learn
+        scores = harness_learn.get_recent_scores(10)
+        if not scores:
+            await update.message.reply_text("📊 暂无评分数据。发几条消息后再看。")
+            return
+        insights = harness_learn.detect_patterns(scores)
+        avg = sum(s.get("overall", 0) for s in scores) / len(scores)
+        flags_all = []
+        for s in scores:
+            flags_all.extend(s.get("flags", []))
+        top_flags = {}
+        for f in flags_all:
+            top_flags[f] = top_flags.get(f, 0) + 1
+
+        text = f"📊 Agent 表现 (最近{len(scores)}次)\n\n"
+        text += f"平均分: {avg:.2f}/1.00\n"
+        if top_flags:
+            text += f"问题标签: {', '.join(f'{k}({v})' for k,v in sorted(top_flags.items(), key=lambda x:-x[1]))}\n"
+        text += "\n"
+        for i in insights:
+            text += f"• {i}\n"
+        text += f"\n最近3次:\n"
+        for s in scores[-3:]:
+            text += f"  {s.get('overall', 0):.2f} | {s.get('model', '?')[:10]} | {s.get('user_message', '')[:30]}\n"
+
+        # Evolution system stats
+        text += "\n" + harness_learn.get_evolution_stats()
+
+        # Skill library stats
+        try:
+            import skill_library
+            text += "\n" + skill_library.get_skill_stats()
+        except Exception:
+            pass
+
+        # Auto-research / meta-learning stats
+        try:
+            import auto_research
+            text += "\n" + auto_research.get_meta_stats()
+            h_stats = auto_research.get_hypothesis_stats()
+            if h_stats:
+                text += "\n" + h_stats
+        except Exception:
+            pass
+        # Telegram message limit: split if >4096 chars
+        if len(text) <= 4096:
+            await update.message.reply_text(text)
+        else:
+            for i in range(0, len(text), 4000):
+                await update.message.reply_text(text[i:i+4000])
+    except Exception as e:
+        await update.message.reply_text(f"📊 评分错误: {e}")
+
+
+async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Self-training curriculum system."""
+    try:
+        import auto_train
+    except ImportError:
+        await update.message.reply_text("auto_train module not available.")
+        return
+
+    # Support /train_xxx commands (e.g., /train_obedience → domain=obedience)
+    _raw = (update.message.text or "").strip().split()
+    cmd_text = _raw[0] if _raw else "/train"
+    domain_from_cmd = None
+    if cmd_text.startswith("/train_"):
+        domain_from_cmd = cmd_text[7:]  # strip "/train_"
+
+    if not context.args and not domain_from_cmd:
+        # Show progress
+        report = auto_train.get_progress_report()
+        await update.message.reply_text(report)
+        return
+
+    action = domain_from_cmd or context.args[0].lower()
+
+    if action == "stop":
+        auto_train.stop_training()
+        await update.message.reply_text("⏹ 停止训练。")
+        return
+
+    if action == "reset":
+        domain = context.args[1] if len(context.args) > 1 else None
+        auto_train.reset_progress(domain)
+        await update.message.reply_text(f"🔄 已重置{'全部' if not domain else domain}训练进度。")
+        return
+
+    # Start training for a domain
+    domain_id = action
     chat_id = update.effective_chat.id
+
+    async def send_status(text):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text[:4000])
+        except Exception as e:
+            # Retry without special chars if parse fails
+            try:
+                clean = text.replace("*", "").replace("_", "").replace("`", "")[:4000]
+                await context.bot.send_message(chat_id=chat_id, text=clean)
+            except Exception:
+                logger.warning(f"send_status failed: {e}")
+
+    async def send_photo(photo_buffer):
+        try:
+            await context.bot.send_photo(chat_id=chat_id, photo=photo_buffer)
+        except Exception:
+            pass
+
+    async def _training_wrapper():
+        try:
+            await auto_train.run_training(
+                domain_id=domain_id,
+                send_status=send_status,
+                send_photo=send_photo,
+                max_tasks=5,
+            )
+        except Exception as exc:
+            logger.error(f"Training task failed: {exc}", exc_info=True)
+
+    _train_task = asyncio.create_task(_training_wrapper())
+    _track_task(context.bot_data, _train_task)
+
+
+async def bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not context.args:
+            harness = "✅ 开启" if config.HARNESS_MODE else "❌ 关闭"
+            bridge_status = "✅ 开启" if config.BRIDGE_MODE else "❌ 关闭"
+            await update.message.reply_text(
+                f"🧠 Harness Mode: {harness}\n"
+                f"🔗 Bridge Mode: {bridge_status}\n\n"
+                "Harness = 免费AI优先 (浏览器自动化)\n"
+                "  纯问答→ChatGPT/Grok, 代码→Claude.ai\n"
+                "  电脑操控→Claude CLI (唯一有工具的)\n\n"
+                "Bridge = Claude CLI 直连 (消耗token)\n\n"
+                "用法: /bridge harness|on|off"
+            )
+            return
+        action = context.args[0].lower()
+        if action == "harness":
+            config.HARNESS_MODE = True
+            config.BRIDGE_MODE = True
+            await update.message.reply_text(
+                "✅ Harness Mode 开启\n"
+                "免费AI优先，Claude CLI仅用于电脑操控"
+            )
+        elif action == "on":
+            config.HARNESS_MODE = False
+            config.BRIDGE_MODE = True
+            bridge.clear_bridge()
+            await update.message.reply_text("✅ Bridge Mode 开启 (Claude CLI 直连)")
+        elif action == "off":
+            config.HARNESS_MODE = False
+            config.BRIDGE_MODE = False
+            await update.message.reply_text("✅ API Mode (直接调API，最贵)")
+        else:
+            await update.message.reply_text("用法: /bridge harness|on|off")
+    except Exception as e:
+        logger.error(f"Bridge command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Bridge error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+# ─── Command Panel System ────────────────────────────────────────────────────
+
+# Panel category definitions: (callback_prefix, label, commands)
+PANEL_CATEGORIES = [
+    ("panel_ai",      "🤖 AI Controls",  [("ask", "提问"), ("model", "模型"), ("reset", "重置"), ("status", "状态")]),
+    ("panel_trading", "📊 Trading",       [("trade", "交易"), ("signal", "信号"), ("portfolio", "持仓"), ("risk", "风险"), ("funding", "资金"), ("okx_top30", "OKX Top30"), ("token_analyze", "Token分析"), ("ma_ribbon_bt", "MA Ribbon回测"), ("ma_ribbon_scr", "MA扫描"), ("okx_backtest", "OKX回测"), ("session_ctrl", "会话控制")]),
+    ("panel_pc",      "🖥️ PC Control",   [("screenshot", "截图"), ("click", "点击"), ("type", "输入"), ("window", "窗口")]),
+    ("panel_web",     "🌐 Web",           [("browse", "浏览"), ("search", "搜索"), ("scrape", "抓取")]),
+    ("panel_system",  "🔧 System",        [("health", "健康"), ("memory", "内存"), ("evolve", "进化"), ("scan", "扫描")]),
+    ("panel_analysis","📈 Analysis",      [("score", "评分"), ("regime", "行情"), ("confluence", "共振"), ("backtest", "回测")]),
+    ("panel_learn",   "🧠 Learning",      [("learn", "学习"), ("learn_report", "报告"), ("learn_gaps", "差距"), ("cc_sessions", "会话")]),
+]
+
+
+async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the main command panel with category buttons."""
+    try:
+        rows = []
+        for i in range(0, len(PANEL_CATEGORIES), 2):
+            row = []
+            for cat_key, cat_label, _ in PANEL_CATEGORIES[i:i+2]:
+                row.append(InlineKeyboardButton(cat_label, callback_data=cat_key))
+            rows.append(row)
+        rows.append([InlineKeyboardButton("⚡ Quick Actions", callback_data="qa_panel")])
+        keyboard = InlineKeyboardMarkup(rows)
+        await update.message.reply_text("📋 Command Panel — choose a category:", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Panel command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Panel error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle panel category and command button presses."""
+    query = update.callback_query
+    if not _is_authorized(query.from_user.id):
+        await query.answer("⛔ Unauthorized", show_alert=True)
+        return
+    data = query.data
+
+    try:
+        # ── Category button: show sub-panel ──────────────────────────────────
+        for cat_key, cat_label, commands in PANEL_CATEGORIES:
+            if data == cat_key:
+                await query.answer()
+                rows = []
+                for i in range(0, len(commands), 3):
+                    row = []
+                    for cmd, label in commands[i:i+3]:
+                        row.append(InlineKeyboardButton(
+                            f"{label}", callback_data=f"pcmd_{cmd}"
+                        ))
+                    rows.append(row)
+                rows.append([InlineKeyboardButton("⬅️ Back", callback_data="panel_back")])
+                await query.edit_message_text(
+                    f"{cat_label} — pick a command:",
+                    reply_markup=InlineKeyboardMarkup(rows),
+                )
+                return
+
+        # ── Back to main panel ───────────────────────────────────────────────
+        if data == "panel_back":
+            await query.answer()
+            rows = []
+            for i in range(0, len(PANEL_CATEGORIES), 2):
+                row = []
+                for cat_key, cat_label, _ in PANEL_CATEGORIES[i:i+2]:
+                    row.append(InlineKeyboardButton(cat_label, callback_data=cat_key))
+                rows.append(row)
+            rows.append([InlineKeyboardButton("⚡ Quick Actions", callback_data="qa_panel")])
+            await query.edit_message_text(
+                "📋 Command Panel — choose a category:",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+        # ── Quick Actions redirect ───────────────────────────────────────────
+        if data == "qa_panel":
+            await query.answer()
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📸 截图", callback_data="qa_screenshot"),
+                    InlineKeyboardButton("🖥 窗口", callback_data="qa_windows"),
+                ],
+                [
+                    InlineKeyboardButton("🌐 Chrome", callback_data="qa_open_chrome"),
+                    InlineKeyboardButton("📁 Explorer", callback_data="qa_open_explorer"),
+                ],
+                [
+                    InlineKeyboardButton("💻 Terminal", callback_data="qa_open_terminal"),
+                    InlineKeyboardButton("📝 VS Code", callback_data="qa_open_vscode"),
+                ],
+                [
+                    InlineKeyboardButton("🔒 锁屏", callback_data="qa_lock"),
+                    InlineKeyboardButton("📊 系统状态", callback_data="qa_sysinfo"),
+                ],
+                [InlineKeyboardButton("⬅️ Back", callback_data="panel_back")],
+            ])
+            await query.edit_message_text("⚡ Quick Actions", reply_markup=keyboard)
+            return
+
+        # ── Individual command buttons (pcmd_xxx) ────────────────────────────
+        if not data.startswith("pcmd_"):
+            # Unknown callback — answer to prevent timeout spinner
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        logger.error(f"Panel callback error for '{data}': {e}", exc_info=True)
+        try:
+            await query.answer("Error - try /panel again")
+        except Exception:
+            pass
+        return
+
+    cmd = data[5:]  # strip "pcmd_"
+    # Answer callback FIRST to prevent Telegram timeout spinner
+    await query.answer(f"/{cmd}...")
+    chat_id = query.message.chat_id
+
+    # Dispatch table for simple text responses (no async work needed)
+    _simple_responses = {
+        "ask":       "💬 Send me your question directly — I'll answer it.",
+        "click":     "🖱 Tell me where to click, e.g. \"click the start button\"",
+        "type":      "⌨️ Tell me what to type, e.g. \"type hello world\"",
+        "browse":    "🌐 Send me a URL or say \"open google.com\"",
+        "search":    "🔍 Tell me what to search, e.g. \"search python tutorials\"",
+        "scrape":    "🕷 Send me a URL to scrape, e.g. \"scrape https://example.com\"",
+        "evolve":    "🧬 Use /train to start the evolution/training system.",
+        "backtest":  "📈 Send a backtest request, e.g. \"backtest BTC MA crossover last 30 days\"",
+        "trade":     "💹 Send a trade instruction, e.g. \"buy 0.1 BTC at market\"",
+        "funding":   "💰 Send funding request, e.g. \"check funding rates\"",
+    }
+
+    try:
+        # Simple text responses
+        if cmd in _simple_responses:
+            await context.bot.send_message(chat_id=chat_id, text=_simple_responses[cmd])
+
+        # Commands that need special handling
+        elif cmd == "model":
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Current model: `{config.CLAUDE_MODEL}`\nUse /model sonnet|opus|haiku to switch.",
+                parse_mode="Markdown",
+            )
+        elif cmd == "reset":
+            claude_agent.clear_history(chat_id)
+            await context.bot.send_message(chat_id=chat_id, text="✅ Conversation cleared. Fresh session.")
+        elif cmd == "status":
+            await _send_status(context, chat_id)
+        elif cmd == "screenshot":
+            from screenshots import capture_screenshot
+            await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+            _loop = asyncio.get_running_loop()
+            buf = await _loop.run_in_executor(None, capture_screenshot)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Refresh", callback_data="qa_screenshot"),
+                InlineKeyboardButton("⬆️ Up", callback_data="qa_scroll_up"),
+                InlineKeyboardButton("⬇️ Down", callback_data="qa_scroll_down"),
+            ]])
+            await context.bot.send_photo(chat_id=chat_id, photo=buf, reply_markup=kb)
+        elif cmd == "window":
+            import tools
+            result = await tools.execute_list_windows()
+            await context.bot.send_message(chat_id=chat_id, text=f"🪟 Windows:\n{result[:3000]}")
+        elif cmd == "health":
+            await _send_health(context, chat_id)
+        elif cmd == "memory":
+            await _send_memory_info(context, chat_id)
+        elif cmd == "scan":
+            await _send_scan(context, chat_id)
+        elif cmd == "score":
+            await _send_score_brief(context, chat_id)
+        elif cmd == "regime":
+            await _send_regime(context, chat_id)
+        elif cmd == "confluence":
+            await _send_confluence(context, chat_id)
+        elif cmd == "signal":
+            await _send_signals(context, chat_id)
+        elif cmd == "portfolio":
+            await _send_portfolio(context, chat_id)
+        elif cmd == "risk":
+            await _send_risk(context, chat_id)
+        elif cmd == "learn":
+            await _send_learn_brief(context, chat_id)
+        elif cmd == "learn_report":
+            await _send_learn_report(context, chat_id)
+        elif cmd == "learn_gaps":
+            await _send_learn_gaps(context, chat_id)
+        elif cmd == "cc_sessions":
+            await _send_cc_sessions(context, chat_id)
+        elif cmd == "okx_top30":
+            await _send_okx_top30(context, chat_id)
+        elif cmd == "token_analyze":
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Use /token_analyze <address> [network]\nExample: /token_analyze EPjFW... solana"
+            )
+        elif cmd == "ma_ribbon_bt":
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Use /ma_ribbon_backtest <symbol> [tf]\nExample: /ma_ribbon_backtest BTC 1d"
+            )
+        elif cmd == "ma_ribbon_scr":
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Starting MA Ribbon Screener in background...\nUse /ma_ribbon_screener for full run."
+            )
+        elif cmd == "okx_backtest":
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Use /okx_backtest [timeframe]\nExample: /okx_backtest 1H"
+            )
+        elif cmd == "session_ctrl":
+            await _send_session_control(context, chat_id)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Unknown command: {cmd}")
+    except Exception as e:
+        logger.error(f"Panel command '{cmd}' failed: {e}", exc_info=True)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Error in /{cmd}: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+# ─── Shared helpers for panel + standalone commands ──────────────────────────
+
+async def _send_status(context, chat_id):
+    """Send bot status. Used by both /status and panel button."""
+    try:
+        return await _send_status_impl(context, chat_id)
+    except Exception as e:
+        logger.error(f"Status error: {e}", exc_info=True)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Status error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+async def _send_status_impl(context, chat_id):
+    """Inner status implementation."""
     session_id = claude_agent._claude_sessions.get(chat_id, "无")
     if session_id != "无":
         session_id = session_id[:12] + "..."
@@ -149,151 +1034,1182 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = int(claude_agent._rate_limited_until - time.time())
         rate_info = f"\n⚠️ CLI限速: 还剩 {remaining}s"
 
-    await update.message.reply_text(
-        f"📊 状态\n\n"
-        f"模式: {mode_str}\n"
-        f"模型: {config.CLAUDE_MODEL}\n"
-        f"Session: {session_id}\n"
-        f"队列: {queue_size} 条待处理\n"
-        f"处理中: {'是' if is_busy else '否'}"
-        f"{rate_info}",
+    # Bot uptime
+    uptime_secs = int(time.time() - _BOT_START_TIME)
+    hours, remainder = divmod(uptime_secs, 3600)
+    minutes, secs = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {secs}s"
+
+    # System health summary
+    try:
+        _loop = asyncio.get_running_loop()
+        cpu = await _loop.run_in_executor(None, lambda: psutil.cpu_percent(interval=0.3))
+        mem = psutil.virtual_memory()
+        disk_path = "C:\\" if sys.platform == "win32" else "/"
+        disk = psutil.disk_usage(disk_path)
+        sys_info = (
+            f"\n\n💻 System: CPU {cpu}% | RAM {mem.percent}% "
+            f"({mem.used // (1024**3)}/{mem.total // (1024**3)} GB) | "
+            f"Disk {disk.percent}%"
+        )
+    except Exception:
+        sys_info = ""
+
+    # Service health from self-monitor
+    health_str = ""
+    try:
+        health = self_monitor.get_health_summary()
+        state_emoji = {"healthy": "🟢", "degraded": "🟡", "broken": "🔴", "critical": "💀"}
+        health_str = f"\n\nHealth: {state_emoji.get(health['overall'], '?')} {health['overall'].upper()}"
+        if health.get("consecutive_failures"):
+            health_str += f" ({health['consecutive_failures']} consecutive failures)"
+        if health.get("last_success_ago") is not None:
+            ago = health["last_success_ago"]
+            if ago > 3600:
+                health_str += f"\nLast success: {ago // 3600}h {(ago % 3600) // 60}m ago"
+            elif ago > 60:
+                health_str += f"\nLast success: {ago // 60}m ago"
+        for svc, info in health.get("services", {}).items():
+            if info.get("failures", 0) > 0:
+                health_str += f"\n  {svc}: {state_emoji.get(info['state'], '?')} {info['failures']} failures"
+    except Exception:
+        pass
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📊 Status\n\n"
+            f"Mode: {mode_str}\n"
+            f"Model: {config.CLAUDE_MODEL}\n"
+            f"Session: {session_id}\n"
+            f"Queue: {queue_size} pending\n"
+            f"Busy: {'Yes' if is_busy else 'No'}\n"
+            f"Uptime: {uptime_str}"
+            f"{rate_info}{health_str}{sys_info}"
+        ),
     )
 
 
-async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _send_health(context, chat_id):
+    """Detailed health check."""
+    lines = ["🏥 Health Check\n"]
+    try:
+        _loop = asyncio.get_running_loop()
+        cpu = await _loop.run_in_executor(None, lambda: psutil.cpu_percent(interval=0.5))
+        cpu_freq = psutil.cpu_freq()
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        disk_path = "C:\\" if sys.platform == "win32" else "/"
+        disk = psutil.disk_usage(disk_path)
+        boot = psutil.boot_time()
+        os_uptime = datetime.datetime.now() - datetime.datetime.fromtimestamp(boot)
+        bot_uptime_secs = int(time.time() - _BOT_START_TIME)
+        bot_h, bot_rem = divmod(bot_uptime_secs, 3600)
+        bot_m, bot_s = divmod(bot_rem, 60)
+
+        lines.append(f"CPU: {cpu}% ({psutil.cpu_count()} cores)")
+        if cpu_freq:
+            lines.append(f"  Freq: {cpu_freq.current:.0f} MHz")
+        lines.append(f"RAM: {mem.percent}% ({mem.used // (1024**2)} / {mem.total // (1024**2)} MB)")
+        lines.append(f"Swap: {swap.percent}% ({swap.used // (1024**2)} / {swap.total // (1024**2)} MB)")
+        lines.append(f"Disk: {disk.percent}% ({disk.used // (1024**3)} / {disk.total // (1024**3)} GB)")
+        lines.append(f"  Free: {disk.free // (1024**3)} GB")
+        lines.append(f"OS Uptime: {str(os_uptime).split('.')[0]}")
+        lines.append(f"Bot Uptime: {bot_h}h {bot_m}m {bot_s}s")
+        lines.append(f"Processes: {len(psutil.pids())}")
+    except Exception as e:
+        lines.append(f"System info error: {e}")
+
+    # Network info
+    lines.append("")
+    lines.append("🌐 Network:")
+    try:
+        net_io = psutil.net_io_counters()
+        lines.append(f"  Sent: {net_io.bytes_sent // (1024**2)} MB")
+        lines.append(f"  Recv: {net_io.bytes_recv // (1024**2)} MB")
+        try:
+            conns = psutil.net_connections(kind='inet')
+            established = sum(1 for c in conns if c.status == 'ESTABLISHED')
+            lines.append(f"  Connections: {established} established / {len(conns)} total")
+        except (psutil.AccessDenied, PermissionError):
+            lines.append("  Connections: access denied (run as admin)")
+    except Exception as e:
+        lines.append(f"  Network error: {e}")
+
+    # Bot-specific health
+    lines.append("")
+    lines.append("🤖 Bot Health:")
+    lines.append(f"  Mode: {'Harness' if config.HARNESS_MODE else 'Bridge' if config.BRIDGE_MODE else 'API'}")
+    lines.append(f"  Model: {config.CLAUDE_MODEL}")
+    lines.append(f"  Rate limited: {'Yes' if claude_agent.is_rate_limited() else 'No'}")
+    lines.append(f"  Active sessions: {len(claude_agent._claude_sessions)}")
+    lines.append(f"  Pending queues: {sum(len(v) for v in claude_agent._pending_messages.values())}")
+    lines.append(f"  PID: {os.getpid()}")
+
+    # Bot process memory
+    try:
+        proc = psutil.Process(os.getpid())
+        rss = proc.memory_info().rss // (1024 * 1024)
+        lines.append(f"  Bot RSS: {rss} MB")
+    except Exception:
+        pass
+
+    # Check Claude CLI availability
+    try:
+        import shutil
+        claude_path = shutil.which("claude") or shutil.which("claude.cmd")
+        lines.append(f"  Claude CLI: {'✅ ' + claude_path if claude_path else '❌ Not found'}")
+    except Exception:
+        lines.append("  Claude CLI: ❓ Unknown")
+
+    text = "\n".join(lines)
+    if len(text) <= 4096:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    else:
+        for i in range(0, len(text), 4000):
+            await context.bot.send_message(chat_id=chat_id, text=text[i:i+4000])
+
+
+async def _send_memory_info(context, chat_id):
+    """Show memory / conversation state."""
+    lines = ["🧠 Memory Info\n"]
+    try:
+        proc = psutil.Process(os.getpid())
+        rss = proc.memory_info().rss // (1024 * 1024)
+        lines.append(f"Bot process RSS: {rss} MB")
+    except Exception:
+        pass
+    lines.append(f"Active sessions: {len(claude_agent._claude_sessions)}")
+    lines.append(f"Pending queues: {sum(len(v) for v in claude_agent._pending_messages.values())}")
+    # Check memory file
+    mem_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_memory.md")
+    if os.path.exists(mem_file):
+        size = os.path.getsize(mem_file)
+        lines.append(f"Memory file: {size} bytes")
+    else:
+        lines.append("Memory file: not found")
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
+
+
+async def _send_scan(context, chat_id):
+    """Quick system scan — processes, network."""
+    lines = ["🔍 System Scan\n"]
+    try:
+        # Top 5 CPU-consuming processes
+        procs = []
+        for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+            try:
+                info = p.info
+                procs.append(info)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs.sort(key=lambda x: x.get('cpu_percent', 0) or 0, reverse=True)
+        lines.append("Top CPU processes:")
+        for p in procs[:5]:
+            lines.append(f"  {p['name'][:20]:20s} CPU {p.get('cpu_percent', 0):5.1f}%  RAM {p.get('memory_percent', 0):5.1f}%")
+
+        # Network connections count
+        try:
+            conns = psutil.net_connections(kind='inet')
+            established = sum(1 for c in conns if c.status == 'ESTABLISHED')
+            lines.append(f"\nNetwork: {established} established connections / {len(conns)} total")
+        except (psutil.AccessDenied, PermissionError):
+            lines.append("\nNetwork: access denied (run as admin)")
+    except Exception as e:
+        lines.append(f"Scan error: {e}")
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
+
+
+async def _send_score_brief(context, chat_id):
+    """Brief score summary for panel."""
+    try:
+        import harness_learn
+        scores = harness_learn.get_recent_scores(10)
+        if not scores:
+            await context.bot.send_message(chat_id=chat_id, text="📊 No scores yet. Send some messages first.")
+            return
+        avg = sum(s.get("overall", 0) for s in scores) / len(scores)
+        last = scores[-1]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"📊 Agent Score (last {len(scores)})\n\n"
+                f"Average: {avg:.2f}/1.00\n"
+                f"Latest: {last.get('overall', 0):.2f} | {last.get('model', '?')[:15]}\n\n"
+                f"Use /score for full details."
+            ),
+        )
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"📊 Score error: {e}")
+
+
+async def _send_signals(context, chat_id):
+    """Show latest trading signals."""
+    lines = ["📡 Latest Signals\n"]
+    try:
+        # Try loading from a signals file/module if it exists
+        signals_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_signals.json")
+        if os.path.exists(signals_file):
+            import json
+            with open(signals_file, "r", encoding="utf-8") as f:
+                signals = json.load(f)
+            for s in signals[-5:]:
+                lines.append(f"  {s.get('symbol', '?')} {s.get('direction', '?')} @ {s.get('price', '?')} ({s.get('time', '?')})")
+        else:
+            lines.append("No signal data available.")
+            lines.append("Send a request like \"analyze BTC signals\" to generate.")
+    except Exception as e:
+        lines.append(f"Error: {e}")
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+
+async def _send_portfolio(context, chat_id):
+    """Show trading portfolio / positions."""
+    lines = ["💼 Portfolio\n"]
+    try:
+        portfolio_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_portfolio.json")
+        if os.path.exists(portfolio_file):
+            import json
+            with open(portfolio_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for pos in data.get("positions", []):
+                pnl = pos.get("pnl", 0)
+                emoji = "🟢" if pnl >= 0 else "🔴"
+                lines.append(
+                    f"  {emoji} {pos.get('symbol', '?')}: {pos.get('size', '?')} "
+                    f"@ {pos.get('entry', '?')} | PnL: {pnl:+.2f}"
+                )
+            if "total_value" in data:
+                lines.append(f"\nTotal value: ${data['total_value']:,.2f}")
+        else:
+            lines.append("No portfolio data.")
+            lines.append("Ask me to check your exchange positions.")
+    except Exception as e:
+        lines.append(f"Error: {e}")
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+
+async def _send_risk(context, chat_id):
+    """Show risk metrics."""
+    lines = ["⚠️ Risk Metrics\n"]
+    try:
+        risk_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_risk.json")
+        if os.path.exists(risk_file):
+            import json
+            with open(risk_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            lines.append(f"Max Drawdown: {data.get('max_drawdown', 'N/A')}")
+            lines.append(f"Current Drawdown: {data.get('current_drawdown', 'N/A')}")
+            lines.append(f"Exposure: {data.get('exposure', 'N/A')}")
+            lines.append(f"Leverage: {data.get('leverage', 'N/A')}")
+            lines.append(f"Win Rate: {data.get('win_rate', 'N/A')}")
+            lines.append(f"Sharpe: {data.get('sharpe', 'N/A')}")
+        else:
+            lines.append("No risk data available.")
+            lines.append("Ask me to calculate risk metrics for your portfolio.")
+    except Exception as e:
+        lines.append(f"Error: {e}")
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+
+async def _send_regime(context, chat_id):
+    """Show market regime analysis."""
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="📈 Market Regime\n\nSend a request like \"analyze market regime for BTC\" to get regime detection.",
+    )
+
+
+async def _send_confluence(context, chat_id):
+    """Show confluence analysis."""
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="🔀 Confluence Analysis\n\nSend a request like \"confluence analysis BTC\" to check multi-indicator alignment.",
+    )
+
+
+async def _send_learn_brief(context, chat_id):
+    """Brief learning status for panel."""
+    if not _session_learner_available:
+        await context.bot.send_message(chat_id=chat_id, text="session_learner module not available.")
+        return
+    try:
+        learner = _sl.get_learner()
+        kb = learner.get_knowledge_base()
+        stats = kb.get("stats", {})
+        text = (
+            f"🧠 Session Learning\n\n"
+            f"Patterns: {kb['total_patterns']}\n"
+            f"Sessions analyzed: {kb['total_sessions']}\n"
+            f"Strategies: {len(kb.get('strategies_by_type', {}))}\n"
+            f"Last scan: {stats.get('last_scan', 'never')}\n\n"
+            f"Use /learn for full scan, /learn report for details."
+        )
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"🧠 Learning error: {e}")
+
+
+async def _send_learn_report(context, chat_id):
+    """Intelligence report for panel."""
+    if not _session_learner_available:
+        await context.bot.send_message(chat_id=chat_id, text="session_learner module not available.")
+        return
+    try:
+        learner = _sl.get_learner()
+        summary = learner.get_session_summary()
+        if len(summary) <= 4096:
+            await context.bot.send_message(chat_id=chat_id, text=summary)
+        else:
+            for i in range(0, len(summary), 4000):
+                await context.bot.send_message(chat_id=chat_id, text=summary[i:i+4000])
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"Report error: {e}")
+
+
+async def _send_learn_gaps(context, chat_id):
+    """Skill gaps for panel."""
+    if not _session_learner_available:
+        await context.bot.send_message(chat_id=chat_id, text="session_learner module not available.")
+        return
+    try:
+        learner = _sl.get_learner()
+        curriculum = learner.generate_training_curriculum()
+        if not curriculum:
+            await context.bot.send_message(chat_id=chat_id, text="No skill gaps identified. Run /learn first.")
+            return
+        lines = ["Skill Gaps & Curriculum\n"]
+        for item in curriculum[:8]:
+            priority = item.get("priority", "?").upper()
+            skill = item.get("skill", "?")
+            gap = item.get("gap_description", "")
+            lines.append(f"[{priority}] {skill}: {gap}")
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"Gaps error: {e}")
+
+
+async def _send_cc_sessions(context, chat_id):
+    """Claude Code sessions list for panel."""
+    if not _session_learner_available:
+        await context.bot.send_message(chat_id=chat_id, text="session_learner module not available.")
+        return
+    try:
+        learner = _sl.get_learner()
+        active = learner.get_active_sessions()
+        if not active:
+            await context.bot.send_message(chat_id=chat_id, text="No active Claude Code sessions found.\nUse /sessions for more options.")
+            return
+        lines = [f"📋 Active Sessions ({len(active)})\n"]
+        for s in active[:10]:
+            pid = s.get("pid", "?")
+            sid = s.get("session_id", "?")[:12]
+            cwd_short = os.path.basename(s.get("cwd", "")) or "?"
+            lines.append(f"  PID {pid} | {sid}... | {cwd_short}")
+        lines.append(f"\nUse /sessions ask/delegate for interaction.")
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"Sessions error: {e}")
+
+
+async def _send_okx_top30(context, chat_id):
+    """OKX Top 30 for panel button."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
+            )
+            resp.raise_for_status()
+            data = resp.json()["data"]
+
+        usdt = [d for d in data if d["instId"].endswith("-USDT-SWAP")]
+        usdt.sort(key=lambda x: float(x.get("volCcy24h", 0) or 0), reverse=True)
+        top30 = usdt[:30]
+
+        lines = ["OKX Top 30 (24h Vol)\n"]
+        for i, t in enumerate(top30, 1):
+            sym = t.get("instId", "?").replace("-USDT-SWAP", "")
+            price = float(t.get("last", 0))
+            open24 = float(t.get("open24h", 0) or 0)
+            chg = ((price - open24) / open24 * 100) if open24 else 0
+            vol = float(t.get("volCcy24h", 0) or 0)
+            vol_str = f"{vol/1e6:.0f}M" if vol >= 1e6 else f"{vol:,.0f}"
+            emoji = "+" if chg >= 0 else ""
+            lines.append(f"{i:>2}. {sym:<10} {price:.4f}  {emoji}{chg:.1f}%  {vol_str}")
+
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"OKX Top 30 error: {e}")
+
+
+async def _send_session_control(context, chat_id):
+    """Session control panel for panel button."""
+    if config.HARNESS_MODE:
+        current = "Harness"
+    elif config.BRIDGE_MODE:
+        current = "Bridge"
+    else:
+        current = f"API ({config.CURRENT_PROVIDER})"
+
+    sessions = len(claude_agent._claude_sessions)
+    pending = sum(len(v) for v in claude_agent._pending_messages.values())
+    rate = "Yes" if claude_agent.is_rate_limited() else "No"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Harness", callback_data="sc_harness"),
+            InlineKeyboardButton("Bridge", callback_data="sc_bridge"),
+            InlineKeyboardButton("API", callback_data="sc_api"),
+        ],
+        [
+            InlineKeyboardButton("Clear Sessions", callback_data="sc_clear"),
+            InlineKeyboardButton("Kill All", callback_data="sc_kill"),
+        ],
+    ])
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Session Control\n\n"
+            f"Mode: {current}\n"
+            f"Model: {config.CLAUDE_MODEL}\n"
+            f"Sessions: {sessions}\n"
+            f"Pending: {pending}\n"
+            f"Rate limited: {rate}"
+        ),
+        reply_markup=keyboard,
+    )
+
+
+# ─── Standalone command handlers for new commands ────────────────────────────
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detailed health check command."""
+    try:
+        await _send_health(context, update.effective_chat.id)
+    except Exception as e:
+        logger.error(f"Health command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Health error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show trading positions."""
+    try:
+        await _send_portfolio(context, update.effective_chat.id)
+    except Exception as e:
+        logger.error(f"Portfolio command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Portfolio error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show latest trading signals."""
+    try:
+        await _send_signals(context, update.effective_chat.id)
+    except Exception as e:
+        logger.error(f"Signal command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Signal error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show risk metrics."""
+    try:
+        await _send_risk(context, update.effective_chat.id)
+    except Exception as e:
+        logger.error(f"Risk command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Risk error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+# ─── Trading Skill Commands ──────────────────────────────────────────────────
+
+CRYPTO_SERVER = "http://127.0.0.1:8001"
+CRYPTO_ANALYSIS_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "crypto-analysis-")
+
+
+async def token_analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyze a token on-chain (Solana/EVM).
+
+    Usage: /token_analyze <address> [network] [pool]
+    Example: /token_analyze So11...  solana
+    """
     if not context.args:
         await update.message.reply_text(
-            f"当前模型: `{config.CLAUDE_MODEL}`\n"
-            "用法: `/model sonnet|opus|haiku`",
-            parse_mode="Markdown",
+            "Usage: /token_analyze <token_address> [network] [pool]\n\n"
+            "Example:\n"
+            "  /token_analyze EPjFW...  solana\n"
+            "  /token_analyze 0xdAC1...  ethereum"
         )
         return
 
-    name = context.args[0].lower()
-    if name not in AVAILABLE_MODELS:
-        await update.message.reply_text("可选: sonnet, opus, haiku")
+    address = context.args[0]
+    network = context.args[1] if len(context.args) > 1 else "solana"
+    pool = context.args[2] if len(context.args) > 2 else None
+
+    msg = await update.message.reply_text(f"Analyzing token {address[:12]}... on {network}...")
+    try:
+        import httpx
+        url = f"{CRYPTO_SERVER}/api/onchain/token/analyze/{address}?network={network}"
+        if pool:
+            url += f"&pool={pool}"
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        if "error" in data:
+            await msg.edit_text(f"Token Analysis Error:\n{data['error']}")
+            return
+
+        # Format results for Telegram
+        lines = [f"Token Analysis: {address[:16]}...\n"]
+        if isinstance(data, dict):
+            for key, val in data.items():
+                if isinstance(val, dict):
+                    lines.append(f"\n{key}:")
+                    for k2, v2 in list(val.items())[:10]:
+                        lines.append(f"  {k2}: {v2}")
+                elif isinstance(val, list):
+                    lines.append(f"{key}: [{len(val)} items]")
+                else:
+                    lines.append(f"{key}: {val}")
+        else:
+            lines.append(str(data)[:3000])
+
+        text = "\n".join(lines)[:4096]
+        await msg.edit_text(text)
+    except Exception as e:
+        err = str(e)[:300]
+        if "ConnectError" in err or "Connection refused" in err:
+            await msg.edit_text(
+                "Crypto analysis server not running.\n"
+                f"Start it: cd {CRYPTO_ANALYSIS_DIR} && python run.py"
+            )
+        else:
+            await msg.edit_text(f"Token analysis failed: {err}")
+
+
+async def okx_backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run OKX Top-30 x 100 Strategies backtest (background).
+
+    Usage: /okx_backtest [timeframe]
+    Example: /okx_backtest 1H
+    """
+    tf = context.args[0] if context.args else "1H"
+    chat_id = update.effective_chat.id
+
+    msg = await update.message.reply_text(
+        f"Starting OKX Top-30 backtest (TF={tf})...\n"
+        "This takes several minutes. Results will be sent when ready."
+    )
+
+    async def _run_backtest():
+        try:
+            import subprocess
+            script = os.path.join(CRYPTO_ANALYSIS_DIR, "strategy_backtest_100.py")
+            if not os.path.exists(script):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Script not found: {script}"
+                )
+                return
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [sys.executable, script],
+                    capture_output=True, text=True, timeout=600,
+                    cwd=CRYPTO_ANALYSIS_DIR,
+                )
+            )
+
+            output = result.stdout or ""
+            stderr = result.stderr or ""
+
+            if result.returncode != 0:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"OKX Backtest failed (rc={result.returncode}):\n{stderr[:2000]}"
+                )
+                return
+
+            # Send last ~3500 chars (the summary section)
+            summary = output[-3500:] if len(output) > 3500 else output
+            if not summary.strip():
+                summary = "Backtest completed but no output captured."
+
+            # Split into chunks if needed
+            for i in range(0, len(summary), 4000):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"OKX Backtest Results:\n\n{summary[i:i+4000]}"
+                )
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+            await context.bot.send_message(
+                chat_id=chat_id, text="OKX Backtest timed out (10 min limit)."
+            )
+        except Exception as e:
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"OKX Backtest error: {str(e)[:500]}"
+            )
+
+    task = asyncio.create_task(_run_backtest())
+    _track_task(context.bot_data, task)
+
+
+async def ma_ribbon_backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """MA Ribbon multi-TF backtest via crypto-analysis server.
+
+    Usage: /ma_ribbon_backtest <symbol> [anchor_tf] [forward_bars] [success_pct]
+    Example: /ma_ribbon_backtest BTC 1d 5 2.0
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /ma_ribbon_backtest <symbol> [anchor_tf] [forward_bars] [success_pct]\n\n"
+            "Example:\n"
+            "  /ma_ribbon_backtest BTC\n"
+            "  /ma_ribbon_backtest ETH 4h 10 3.0"
+        )
         return
 
-    config.CLAUDE_MODEL = AVAILABLE_MODELS[name]
-    claude_agent.clear_history(update.effective_chat.id)
-    await update.message.reply_text(f"✅ 已切换为 `{config.CLAUDE_MODEL}`", parse_mode="Markdown")
+    symbol = context.args[0].upper()
+    anchor_tf = context.args[1] if len(context.args) > 1 else "1d"
+    forward_bars = context.args[2] if len(context.args) > 2 else "5"
+    success_pct = context.args[3] if len(context.args) > 3 else "2.0"
+
+    msg = await update.message.reply_text(f"Running MA Ribbon backtest for {symbol} ({anchor_tf})...")
+    try:
+        import httpx
+        url = (
+            f"{CRYPTO_SERVER}/api/ma-ribbon/backtest"
+            f"?symbol={symbol}&anchor_tf={anchor_tf}"
+            f"&forward_bars={forward_bars}&success_pct={success_pct}"
+        )
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        if "error" in data:
+            await msg.edit_text(f"Backtest Error:\n{data['error']}")
+            return
+
+        lines = [f"MA Ribbon Backtest: {symbol} ({anchor_tf})\n"]
+
+        # Format score-band results
+        if "score_bands" in data:
+            lines.append("Score Band Results:")
+            for band in data["score_bands"]:
+                score = band.get("score_range", "?")
+                total = band.get("total", 0)
+                success = band.get("success_rate", 0)
+                avg_ret = band.get("avg_return", 0)
+                lines.append(
+                    f"  Score {score}: {total} signals | "
+                    f"Win {success:.1f}% | Avg {avg_ret:+.2f}%"
+                )
+
+        # Overall stats
+        for key in ["total_signals", "overall_success_rate", "tier", "score"]:
+            if key in data:
+                lines.append(f"{key}: {data[key]}")
+
+        # Dump remaining top-level keys
+        shown = {"score_bands", "total_signals", "overall_success_rate", "tier", "score"}
+        for key, val in data.items():
+            if key not in shown:
+                if isinstance(val, (int, float, str, bool)):
+                    lines.append(f"{key}: {val}")
+
+        text = "\n".join(lines)[:4096]
+        await msg.edit_text(text)
+    except Exception as e:
+        err = str(e)[:300]
+        if "ConnectError" in err or "Connection refused" in err:
+            await msg.edit_text(
+                "Crypto analysis server not running.\n"
+                f"Start it: cd {CRYPTO_ANALYSIS_DIR} && python run.py"
+            )
+        else:
+            await msg.edit_text(f"MA Ribbon backtest failed: {err}")
 
 
-async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    valid = list(PROVIDER_DISPLAY.keys())
-    if not context.args:
-        lines = ["AI Provider 状态:\n"]
-        key_map = {"claude": config.ANTHROPIC_API_KEY, "openai": config.OPENAI_API_KEY, "gemini": config.GEMINI_API_KEY}
-        for p, name in PROVIDER_DISPLAY.items():
-            if p == config.CURRENT_PROVIDER:
-                status = "✅ 当前"
-            elif p == "web_ai":
-                status = "🌐 免费"
-            elif key_map.get(p):
-                status = "🔑 可用"
+async def ma_ribbon_screener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run MA Ribbon full-market screener (background, takes minutes).
+
+    Usage: /ma_ribbon_screener
+    """
+    chat_id = update.effective_chat.id
+    msg = await update.message.reply_text(
+        "Starting MA Ribbon full-market screener...\n"
+        "Scanning 120 OKX pairs x 2 timeframes. This takes 5-10 minutes.\n"
+        "Results will be sent when ready."
+    )
+
+    async def _run_screener():
+        try:
+            import subprocess
+            script = os.path.join(CRYPTO_ANALYSIS_DIR, "ma_ribbon_screener.py")
+            if not os.path.exists(script):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Script not found: {script}"
+                )
+                return
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [sys.executable, script],
+                    capture_output=True, text=True, timeout=900,
+                    cwd=CRYPTO_ANALYSIS_DIR,
+                )
+            )
+
+            output = result.stdout or ""
+            stderr = result.stderr or ""
+
+            if result.returncode != 0:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"MA Ribbon Screener failed (rc={result.returncode}):\n{stderr[:2000]}"
+                )
+                return
+
+            # Extract the summary section (after the scanning lines)
+            summary = output[-3500:] if len(output) > 3500 else output
+            if not summary.strip():
+                summary = "Screener completed but no output captured."
+
+            for i in range(0, len(summary), 4000):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"MA Ribbon Screener Results:\n\n{summary[i:i+4000]}"
+                )
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+            await context.bot.send_message(
+                chat_id=chat_id, text="MA Ribbon Screener timed out (15 min limit)."
+            )
+        except Exception as e:
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"Screener error: {str(e)[:500]}"
+            )
+
+    task = asyncio.create_task(_run_screener())
+    _track_task(context.bot_data, task)
+
+
+async def okx_top30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show OKX Top 30 USDT-SWAP by 24h volume.
+
+    Usage: /okx_top30
+    """
+    msg = await update.message.reply_text("Fetching OKX Top 30 by volume...")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
+            )
+            resp.raise_for_status()
+            data = resp.json()["data"]
+
+        usdt = [d for d in data if d["instId"].endswith("-USDT-SWAP")]
+        usdt.sort(key=lambda x: float(x.get("volCcy24h", 0) or 0), reverse=True)
+        top30 = usdt[:30]
+
+        lines = ["OKX Top 30 USDT-SWAP (24h Volume)\n"]
+        lines.append(f"{'#':>2} {'Symbol':<14} {'Price':>12} {'24h%':>8} {'Vol24h':>14}")
+        lines.append("-" * 54)
+
+        for i, t in enumerate(top30, 1):
+            sym = t.get("instId", "?").replace("-USDT-SWAP", "")
+            price = float(t.get("last", 0))
+            open24 = float(t.get("open24h", 0) or 0)
+            chg = ((price - open24) / open24 * 100) if open24 else 0
+            vol = float(t.get("volCcy24h", 0) or 0)
+
+            if vol >= 1_000_000_000:
+                vol_str = f"{vol/1e9:.1f}B"
+            elif vol >= 1_000_000:
+                vol_str = f"{vol/1e6:.1f}M"
             else:
-                status = "❌ 无key"
-            lines.append(f"{status} — {name}")
-        lines.append(f"\n用法: `/provider claude|openai|gemini|web_ai`")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-        return
+                vol_str = f"{vol:,.0f}"
 
-    choice = context.args[0].lower()
-    if choice not in valid:
-        await update.message.reply_text(f"可选: {', '.join(valid)}")
-        return
+            emoji = "+" if chg >= 0 else ""
+            lines.append(f"{i:>2} {sym:<14} {price:>12.4f} {emoji}{chg:>6.2f}% {vol_str:>14}")
 
-    config.CURRENT_PROVIDER = choice
-    claude_agent.clear_history(update.effective_chat.id)
-    await update.message.reply_text(f"✅ 已切换到 {PROVIDER_DISPLAY[choice]}")
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 我能做什么:\n\n"
-        "💻 执行命令、打开应用\n"
-        "📁 文件操作、代码编辑\n"
-        "🌐 网页浏览、下载文件\n"
-        "🖱 鼠标键盘控制\n"
-        "📸 截图、GUI操作\n"
-        "🔧 安装软件、Git操作\n\n"
-        "直接说就行，不用客气。"
-    )
-
-
-async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show quota status for all AI platforms."""
-    try:
-        from tracker.quota import QuotaTracker
-        qt = QuotaTracker()
-        report = qt.status_report()
-        rate_info = ""
-        if claude_agent.is_rate_limited():
-            remaining = int(claude_agent._rate_limited_until - __import__('time').time())
-            rate_info = f"\n⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
-        await update.message.reply_text(f"📊 AI 平台用量\n{rate_info}\n{report}")
+        text = "\n".join(lines)
+        await msg.edit_text(f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
-        rate_info = ""
-        if claude_agent.is_rate_limited():
-            remaining = int(claude_agent._rate_limited_until - __import__('time').time())
-            rate_info = f"⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
-        await update.message.reply_text(f"📊 Quota\n{rate_info}\nHarness 未初始化 (首次限速时自动启动)")
+        await msg.edit_text(f"OKX Top 30 failed: {str(e)[:300]}")
 
 
-async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show active/paused sessions."""
+async def session_control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Control bot session mode and manage active sessions.
+
+    Usage: /session_control [harness|bridge|api|status]
+    """
     try:
-        from tracker.session_store import SessionStore
-        ss = SessionStore()
-        report = ss.status_report()
-        await update.message.reply_text(f"📋 Sessions\n\n{report}")
+        return await _session_control_impl(update, context)
     except Exception as e:
-        await update.message.reply_text(f"📋 Sessions\nHarness 未初始化: {e}")
+        logger.error(f"Session control command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Session control error: {str(e)[:300]}")
+        except Exception:
+            pass
 
-
-async def bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _session_control_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        harness = "✅ 开启" if config.HARNESS_MODE else "❌ 关闭"
-        bridge = "✅ 开启" if config.BRIDGE_MODE else "❌ 关闭"
+        # Show interactive panel
+        if config.HARNESS_MODE:
+            current = "Harness (free AI primary)"
+        elif config.BRIDGE_MODE:
+            current = "Bridge (Claude CLI direct)"
+        else:
+            current = f"API ({config.CURRENT_PROVIDER})"
+
+        rate_info = ""
+        if claude_agent.is_rate_limited():
+            remaining = int(claude_agent._rate_limited_until - time.time())
+            rate_info = f"\nRate limited: {remaining}s remaining"
+
+        sessions_count = len(claude_agent._claude_sessions)
+        pending = sum(len(v) for v in claude_agent._pending_messages.values())
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Harness", callback_data="sc_harness"),
+                InlineKeyboardButton("Bridge", callback_data="sc_bridge"),
+                InlineKeyboardButton("API", callback_data="sc_api"),
+            ],
+            [
+                InlineKeyboardButton("Clear Sessions", callback_data="sc_clear"),
+                InlineKeyboardButton("Kill All", callback_data="sc_kill"),
+            ],
+        ])
+
         await update.message.reply_text(
-            f"🧠 Harness Mode: {harness}\n"
-            f"🔗 Bridge Mode: {bridge}\n\n"
-            "Harness = 免费AI优先 (浏览器自动化)\n"
-            "  纯问答→ChatGPT/Grok, 代码→Claude.ai\n"
-            "  电脑操控→Claude CLI (唯一有工具的)\n\n"
-            "Bridge = Claude CLI 直连 (消耗token)\n\n"
-            "用法: /bridge harness|on|off"
+            f"Session Control\n\n"
+            f"Current mode: {current}\n"
+            f"Model: {config.CLAUDE_MODEL}\n"
+            f"Active sessions: {sessions_count}\n"
+            f"Pending messages: {pending}"
+            f"{rate_info}\n\n"
+            "Choose a mode or action:",
+            reply_markup=keyboard,
         )
         return
+
     action = context.args[0].lower()
     if action == "harness":
         config.HARNESS_MODE = True
         config.BRIDGE_MODE = True
-        await update.message.reply_text(
-            "✅ Harness Mode 开启\n"
-            "免费AI优先，Claude CLI仅用于电脑操控"
-        )
-    elif action == "on":
+        await update.message.reply_text("Harness Mode ON (free AI primary, CLI for tools)")
+    elif action == "bridge":
         config.HARNESS_MODE = False
         config.BRIDGE_MODE = True
         bridge.clear_bridge()
-        await update.message.reply_text("✅ Bridge Mode 开启 (Claude CLI 直连)")
-    elif action == "off":
+        await update.message.reply_text("Bridge Mode ON (Claude CLI direct)")
+    elif action == "api":
         config.HARNESS_MODE = False
         config.BRIDGE_MODE = False
-        await update.message.reply_text("✅ API Mode (直接调API，最贵)")
+        await update.message.reply_text(f"API Mode ON (provider: {config.CURRENT_PROVIDER})")
+    elif action == "status":
+        if config.HARNESS_MODE:
+            mode = "Harness"
+        elif config.BRIDGE_MODE:
+            mode = "Bridge"
+        else:
+            mode = f"API ({config.CURRENT_PROVIDER})"
+        sessions = len(claude_agent._claude_sessions)
+        pending = sum(len(v) for v in claude_agent._pending_messages.values())
+        rate = "Yes" if claude_agent.is_rate_limited() else "No"
+        await update.message.reply_text(
+            f"Mode: {mode}\nModel: {config.CLAUDE_MODEL}\n"
+            f"Sessions: {sessions}\nPending: {pending}\nRate limited: {rate}"
+        )
+    elif action == "clear":
+        claude_agent._claude_sessions.clear()
+        claude_agent._save_sessions()
+        await update.message.reply_text("All sessions cleared.")
     else:
-        await update.message.reply_text("用法: /bridge harness|on|off")
+        await update.message.reply_text(
+            "Usage: /session_control [harness|bridge|api|status|clear]"
+        )
+
+
+async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Control the self-monitoring system. Usage: /monitor [on|off|status]"""
+    try:
+        action = (context.args[0].lower() if context.args else "status")
+
+        if action == "on":
+            if not self_monitor._running:
+                await self_monitor.start()
+            await update.message.reply_text("Self-Monitor started.")
+        elif action == "off":
+            if self_monitor._running:
+                await self_monitor.stop()
+            await update.message.reply_text("Self-Monitor stopped.")
+        elif action == "status":
+            report = self_monitor.get_status_report()
+            # Include action memory stats
+            patterns = action_memory.get_failure_patterns()
+            if patterns:
+                report += "\n\n=== Failure Patterns ===\n"
+                for p in patterns[:5]:
+                    report += f"  {p['action_type']}: {p['error_signature'][:80]} (x{p['count']})\n"
+            await update.message.reply_text(report[:4096])
+        else:
+            await update.message.reply_text("Usage: /monitor [on|off|status]")
+    except Exception as e:
+        logger.error(f"Monitor command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Monitor error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def proactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Control the proactive agent. Usage: /proactive [on|off|status]"""
+    try:
+        from proactive_agent import PROACTIVE_CONFIG
+
+        action = (context.args[0].lower() if context.args else "status")
+
+        if action == "on":
+            if not proactive_agent._running:
+                await proactive_agent.start()
+            await update.message.reply_text("Proactive Agent started.")
+        elif action == "off":
+            if proactive_agent._running:
+                await proactive_agent.stop()
+            await update.message.reply_text("Proactive Agent stopped.")
+        elif action == "status":
+            running = "running" if proactive_agent._running else "stopped"
+            tasks = len(proactive_agent._tasks)
+            enabled = [k for k, v in PROACTIVE_CONFIG.items() if v]
+            disabled = [k for k, v in PROACTIVE_CONFIG.items() if not v]
+            text = (
+                f"Proactive Agent: {running}\n"
+                f"Active tasks: {tasks}\n"
+                f"Enabled loops: {', '.join(enabled) if enabled else 'none'}\n"
+                f"Disabled loops: {', '.join(disabled) if disabled else 'none'}"
+            )
+            await update.message.reply_text(text)
+        else:
+            await update.message.reply_text("Usage: /proactive [on|off|status]")
+    except Exception as e:
+        logger.error(f"Proactive command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Proactive error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+# ─── Autonomy & Consciousness Commands ────────────────────────────────────────
+
+async def autonomy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Control autonomous agent. Usage: /autonomy [start|stop|status|goal <text>]"""
+    if not _autonomy_available:
+        await update.message.reply_text("Autonomy module not available.")
+        return
+    try:
+        engine = get_autonomy_engine()
+        action = (context.args[0].lower() if context.args else "status")
+
+        if action == "start":
+            chat_id = update.effective_chat.id
+            async def _send_status(msg):
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=msg)
+                except Exception:
+                    pass
+            engine.start(send_fn=_send_status, interval=15.0)
+            await update.message.reply_text("🤖 Autonomy engine started.")
+        elif action == "stop":
+            engine.stop()
+            await update.message.reply_text("🤖 Autonomy engine stopped.")
+        elif action == "goal":
+            goal_text = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+            if not goal_text:
+                await update.message.reply_text("Usage: /autonomy goal <description>")
+                return
+            goal = engine.add_goal(goal_text)
+            await update.message.reply_text(f"🎯 Goal added: {goal.description[:200]}")
+        elif action == "status":
+            summary = engine.get_status_summary()
+            stats = await engine.self_evaluate()
+            text = (
+                f"🤖 Autonomy Engine\n\n"
+                f"{summary}\n"
+                f"Success rate: {stats.get('success_rate', 0):.0%}\n"
+            )
+            active = engine.get_active_goals()
+            if active:
+                text += "\nActive goals:\n"
+                for g in active[:5]:
+                    text += f"  • {g.description[:80]} ({g.attempts}/{g.max_attempts})\n"
+            await update.message.reply_text(text)
+        else:
+            await update.message.reply_text("Usage: /autonomy [start|stop|status|goal <text>]")
+    except Exception as e:
+        logger.error(f"Autonomy command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def consciousness_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Self-awareness report. Usage: /consciousness"""
+    if not _autonomy_available:
+        await update.message.reply_text("Consciousness module not available.")
+        return
+    try:
+        awareness = get_self_awareness()
+        report = awareness.self_reflect()
+        desc = awareness.get_self_description()
+
+        text = f"🧠 Self-Awareness Report\n\n{desc}\n\n"
+        text += f"Performance trend: {report['performance_trend']}\n"
+
+        gaps = report.get("top_capability_gaps", [])
+        if gaps:
+            text += "\nCapability gaps:\n"
+            for g in gaps[:3]:
+                text += f"  • {g['reason'][:60]} (×{g['count']})\n"
+
+        evolutions = report.get("recent_evolutions", [])
+        if evolutions:
+            text += f"\nRecent evolutions: {len(evolutions)}\n"
+            for e in evolutions[-3:]:
+                outcome = e.get("outcome", "?")
+                text += f"  • [{outcome}] {e['description'][:60]}\n"
+
+        await update.message.reply_text(text[:4000])
+    except Exception as e:
+        logger.error(f"Consciousness command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Self-evolution: bot analyzes and improves its own code. Usage: /evolve [focus]"""
+    try:
+        from agents.loop import self_evolve
+        focus = " ".join(context.args) if context.args else ""
+        chat_id = update.effective_chat.id
+
+        await update.message.reply_text(f"🧬 Self-evolution starting... Focus: {focus or 'general'}")
+
+        async def _send(msg):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=msg[:4000])
+            except Exception:
+                pass
+
+        result = await self_evolve(send_status=_send, focus=focus, max_rounds=3)
+        await context.bot.send_message(chat_id=chat_id, text=f"🧬 Evolution result:\n{result[:4000]}")
+    except Exception as e:
+        logger.error(f"Evolve command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Evolution error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def multi_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-session control. Usage: /ms [list|create <name> <dir>|send <name> <msg>]"""
+    if not _sessions_available:
+        await update.message.reply_text("Sessions module not available.")
+        return
+    try:
+        action = (context.args[0].lower() if context.args else "list")
+
+        if action == "list":
+            sessions = _session_mgr.list_sessions()
+            if not sessions:
+                await update.message.reply_text("No sessions. Use /ms create <name> <project_dir>")
+                return
+            text = "📋 Active Sessions:\n"
+            for s in sessions:
+                status = "🔴 busy" if s["busy"] else "🟢 idle"
+                ctx = "✅" if s["has_context"] else "❌"
+                text += f"\n• {s['name']} [{status}] ctx:{ctx}\n  {s['project_dir']}\n"
+            await update.message.reply_text(text)
+
+        elif action == "create":
+            if len(context.args) < 3:
+                await update.message.reply_text("Usage: /ms create <name> <project_dir>")
+                return
+            name = context.args[1]
+            proj_dir = " ".join(context.args[2:])
+            _session_mgr.create(name, proj_dir)
+            await update.message.reply_text(f"✅ Session '{name}' created → {proj_dir}")
+
+        elif action == "send":
+            if len(context.args) < 3:
+                await update.message.reply_text("Usage: /ms send <name> <message>")
+                return
+            name = context.args[1]
+            msg = " ".join(context.args[2:])
+            await update.message.reply_text(f"⏳ Sending to {name}...")
+            result = await _session_mgr.send(name, msg)
+            # Truncate for Telegram
+            await update.message.reply_text(result[:4000])
+
+        elif action == "broadcast":
+            if len(context.args) < 2:
+                await update.message.reply_text("Usage: /ms broadcast <message>")
+                return
+            msg = " ".join(context.args[1:])
+            await update.message.reply_text(f"⏳ Broadcasting to {len(_session_mgr.sessions)} sessions...")
+            results = await _session_mgr.broadcast(msg)
+            text = "Broadcast results:\n"
+            for name, result in results.items():
+                text += f"\n• {name}: {result[:200]}\n"
+            await update.message.reply_text(text[:4000])
+        else:
+            await update.message.reply_text("Usage: /ms [list|create|send|broadcast]")
+    except Exception as e:
+        logger.error(f"Multi-session command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ {str(e)[:300]}")
+        except Exception:
+            pass
 
 
 # ─── Screenshot & Quick Actions ───────────────────────────────────────────────
 
 async def quick_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from screenshots import capture_screenshot
-
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
     try:
-        buffer = capture_screenshot()
+        from screenshots import capture_screenshot
+    except ImportError:
+        await update.message.reply_text("screenshots module not available.")
+        return
+
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    except Exception:
+        pass
+    try:
+        _loop = asyncio.get_running_loop()
+        buffer = await _loop.run_in_executor(None, capture_screenshot)
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🔄 刷新", callback_data="qa_screenshot"),
@@ -307,6 +2223,16 @@ async def quick_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def quick_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        return await _quick_action_impl(update, context)
+    except Exception as e:
+        logger.error(f"Quick action error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Quick action error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+async def _quick_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📸 截图", callback_data="qa_screenshot"),
@@ -324,12 +2250,72 @@ async def quick_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔒 锁屏", callback_data="qa_lock"),
             InlineKeyboardButton("📊 系统状态", callback_data="qa_sysinfo"),
         ],
+        [
+            InlineKeyboardButton("📊 评分", callback_data="qa_score"),
+            InlineKeyboardButton("🎓 训练", callback_data="qa_train"),
+            InlineKeyboardButton("🔪 终止", callback_data="qa_kill"),
+        ],
     ])
     await update.message.reply_text("⚡ 快捷操作", reply_markup=keyboard)
 
 
+async def handle_session_control_callback(update, context):
+    """Handle session_control inline button presses (sc_ prefix)."""
+    query = update.callback_query
+    if not _is_authorized(query.from_user.id):
+        await query.answer("⛔ Unauthorized", show_alert=True)
+        return
+    if not query.data.startswith("sc_"):
+        return
+    await query.answer()
+    chat_id = query.message.chat_id
+    action = query.data[3:]  # strip "sc_"
+
+    try:
+        if action == "harness":
+            config.HARNESS_MODE = True
+            config.BRIDGE_MODE = True
+            await query.edit_message_text("Harness Mode ON (free AI primary, CLI for tools)")
+        elif action == "bridge":
+            config.HARNESS_MODE = False
+            config.BRIDGE_MODE = True
+            bridge.clear_bridge()
+            await query.edit_message_text("Bridge Mode ON (Claude CLI direct)")
+        elif action == "api":
+            config.HARNESS_MODE = False
+            config.BRIDGE_MODE = False
+            await query.edit_message_text(f"API Mode ON (provider: {config.CURRENT_PROVIDER})")
+        elif action == "clear":
+            claude_agent._claude_sessions.clear()
+            claude_agent._save_sessions()
+            await query.edit_message_text("All sessions cleared.")
+        elif action == "kill":
+            claude_agent._pending_messages.clear()
+            claude_agent._claude_sessions.clear()
+            claude_agent._save_sessions()
+            try:
+                import subprocess
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Process claude -ErrorAction SilentlyContinue | Stop-Process -Force"],
+                    capture_output=True, text=True, timeout=10,
+                ))
+            except Exception:
+                pass
+            await query.edit_message_text("All sessions killed, queues cleared.")
+    except Exception as e:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"Session control error: {e}")
+        except Exception:
+            pass
+
+
 async def handle_quick_action_callback(update, context):
     query = update.callback_query
+    if not _is_authorized(query.from_user.id):
+        await query.answer("⛔ Unauthorized", show_alert=True)
+        return
     if query.data.startswith(("allow_", "deny_")):
         return
     if not query.data.startswith("qa_"):
@@ -343,7 +2329,8 @@ async def handle_quick_action_callback(update, context):
         if action == "qa_screenshot":
             from screenshots import capture_screenshot
             await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-            buffer = capture_screenshot()
+            _loop = asyncio.get_running_loop()
+            buffer = await _loop.run_in_executor(None, capture_screenshot)
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("🔄 刷新", callback_data="qa_screenshot"),
@@ -366,7 +2353,7 @@ async def handle_quick_action_callback(update, context):
 
         elif action == "qa_lock":
             import tools
-            await tools.execute_run_command("rundll32.exe user32.dll,LockWorkStation")
+            result = await tools.execute_run_command("rundll32.exe user32.dll,LockWorkStation")
             await context.bot.send_message(chat_id=chat_id, text="🔒 已锁屏")
 
         elif action == "qa_sysinfo":
@@ -380,7 +2367,8 @@ async def handle_quick_action_callback(update, context):
             from screenshots import capture_screenshot
             pyautogui.scroll(5 if action == "qa_scroll_up" else -5)
             await asyncio.sleep(0.3)
-            buffer = capture_screenshot()
+            _loop = asyncio.get_running_loop()
+            buffer = await _loop.run_in_executor(None, capture_screenshot)
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("🔄 刷新", callback_data="qa_screenshot"),
@@ -390,28 +2378,180 @@ async def handle_quick_action_callback(update, context):
             ])
             await context.bot.send_photo(chat_id=chat_id, photo=buffer, reply_markup=keyboard)
 
+        elif action == "qa_score":
+            import harness_learn
+            scores = harness_learn.get_recent_scores(10)
+            if not scores:
+                await context.bot.send_message(chat_id=chat_id, text="📊 暂无评分数据。")
+            else:
+                avg = sum(s.get("overall", 0) for s in scores) / len(scores)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📊 最近{len(scores)}次平均: {avg:.2f}/1.00\n发 /score 查看详情",
+                )
+
+        elif action == "qa_train":
+            import auto_train
+            report = auto_train.get_progress_report()
+            await context.bot.send_message(chat_id=chat_id, text=report[:3000])
+
+        elif action == "qa_kill":
+            claude_agent._pending_messages.pop(chat_id, None)
+            claude_agent._claude_sessions.pop(chat_id, None)
+            claude_agent._save_sessions()
+            await context.bot.send_message(
+                chat_id=chat_id, text="🔪 已终止并清空队列。发新消息重新开始。",
+            )
+
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ {e}")
+
+
+# ─── Session Learning Background ─────────────────────────────────────────────
+
+async def _background_session_scan(learner):
+    """Run session log scanning in the background (non-blocking)."""
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, learner.learn_from_all_recent, 10)
+        logger.debug("Background session scan completed")
+    except Exception as exc:
+        logger.debug("Background session scan failed: %s", exc)
 
 
 # ─── Message Handlers ─────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages."""
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
-    text = update.message.text
+    text = (update.message.text or "").strip()
     if not text:
         return
+
+    # Guard: truncate extremely long messages to prevent CLI arg overflow on Windows
+    if len(text) > 30000:
+        text = text[:30000] + "\n\n...(消息过长，已截断到30000字符)"
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     except Exception:
         pass
 
+    _msg_start = time.time()
     try:
-        await claude_agent.process_message(text, chat_id, context)
+        actually_processed = await claude_agent.process_message(text, chat_id, context)
+        if not actually_processed:
+            return  # Message was queued, don't count as success
+        # Record success for self-monitor
+        self_monitor.record_message_success()
+        duration_ms = (time.time() - _msg_start) * 1000
+        self_monitor.record_response_time(duration_ms)
+        action_memory.record_action("handle_message", {"text": text[:100]}, success=True, duration_ms=duration_ms)
+
+        # Intelligence + Reflexion + RAG: learn from success
+        if _intel_available:
+            try:
+                _intel.extract_pattern({
+                    "request": text[:300],
+                    "response": "(success)",
+                    "duration_ms": duration_ms,
+                    "tools_used": [],
+                })
+            except Exception:
+                pass
+        if _autonomy_available:
+            try:
+                get_reflexion_engine().reflect_on_action(
+                    action=text[:200], result="success", success=True, duration_ms=duration_ms,
+                )
+                # Store as retrievable solution if response was substantive
+                if duration_ms > 2000:  # Non-trivial task
+                    get_solution_store().store_solution(
+                        task=text[:300], solution="(completed successfully)",
+                        category="general", score=1.0,
+                    )
+            except Exception:
+                pass
+
+        # Consciousness: periodic performance snapshot (every 50 messages)
+        if _autonomy_available:
+            global _message_counter
+            _message_counter += 1
+            if _message_counter % 50 == 0:
+                try:
+                    awareness = get_self_awareness()
+                    awareness.record_performance_snapshot()
+                except Exception:
+                    pass
+
+        # Session learning: periodic background scan
+        if _session_learner_available and config.SESSION_LEARNING_ENABLED:
+            if _message_counter % config.SESSION_LEARNING_INTERVAL == 0:
+                try:
+                    learner = _sl.get_learner()
+                    _scan_task = asyncio.create_task(_background_session_scan(learner))
+                    _track_task(context.bot_data, _scan_task)
+                except Exception:
+                    pass
+
     except Exception as e:
         logger.error(f"Error processing message: {e}", exc_info=True)
+        # Record error for self-monitor and proactive agent
+        duration_ms = (time.time() - _msg_start) * 1000
+        try:
+            self_monitor.record_error(str(e))
+            self_monitor.record_message_failure()
+        except Exception:
+            pass
+        try:
+            action_memory.record_action("handle_message", {"text": text[:100]}, success=False, error=str(e), duration_ms=duration_ms)
+        except Exception:
+            pass
+
+        # Intelligence + Reflexion: analyze failure for learning
+        if _intel_available:
+            try:
+                analysis = _intel.analyze_failure(
+                    action="handle_message",
+                    error=str(e)[:500],
+                    context={"user_message": text[:300], "duration_ms": duration_ms},
+                )
+                if analysis.get("suggestions"):
+                    logger.info(f"Intelligence suggestions: {analysis['suggestions'][:2]}")
+            except Exception:
+                pass
+        if _autonomy_available:
+            try:
+                get_reflexion_engine().reflect_on_action(
+                    action=text[:200], result=str(e)[:300], success=False, duration_ms=duration_ms,
+                )
+            except Exception:
+                pass
+
+        # Session learning: analyze failure
+        if _session_learner_available and config.SESSION_LEARNING_ENABLED:
+            try:
+                learner = _sl.get_learner()
+                kb = learner._knowledge
+                failure_log = kb.setdefault("failure_log", [])
+                failure_log.append({
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "user_message": text[:200],
+                    "error": str(e)[:500],
+                })
+                # Cap failure log in-place
+                if len(failure_log) > 200:
+                    failure_log[:] = failure_log[-200:]
+                learner._save_knowledge()
+            except Exception:
+                pass
+
+        try:
+            await proactive_agent.push_error("message_processing", str(e)[:500], source="handle_message")
+        except Exception:
+            pass
         try:
             await update.message.reply_text(f"❌ Error: {str(e)[:500]}")
         except Exception:
@@ -420,15 +2560,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle photos — save to disk and pass to Claude with vision support in API mode."""
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
     caption = update.message.caption or ""
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-        # Save photo to disk
+        # Save photo to disk — handle stickers/GIFs sent as photos
         if not update.message.photo:
-            await update.message.reply_text("📸 无法获取图片。")
+            if update.message.sticker:
+                sticker = update.message.sticker
+                file = await context.bot.get_file(sticker.file_id)
+                save_dir = config.TELEGRAM_FILES_DIR
+                os.makedirs(save_dir, exist_ok=True)
+                ext = ".webp" if not sticker.is_animated else ".tgs"
+                save_path = os.path.join(save_dir, f"sticker_{sticker.file_id}{ext}")
+                await file.download_to_drive(save_path)
+                msg = f"用户发送了一个贴纸，已保存到: {save_path}"
+                if caption:
+                    msg += f"\n用户说: {caption}"
+                await update.message.reply_text(f"🎭 贴纸已保存: {save_path}")
+                _sr = await claude_agent.process_message(msg, chat_id, context)
+                if _sr:
+                    self_monitor.record_message_success()
+                return
+            await update.message.reply_text("📸 无法获取图片。请重新发送。")
             return
         photo = update.message.photo[-1]  # Largest resolution
         file = await context.bot.get_file(photo.file_id)
@@ -438,8 +2596,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(save_path)
 
         # In API mode with vision enabled, read as base64
+        # Skip this in bridge/harness mode where Claude CLI reads from disk directly
         image_data = None
-        if config.ENABLE_VISION and not config.BRIDGE_MODE:
+        if config.ENABLE_VISION and not config.BRIDGE_MODE and not config.HARNESS_MODE:
             try:
                 with open(save_path, "rb") as f:
                     import base64
@@ -454,7 +2613,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "\n(无附加说明)"
 
         await update.message.reply_text(f"📸 图片已保存: {save_path}")
-        await claude_agent.process_message(msg, chat_id, context, image_data=image_data)
+        actually_processed = await claude_agent.process_message(msg, chat_id, context, image_data=image_data)
+        if actually_processed:
+            self_monitor.record_message_success()
 
     except Exception as e:
         logger.error(f"Photo handling error: {e}", exc_info=True)
@@ -466,13 +2627,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle voice messages — transcribe with Gemini, process as text."""
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
 
+    tmp = None
     try:
         voice = update.message.voice or update.message.audio
         if not voice:
             await update.message.reply_text("🎙 无法获取音频。")
+            return
+        # Reject audio over 20 MB
+        if voice.file_size and voice.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text("🎙 音频太大，最大支持 20 MB。")
             return
         file = await context.bot.get_file(voice.file_id)
         import tempfile
@@ -489,14 +2660,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 client = google_genai.Client(api_key=config.GEMINI_API_KEY)
                 with open(tmp, "rb") as f:
                     audio_data = f.read()
-                resp = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[
-                        gtypes.Content(role="user", parts=[
-                            gtypes.Part(inline_data=gtypes.Blob(mime_type="audio/ogg", data=audio_data)),
-                            gtypes.Part(text="Transcribe this voice message exactly. Output only the text. If Chinese, keep Chinese."),
-                        ])
-                    ],
+                # Gemini SDK is sync — run in executor to avoid blocking event loop
+                _loop = asyncio.get_running_loop()
+                _contents = [
+                    gtypes.Content(role="user", parts=[
+                        gtypes.Part(inline_data=gtypes.Blob(mime_type="audio/ogg", data=audio_data)),
+                        gtypes.Part(text="Transcribe this voice message exactly. Output only the text. If Chinese, keep Chinese."),
+                    ])
+                ]
+                resp = await asyncio.wait_for(
+                    _loop.run_in_executor(
+                        None,
+                        lambda: client.models.generate_content(
+                            model="gemini-2.5-flash",
+                            contents=_contents,
+                        )
+                    ),
+                    timeout=60.0,
                 )
                 text = resp.text.strip() if resp.text else ""
                 if text and len(text) > 1:  # Ignore single-char noise
@@ -515,14 +2695,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.copy2(tmp, save_path)
             await update.message.reply_text(f"🎙 语音已保存: {save_path}")
             # Still notify Claude so it can try to process the audio file
-            await claude_agent.process_message(
+            _vr = await claude_agent.process_message(
                 f"用户发送了一条语音消息，已保存到: {save_path}\n(无法自动转录，请尝试用其他方式处理)",
                 chat_id, context
             )
+            if _vr:
+                self_monitor.record_message_success()
             return
 
         await update.message.reply_text(f"🎙 「{transcription}」")
-        await claude_agent.process_message(transcription, chat_id, context)
+        _vr = await claude_agent.process_message(transcription, chat_id, context)
+        if _vr:
+            self_monitor.record_message_success()
 
     except Exception as e:
         logger.error(f"Voice handling error: {e}", exc_info=True)
@@ -533,7 +2717,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         # Always cleanup temp file
         try:
-            if 'tmp' in locals() and os.path.exists(tmp):
+            if tmp and os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
             pass
@@ -541,18 +2725,33 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle files — save to desktop and notify AI."""
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
 
     try:
         doc = update.message.document
         if not doc:
             await update.message.reply_text("📁 无法获取文件。")
             return
+        # Reject files over 50 MB to prevent disk exhaustion
+        if doc.file_size and doc.file_size > 50 * 1024 * 1024:
+            await update.message.reply_text(f"📁 文件太大 ({doc.file_size // (1024*1024)} MB)，最大支持 50 MB。")
+            return
         file = await context.bot.get_file(doc.file_id)
         save_dir = config.TELEGRAM_FILES_DIR
         os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, doc.file_name or f"file_{doc.file_id}")
+        # Sanitize filename to prevent path traversal and invalid chars
+        safe_name = os.path.basename(doc.file_name or "")
+        if not safe_name or safe_name in (".", ".."):
+            safe_name = f"file_{doc.file_id}"
+        # Remove control characters but keep Unicode (Chinese filenames etc.)
+        safe_name = "".join(c for c in safe_name if c.isprintable())
+        save_path = os.path.join(save_dir, safe_name)
         await file.download_to_drive(save_path)
 
         caption = update.message.caption or ""
@@ -561,25 +2760,37 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"\n用户说: {caption}"
 
         await update.message.reply_text(f"📁 文件已保存: {save_path}")
-        await claude_agent.process_message(msg, chat_id, context)
+        actually_processed = await claude_agent.process_message(msg, chat_id, context)
+        if actually_processed:
+            self_monitor.record_message_success()
 
     except Exception as e:
         logger.error(f"Document handling error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ 文件处理失败: {e}")
+        try:
+            await update.message.reply_text(f"❌ 文件处理失败: {e}")
+        except Exception:
+            pass
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle video/animation — save to disk and tell Claude."""
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        video = update.message.video or update.message.animation
+        video = update.message.video or update.message.animation or update.message.video_note
         if not video:
+            await update.message.reply_text("🎬 无法获取视频。请重新发送。")
+            return
+        # Reject video over 50 MB
+        if hasattr(video, 'file_size') and video.file_size and video.file_size > 50 * 1024 * 1024:
+            await update.message.reply_text(f"🎬 视频太大，最大支持 50 MB。")
             return
         file = await context.bot.get_file(video.file_id)
         save_dir = config.TELEGRAM_FILES_DIR
         os.makedirs(save_dir, exist_ok=True)
-        ext = ".mp4" if update.message.video else ".gif"
+        ext = ".mp4" if (update.message.video or update.message.video_note) else ".gif"
         save_path = os.path.join(save_dir, f"video_{video.file_id}{ext}")
         await file.download_to_drive(save_path)
         caption = update.message.caption or ""
@@ -587,7 +2798,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if caption:
             msg += f"\n用户说: {caption}"
         await update.message.reply_text(f"🎬 已保存: {save_path}")
-        await claude_agent.process_message(msg, chat_id, context)
+        actually_processed = await claude_agent.process_message(msg, chat_id, context)
+        if actually_processed:
+            self_monitor.record_message_success()
     except Exception as e:
         logger.error(f"Video handling error: {e}", exc_info=True)
         try:
@@ -597,55 +2810,118 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    logger.warning(f"Unauthorized: user {user.id} ({user.username})")
-    if update.message:
-        await update.message.reply_text(
-            f"⛔ 未授权。你的 ID: `{user.id}`\n"
-            f"将此 ID 加到 .env 的 AUTHORIZED_USER_ID。",
-            parse_mode="Markdown",
-        )
+    try:
+        user = update.effective_user
+        if not user:
+            return
+        logger.warning(f"Unauthorized: user {user.id} ({user.username})")
+        if update.message:
+            await update.message.reply_text(
+                f"⛔ 未授权。你的 ID: `{user.id}`\n"
+                f"将此 ID 加到 .env 的 AUTHORIZED_USER_ID。",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error(f"Unauthorized handler error: {e}")
 
 
 # ─── PID Lock (prevent dual instances) ────────────────────────────────────────
 
 _PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.pid")
 
+def _is_python_process(pid):
+    """Check if PID is alive and is a Python process."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    if sys.platform == "win32":
+        try:
+            import subprocess as _sp
+            _cmd_out = _sp.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-Process -Id {pid} -ErrorAction SilentlyContinue).ProcessName"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "python" in (_cmd_out.stdout or "").strip().lower()
+        except Exception:
+            return False
+    return True
+
 def _acquire_pid_lock():
-    """Check for existing bot instance and kill it before starting."""
-    # Check if another instance is running
+    """Check for existing bot instance and kill it before starting.
+
+    Steps:
+    1. Read PID file, kill old process if still alive
+    2. Scan for any other python processes running bot.py (catch orphans)
+    3. Write our PID
+    4. Wait for Telegram polling to expire if we killed something
+    """
+    killed = False
+    my_pid = os.getpid()
+
+    # 1. Check PID file
     if os.path.exists(_PID_FILE):
         try:
-            with open(_PID_FILE, "r") as _pf:
+            with open(_PID_FILE, "r", encoding="utf-8") as _pf:
                 old_pid = int(_pf.read().strip())
-            # Check if process is still alive
-            try:
-                os.kill(old_pid, 0)  # signal 0 = test if process exists
-                # Process exists — kill it so we can take over
+            if old_pid != my_pid and _is_python_process(old_pid):
                 logger.warning(f"Killing previous bot instance (PID {old_pid})")
                 print(f"Killing previous bot instance (PID {old_pid})")
                 try:
-                    os.kill(old_pid, signal.SIGTERM)
-                    import time as _t
-                    _t.sleep(2)  # Give it time to shut down
+                    if sys.platform == "win32":
+                        import subprocess as _sp2
+                        _sp2.run(["taskkill", "/PID", str(old_pid), "/F"],
+                                 capture_output=True, timeout=5)
+                    else:
+                        os.kill(old_pid, signal.SIGTERM)
+                    time.sleep(3)
+                    killed = True
                 except Exception:
                     pass
-            except OSError:
-                pass  # Process already dead
         except (ValueError, IOError):
-            pass  # Corrupt PID file, ignore
+            pass
 
-    # Write our PID
-    with open(_PID_FILE, "w") as f:
+    # 2. Scan for orphan bot.py processes (belt and suspenders)
+    if sys.platform == "win32":
+        try:
+            import subprocess as _sp3
+            result = _sp3.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-WmiObject Win32_Process | Where-Object { $_.Name -like 'python*' -and $_.CommandLine -like '*bot.py*' -and $_.ProcessId -ne " + str(my_pid) + " } | Select-Object -ExpandProperty ProcessId"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if line and line.isdigit():
+                    orphan_pid = int(line)
+                    if orphan_pid != my_pid:
+                        logger.warning(f"Killing orphan bot.py process (PID {orphan_pid})")
+                        print(f"Killing orphan bot.py process (PID {orphan_pid})")
+                        try:
+                            _sp3.run(["taskkill", "/PID", str(orphan_pid), "/F"],
+                                     capture_output=True, timeout=5)
+                            killed = True
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug(f"Orphan scan failed: {e}")
+
+    # 3. Write our PID
+    with open(_PID_FILE, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
+
+    # 4. If we killed something, wait for Telegram's long-poll to expire
+    if killed:
+        wait = 12
+        print(f"Killed old instance(s). Waiting {wait}s for Telegram polling to expire...")
+        time.sleep(wait)
 
 def _release_pid_lock():
     """Remove PID file on clean exit."""
     try:
         if os.path.exists(_PID_FILE):
-            with open(_PID_FILE, "r") as _pf:
+            with open(_PID_FILE, "r", encoding="utf-8") as _pf:
                 pid_in_file = int(_pf.read().strip())
             if pid_in_file == os.getpid():
                 os.remove(_PID_FILE)
@@ -655,13 +2931,46 @@ def _release_pid_lock():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def _startup_health_check():
+    """Self-healing startup check: detect and report config issues."""
+    issues = []
+
+    # Check Claude CLI availability
+    import shutil
+    claude_cmd = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "npm", "claude.cmd")
+    if not os.path.exists(claude_cmd) and not shutil.which("claude"):
+        issues.append("[WARN] Claude CLI not found - fallback providers will be used")
+
+    # Check if Claude CLI is logged in (quick test)
+    try:
+        import subprocess
+        result = subprocess.run(
+            [claude_cmd, "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            issues.append(f"[WARN] Claude CLI returned error: {result.stderr[:100]}")
+    except Exception:
+        pass  # CLI check is optional
+
+    # API keys not needed — API fallback is disabled (user preference: CLI only, no paid API)
+
+    if issues:
+        logger.warning("Startup Health Check: %d issues found", len(issues))
+        for issue in issues:
+            logger.warning(issue)
+
+    return issues
+
+
 def main():
     if not config.TELEGRAM_BOT_TOKEN or config.TELEGRAM_BOT_TOKEN == "your_token_here":
         print("ERROR: Set TELEGRAM_BOT_TOKEN in .env")
         return
-    if config.AUTHORIZED_USER_ID == 0:
+    if config.AUTHORIZED_USER_ID is None:
         print("NOTE: AUTHORIZED_USER_ID not set. Send any message to get your ID.")
 
+    _startup_health_check()
     _acquire_pid_lock()
 
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
@@ -682,10 +2991,36 @@ def main():
     app.add_handler(CommandHandler("kill", kill_command, filters=auth_filter))
     app.add_handler(CommandHandler("quota", quota_command, filters=auth_filter))
     app.add_handler(CommandHandler("sessions", sessions_command, filters=auth_filter))
+    app.add_handler(CommandHandler("learn", learn_command, filters=auth_filter))
+    app.add_handler(CommandHandler("score", score_command, filters=auth_filter))
+    app.add_handler(CommandHandler("train", train_command, filters=auth_filter))
+    # /train_xxx shortcuts so TG clickable commands work
+    for _domain in ["file_ops", "code_edit", "computer_control", "browser", "obedience", "all", "stop", "reset"]:
+        app.add_handler(CommandHandler(f"train_{_domain}", train_command, filters=auth_filter))
     app.add_handler(CommandHandler("q", quick_action, filters=auth_filter))
     app.add_handler(CommandHandler("quick", quick_action, filters=auth_filter))
+    app.add_handler(CommandHandler("panel", panel_command, filters=auth_filter))
+    app.add_handler(CommandHandler("health", health_command, filters=auth_filter))
+    app.add_handler(CommandHandler("portfolio", portfolio_command, filters=auth_filter))
+    app.add_handler(CommandHandler("signal", signal_command, filters=auth_filter))
+    app.add_handler(CommandHandler("risk", risk_command, filters=auth_filter))
+    app.add_handler(CommandHandler("monitor", monitor_command, filters=auth_filter))
+    app.add_handler(CommandHandler("proactive", proactive_command, filters=auth_filter))
+    # Trading skill commands
+    app.add_handler(CommandHandler("token_analyze", token_analyze_command, filters=auth_filter))
+    app.add_handler(CommandHandler("okx_backtest", okx_backtest_command, filters=auth_filter))
+    app.add_handler(CommandHandler("ma_ribbon_backtest", ma_ribbon_backtest_command, filters=auth_filter))
+    app.add_handler(CommandHandler("ma_ribbon_screener", ma_ribbon_screener_command, filters=auth_filter))
+    app.add_handler(CommandHandler("okx_top30", okx_top30_command, filters=auth_filter))
+    app.add_handler(CommandHandler("session_control", session_control_command, filters=auth_filter))
+    app.add_handler(CommandHandler("autonomy", autonomy_command, filters=auth_filter))
+    app.add_handler(CommandHandler("consciousness", consciousness_command, filters=auth_filter))
+    app.add_handler(CommandHandler("ms", multi_session_command, filters=auth_filter))
+    app.add_handler(CommandHandler("evolve", evolve_command, filters=auth_filter))
 
-    # Callbacks
+    # Callbacks — panel first, then session control, then quick actions, then safety confirmations
+    app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
+    app.add_handler(CallbackQueryHandler(handle_session_control_callback, pattern="^sc_"))
     app.add_handler(CallbackQueryHandler(handle_quick_action_callback, pattern="^qa_"))
     app.add_handler(CallbackQueryHandler(handle_confirmation_callback))
 
@@ -703,12 +3038,243 @@ def main():
 
     # Video/animation — save and notify Claude
     app.add_handler(MessageHandler(
-        auth_filter & (filters.VIDEO | filters.ANIMATION),
+        auth_filter & (filters.VIDEO | filters.ANIMATION | filters.VIDEO_NOTE),
         handle_video
     ))
 
+    # Location — forward to Claude as text description
+    async def _handle_location(u, c):
+        if not u.message or not u.message.location:
+            return
+        loc = u.message.location
+        msg = f"用户分享了位置: 纬度 {loc.latitude}, 经度 {loc.longitude}"
+        try:
+            await u.message.reply_text(f"📍 位置已收到: ({loc.latitude}, {loc.longitude})")
+            await claude_agent.process_message(msg, u.effective_chat.id, c)
+        except Exception as e:
+            logger.error(f"Location handling error: {e}", exc_info=True)
+            try:
+                await u.message.reply_text(f"❌ 位置处理失败: {e}")
+            except Exception:
+                pass
+    app.add_handler(MessageHandler(auth_filter & filters.LOCATION, _handle_location))
+
+    # Contact — forward to Claude as text
+    async def _handle_contact(u, c):
+        if not u.message or not u.message.contact:
+            return
+        ct = u.message.contact
+        msg = f"用户分享了联系人: {ct.first_name or ''} {ct.last_name or ''}, 电话: {ct.phone_number or 'N/A'}"
+        try:
+            await u.message.reply_text(f"👤 联系人已收到: {ct.first_name or ''} {ct.phone_number or ''}")
+            await claude_agent.process_message(msg, u.effective_chat.id, c)
+        except Exception as e:
+            logger.error(f"Contact handling error: {e}", exc_info=True)
+            try:
+                await u.message.reply_text(f"❌ 联系人处理失败: {e}")
+            except Exception:
+                pass
+    app.add_handler(MessageHandler(auth_filter & filters.CONTACT, _handle_contact))
+
+    # Poll — acknowledge
+    async def _handle_poll(u, c):
+        if u.message:
+            await u.message.reply_text("📊 收到投票/问卷，暂不支持处理。")
+    app.add_handler(MessageHandler(auth_filter & filters.POLL, _handle_poll))
+
     # Unauthorized
     app.add_handler(MessageHandler(~auth_filter, handle_unauthorized))
+
+    # Register commands in Telegram menu + start background loops
+    async def post_init(application):
+        # Start auto-research background loop (non-essential, don't crash bot on failure)
+        try:
+            import auto_research
+
+            async def _send_to_user(text):
+                if config.AUTHORIZED_USER_ID is None:
+                    return
+                try:
+                    await application.bot.send_message(
+                        chat_id=config.AUTHORIZED_USER_ID, text=text,
+                    )
+                except Exception:
+                    pass
+
+            _research_task = asyncio.create_task(auto_research.run_experiment_loop(send_status=_send_to_user))
+            _track_task(application.bot_data, _research_task)
+            logger.info("Auto-research background loop started")
+        except Exception as e:
+            logger.warning(f"Auto-research background loop failed to start: {e}")
+
+        # Start Self-Monitor background loop
+        try:
+            if config.SELF_MONITOR_ENABLED:
+                self_monitor._interval = config.SELF_MONITOR_INTERVAL
+
+                # Register alert handler that sends anomaly alerts to the user via Telegram
+                async def _monitor_alert_handler(anomalies):
+                    if not anomalies or config.AUTHORIZED_USER_ID is None:
+                        return
+                    lines = ["Self-Monitor Alert\n"]
+                    for a in anomalies:
+                        lines.append(f"  [{a.get('severity', '?')}] {a.get('type', '?')}: {a.get('message', '')}")
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text="\n".join(lines),
+                        )
+                    except Exception:
+                        pass
+
+                self_monitor.register_alert_handler(_monitor_alert_handler)
+                await self_monitor.start()
+                logger.info("SelfMonitor background loop started")
+        except Exception as e:
+            logger.warning(f"SelfMonitor failed to start: {e}")
+
+        # Start Proactive Agent background loops
+        try:
+            if config.PROACTIVE_AGENT_ENABLED:
+                # Wire the send_func to deliver messages via Telegram
+                async def _proactive_send(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4000],
+                        )
+                    except Exception:
+                        pass
+
+                proactive_agent._send = _proactive_send
+                await proactive_agent.start()
+                logger.info("ProactiveAgent background loops started")
+        except Exception as e:
+            logger.warning(f"ProactiveAgent failed to start: {e}")
+
+        # ─── Autonomy Engine: auto-start if there are pending goals ──────────
+        try:
+            if _autonomy_available:
+                engine = get_autonomy_engine()
+                active = engine.get_active_goals()
+                if active:
+                    async def _auto_send(msg):
+                        try:
+                            if config.AUTHORIZED_USER_ID:
+                                await application.bot.send_message(
+                                    chat_id=config.AUTHORIZED_USER_ID,
+                                    text=msg[:4000],
+                                )
+                        except Exception:
+                            pass
+                    engine.start(send_fn=_auto_send, interval=30.0)
+                    logger.info(f"Autonomy engine auto-started with {len(active)} pending goals")
+                else:
+                    logger.info("Autonomy engine: no pending goals, idle")
+        except Exception as e:
+            logger.warning(f"Autonomy engine failed to start: {e}")
+
+        # ─── Heartbeat: self-test every HEARTBEAT_INTERVAL seconds ────────────
+        try:
+            if getattr(config, "HEARTBEAT_ENABLED", True):
+                async def _heartbeat_loop():
+                    """Periodic self-test. If the bot can't respond to itself, auto-restart."""
+                    import os as _hb_os
+                    interval = getattr(config, "HEARTBEAT_INTERVAL", 1800)
+                    timeout = getattr(config, "HEARTBEAT_TIMEOUT", 60)
+                    _consecutive_failures = 0
+                    _MAX_FAILURES = 3  # restart after 3 consecutive heartbeat failures
+
+                    while True:
+                        await asyncio.sleep(interval)
+                        try:
+                            # Test 1: Can we call the Telegram API?
+                            me = await asyncio.wait_for(
+                                application.bot.get_me(), timeout=timeout
+                            )
+                            if me and me.id:
+                                _consecutive_failures = 0
+                                logger.debug(f"Heartbeat OK: bot @{me.username} alive")
+                                continue
+
+                            _consecutive_failures += 1
+                            logger.warning(f"Heartbeat: get_me returned empty ({_consecutive_failures}/{_MAX_FAILURES})")
+
+                        except asyncio.TimeoutError:
+                            _consecutive_failures += 1
+                            logger.warning(f"Heartbeat: timeout ({_consecutive_failures}/{_MAX_FAILURES})")
+                        except Exception as e:
+                            _consecutive_failures += 1
+                            logger.warning(f"Heartbeat: error {e} ({_consecutive_failures}/{_MAX_FAILURES})")
+
+                        if _consecutive_failures >= _MAX_FAILURES:
+                            logger.error(f"Heartbeat: {_MAX_FAILURES} consecutive failures, triggering auto-restart")
+                            try:
+                                if config.AUTHORIZED_USER_ID is not None:
+                                    await application.bot.send_message(
+                                        chat_id=config.AUTHORIZED_USER_ID,
+                                        text=f"Heartbeat failed {_MAX_FAILURES}x. Auto-restarting...",
+                                    )
+                            except Exception:
+                                pass
+                            # Exit with non-zero code so run.py restarts us
+                            _hb_os._exit(1)
+
+                _hb_task = asyncio.create_task(_heartbeat_loop())
+                _track_task(application.bot_data, _hb_task)
+                logger.info(f"Heartbeat started (interval={getattr(config, 'HEARTBEAT_INTERVAL', 1800)}s)")
+        except Exception as e:
+            logger.warning(f"Heartbeat failed to start: {e}")
+
+        await application.bot.set_my_commands([
+            ("panel", "Command panel"),
+            ("start", "Start/help"),
+            ("clear", "Clear conversation"),
+            ("screenshot", "Screenshot"),
+            ("status", "Status + health"),
+            ("health", "Detailed health check"),
+            ("model", "Switch model"),
+            ("bridge", "Switch mode"),
+            ("score", "Agent score"),
+            ("portfolio", "Portfolio"),
+            ("signal", "Signals"),
+            ("risk", "Risk metrics"),
+            ("train", "Training"),
+            ("learn", "Session learning"),
+            ("sessions", "Claude sessions"),
+            ("kill", "Kill task"),
+            ("ping", "Ping"),
+            ("q", "Quick panel"),
+            ("quota", "Quota usage"),
+            ("monitor", "System monitor"),
+            ("proactive", "Proactive agent"),
+        ])
+    app.post_init = post_init
+
+    async def post_shutdown(application):
+        """Clean up resources on bot shutdown."""
+        # Close Playwright browsers to prevent orphan processes
+        try:
+            from web_ai import close_web_ai
+            await close_web_ai()
+        except Exception:
+            pass
+        try:
+            from browser_agent import browser_close_all
+            await browser_close_all()
+        except Exception:
+            pass
+        # Stop proactive agent loops
+        try:
+            if proactive_agent:
+                await proactive_agent.stop()
+        except Exception:
+            pass
+        logger.info("Post-shutdown cleanup complete")
+
+    app.post_shutdown = post_shutdown
 
     print(f"Bot started! Mode: {'CLI (Plan tokens)' if config.BRIDGE_MODE else 'API'}")
     print("Press Ctrl+C to stop.")

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -132,15 +133,18 @@ class Orchestrator:
             if result.platform:
                 self.quota.record_usage(
                     result.platform,
-                    was_rate_limited=("rate limit" in result.error.lower() if result.error else False),
+                    was_rate_limited=(bool(result.error) and "rate limit" in result.error.lower()),
                 )
 
         # Step 4: Git merge (if multi-agent)
         merged = False
         git_branch = ""
         if route.metadata.get("needs_git_merge") and len(agent_results) > 1:
-            git_branch = self._git_merge(route, agent_results)
-            merged = True
+            loop = asyncio.get_running_loop()
+            git_branch = await loop.run_in_executor(
+                None, self._git_merge, route, agent_results
+            )
+            merged = bool(git_branch)
 
         # Step 5: Build result
         success = any(r.success for r in agent_results)
@@ -193,7 +197,7 @@ class Orchestrator:
         # Record usage
         self.quota.record_usage(
             session.platform,
-            was_rate_limited=("rate limit" in result.error.lower() if result.error else False),
+            was_rate_limited=(bool(result.error) and "rate limit" in result.error.lower()),
         )
 
         return result
@@ -209,7 +213,7 @@ class Orchestrator:
         # Update session based on result
         if result.success:
             session.complete(result.output, result.code_blocks)
-        elif "rate limit" in result.error.lower():
+        elif result.error and "rate limit" in result.error.lower():
             session.partial_output = result.output
             session.pause("rate_limited")
         else:
@@ -222,7 +226,10 @@ class Orchestrator:
     async def _execute_multi_agent(self, route: TaskRoute) -> list[AgentResult]:
         """Execute subtasks on multiple browser agents in parallel."""
         platforms = route.metadata.get("all_platforms", [route.platform])
-        subtasks = route.subtasks
+        subtasks = getattr(route, "subtasks", None) or [route.task]
+
+        if not platforms:
+            platforms = [route.platform]
 
         # Pair subtasks with platforms
         tasks = []
@@ -235,12 +242,16 @@ class Orchestrator:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         agent_results = []
-        for r in results:
+        for i, r in enumerate(results):
             if isinstance(r, Exception):
+                platform = platforms[i % len(platforms)] if platforms else "unknown"
                 agent_results.append(AgentResult(
                     success=False,
                     output="",
                     error=str(r),
+                    platform=platform,
+                    duration_seconds=0.0,
+                    code_blocks=[],
                 ))
             else:
                 agent_results.append(r)
@@ -263,7 +274,13 @@ class Orchestrator:
                 for j, code in enumerate(result.code_blocks):
                     filename = f"output_{result.platform}_{i}_{j}.py"
                     filepath = self.repo_dir / filename
-                    filepath.write_text(code, encoding="utf-8")
+                    # Atomic write: temp + fsync + replace
+                    _tmp = filepath.with_suffix(".tmp")
+                    with open(str(_tmp), "w", encoding="utf-8") as _wf:
+                        _wf.write(code)
+                        _wf.flush()
+                        os.fsync(_wf.fileno())
+                    os.replace(str(_tmp), str(filepath))
                     self._run_git("add", str(filepath))
 
             # Commit
@@ -292,6 +309,7 @@ class Orchestrator:
             capture_output=True,
             text=True,
             check=check,
+            timeout=60,
         )
 
     def _build_summary(
@@ -300,7 +318,7 @@ class Orchestrator:
         """Build a human-readable summary for Telegram response."""
         lines = [
             f"**Task completed**",
-            f"Difficulty: Level {route.difficulty} ({route.difficulty.name})",
+            f"Difficulty: Level {route.difficulty.value} ({route.difficulty.name})",
             f"Platforms: {', '.join(r.platform for r in results)}",
         ]
 

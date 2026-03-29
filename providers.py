@@ -8,6 +8,8 @@ import json
 import re
 import logging
 import asyncio
+import time
+import base64
 import config
 from tools import TOOL_DEFINITIONS, execute_tool
 from safety import is_dangerous, request_permission
@@ -76,7 +78,7 @@ Rules:
 TOOLS_NEEDING_SAFETY_CHECK = {"run_command"}
 
 # ─── Smart Tool Router ────────────────────────────────────────────────────────
-# Instead of sending ALL 39 tools (huge token cost), select relevant subset
+# Instead of sending ALL 53 tools (huge token cost), select relevant subset
 
 # Core tools always available
 CORE_TOOLS = {
@@ -91,21 +93,28 @@ TOOL_GROUPS = {
                       "click", "点击", "登录", "login", "sign", "form", "表单", "tradingview",
                       "youtube", "github", "reddit", "twitter", "facebook", "amazon",
                       "browser", "page", "页面", "链接", "link", "url", "playwright",
-                      "zillow", "房子", "house", "apartment", "real estate"],
+                      "zillow", "房子", "house", "apartment", "real estate",
+                      "scrape", "extract", "fill", "submit"],
         "tools": {"browser_navigate", "browser_click", "browser_type",
                   "browser_screenshot", "browser_get_text", "browser_get_elements",
                   "browser_scroll", "browser_go_back", "browser_tabs",
                   "browser_new_tab", "browser_switch_tab", "browser_eval_js",
-                  "browser_close_tab", "browser_wait_for"},
+                  "browser_close_tab", "browser_wait_for",
+                  "web_navigate", "web_extract", "web_fill_form", "web_click",
+                  "web_screenshot_element"},
     },
     "gui": {
         "keywords": ["点击", "click", "鼠标", "mouse", "键盘", "key", "type", "打字",
                       "输入", "拖", "drag", "滚动", "scroll", "截图", "screenshot",
-                      "屏幕", "screen", "窗口", "window", "桌面", "desktop"],
+                      "屏幕", "screen", "窗口", "window", "桌面", "desktop",
+                      "ui", "element", "color", "pixel", "button", "界面",
+                      "等待", "appear", "visible", "变化", "change"],
         "tools": {"mouse_click", "mouse_scroll", "mouse_move", "mouse_drag",
                   "type_text", "press_key", "get_screen_size", "get_active_window",
                   "list_windows", "focus_window", "set_clipboard", "get_clipboard",
-                  "wait"},
+                  "wait", "list_windows_detailed", "detect_screen_changes",
+                  "find_ui_elements", "find_color_on_screen", "smart_action",
+                  "wait_for_element", "window_manager"},
     },
     "files": {
         "keywords": ["文件", "file", "代码", "code", "编辑", "edit", "读", "read",
@@ -176,7 +185,8 @@ PROVIDER_DISPLAY = {
 # ─── Tool format converters ───────────────────────────────────────────────────
 
 def _tools_openai(tool_defs=None):
-    tool_defs = tool_defs or TOOL_DEFINITIONS
+    if tool_defs is None:
+        tool_defs = TOOL_DEFINITIONS
     return [
         {
             "type": "function",
@@ -192,7 +202,8 @@ def _tools_openai(tool_defs=None):
 
 def _tools_gemini(tool_defs=None):
     """Convert to Gemini function declarations for google-genai SDK."""
-    tool_defs = tool_defs or TOOL_DEFINITIONS
+    if tool_defs is None:
+        tool_defs = TOOL_DEFINITIONS
     from google.genai import types as gtypes
     TYPE_MAP = {
         "string": "STRING", "integer": "INTEGER",
@@ -242,15 +253,43 @@ async def _safety_ok(tool_name, tool_input, chat_id, context):
 
 
 async def _run_tool(tool_name, tool_input, chat_id, context):
+    t0 = time.monotonic()
     try:
-        result_text, screenshot_buffer = await execute_tool(tool_name, tool_input)
+        result = await execute_tool(tool_name, tool_input)
+        # execute_tool returns (result_text, screenshot_buffer_or_None)
+        if isinstance(result, tuple):
+            result_text, screenshot_buffer = result
+        else:
+            result_text, screenshot_buffer = str(result), None
     except Exception as e:
+        elapsed = time.monotonic() - t0
+        logger.error(f"Tool {tool_name} FAILED after {elapsed:.1f}s: {e}", exc_info=True)
         return f"Tool execution error: {e}"
+
+    elapsed = time.monotonic() - t0
+    if not result_text:
+        result_text = "(no output)"
+
+    # Truncate very long results to avoid blowing up context window
+    if len(result_text) > 20000:
+        result_text = result_text[:20000] + "\n... (output truncated to 20k chars)"
+
+    # Log result summary (first 300 chars)
+    result_preview = result_text[:300].replace('\n', ' ')
+    logger.info(f"Tool {tool_name} completed in {elapsed:.1f}s -> {result_preview}")
+
     if screenshot_buffer:
         try:
             await context.bot.send_photo(chat_id=chat_id, photo=screenshot_buffer)
         except Exception as e:
+            logger.warning(f"Screenshot send failed for {tool_name}: {e}")
             result_text += f"\n(Screenshot send failed: {e})"
+        finally:
+            if hasattr(screenshot_buffer, 'close'):
+                try:
+                    screenshot_buffer.close()
+                except Exception:
+                    pass
     return result_text
 
 
@@ -258,6 +297,9 @@ def _sanitize_telegram_markdown(text: str) -> str:
     """Sanitize text for Telegram Markdown parsing.
     Preserves code blocks and inline code.
     """
+    # Strip NUL bytes that could collide with our placeholder sentinel
+    text = text.replace("\x00", "")
+
     # Extract code blocks first to protect them
     code_blocks = []
     def _save_code_block(m):
@@ -283,7 +325,10 @@ def _sanitize_telegram_markdown(text: str) -> str:
     parts = re.split(r'(https?://\S+)', text)
     for i, part in enumerate(parts):
         if not part.startswith('http') and part.count('_') % 2 != 0:
-            parts[i] = part.replace('_', '\\_')
+            # Remove last unmatched underscore rather than escaping all
+            idx = part.rfind('_')
+            if idx >= 0:
+                parts[i] = part[:idx] + part[idx+1:]
     text = ''.join(parts)
 
     # Restore code blocks
@@ -296,18 +341,29 @@ def _sanitize_telegram_markdown(text: str) -> str:
 async def _send_text(text, chat_id, context, parse_mode=None):
     if not text or not text.strip():
         return
-    remaining = text
+    remaining = text.strip()
     while remaining:
-        if len(remaining) <= 4000:
+        if not remaining.strip():
+            break  # Only whitespace left, nothing to send
+        if len(remaining) <= 4096:
             chunk = remaining
             remaining = ""
         else:
             # Try to break at a newline near the limit
-            break_pos = remaining.rfind("\n", 3000, 4000)
+            break_pos = remaining.rfind("\n", 3000, 4096)
             if break_pos == -1:
-                break_pos = 4000
+                break_pos = remaining.rfind(" ", 3000, 4096)
+            if break_pos == -1:
+                break_pos = 4096
             chunk = remaining[:break_pos]
             remaining = remaining[break_pos:].lstrip('\n')
+        if not chunk.strip():
+            # Safety: if chunk is empty after stripping, force-advance to avoid infinite loop
+            if remaining:
+                chunk = remaining[:4096]
+                remaining = remaining[4096:]
+            if not chunk.strip():
+                break
 
         # Sanitize markdown if needed
         if parse_mode == "Markdown":
@@ -338,74 +394,102 @@ async def process_claude(messages, chat_id, context, selected_tools=None):
         return False, "no_package"
 
     tools = selected_tools or TOOL_DEFINITIONS
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY, timeout=120.0)
 
-    for _ in range(config.MAX_TOOL_ITERATIONS):
-        try:
-            response = client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=8192,
-                system=SYSTEM_PROMPT,
-                tools=tools,
-                messages=messages,
-            )
-        except Exception as e:
-            err = str(e).lower()
-            if "credit" in err or "billing" in err or "balance" in err:
-                return False, "billing"
-            if "authentication" in err or "invalid x-api-key" in err:
-                return False, "auth"
-            return False, str(e)
-
-        if response.stop_reason == "end_turn":
-            text_parts = [b.text for b in response.content if b.type == "text" and b.text.strip()]
-            if text_parts:
-                text_combined = "\n".join(text_parts)
-                # Store as string so it survives the history cleanup in claude_agent.py
-                messages.append({"role": "assistant", "content": text_combined})
-                await _send_text(text_combined, chat_id, context, parse_mode="Markdown")
-            return True, None
-
-        elif response.stop_reason == "tool_use":
-            # Append list format required by Anthropic API for tool_use turns
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for block in response.content:
-                if block.type == "text" and block.text.strip():
-                    await _send_text(block.text, chat_id, context)
-                if block.type != "tool_use":
+    try:
+        iteration = 0
+        for iteration in range(config.MAX_TOOL_ITERATIONS):
+            try:
+                response = await client.messages.create(
+                    model=config.CLAUDE_MODEL,
+                    max_tokens=8192,
+                    system=SYSTEM_PROMPT,
+                    tools=tools,
+                    messages=messages,
+                )
+            except Exception as e:
+                err = str(e).lower()
+                if "credit" in err or "billing" in err or "balance" in err:
+                    return False, "billing"
+                if "authentication" in err or "invalid x-api-key" in err:
+                    return False, "auth"
+                if "overloaded" in err or "529" in err:
+                    logger.warning("Claude overloaded, retrying in 3s...")
+                    await asyncio.sleep(3)
                     continue
-                if not await _safety_ok(block.name, block.input, chat_id, context):
+                return False, str(e)
+
+            logger.info(f"[Claude] iter={iteration} stop_reason={response.stop_reason} blocks={len(response.content)}")
+
+            if response.stop_reason == "end_turn":
+                text_parts = [b.text for b in response.content if hasattr(b, 'text') and b.type == "text" and b.text and b.text.strip()]
+                if text_parts:
+                    text_combined = "\n".join(text_parts)
+                    # Store as string so it survives the history cleanup in claude_agent.py
+                    messages.append({"role": "assistant", "content": text_combined})
+                    await _send_text(text_combined, chat_id, context, parse_mode="Markdown")
+                return True, None
+
+            elif response.stop_reason == "tool_use":
+                # Convert response.content to serializable list for message history
+                content_list = []
+                for block in response.content:
+                    if block.type == "text":
+                        content_list.append({"type": "text", "text": block.text or ""})
+                    elif block.type == "tool_use":
+                        content_list.append({
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        })
+                messages.append({"role": "assistant", "content": content_list})
+
+                tool_results = []
+                for block in response.content:
+                    if block.type == "text" and hasattr(block, 'text') and block.text and block.text.strip():
+                        await _send_text(block.text, chat_id, context)
+                    if block.type != "tool_use":
+                        continue
+                    if not await _safety_ok(block.name, block.input, chat_id, context):
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": "Action denied by user.",
+                        })
+                        continue
+                    logger.info(f"[Claude] Tool call #{iteration}: {block.name}({json.dumps(block.input, ensure_ascii=False)[:200]})")
+                    result = await _run_tool(block.name, block.input, chat_id, context)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": "Action denied by user.",
+                        "content": result,
                     })
-                    continue
-                logger.info(f"[Claude] Tool: {block.name}({json.dumps(block.input, ensure_ascii=False)[:200]})")
-                result = await _run_tool(block.name, block.input, chat_id, context)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
-            messages.append({"role": "user", "content": tool_results})
+                if tool_results:
+                    messages.append({"role": "user", "content": tool_results})
+                else:
+                    # No tool results generated (shouldn't happen) — break to avoid infinite loop
+                    logger.warning("[Claude] tool_use stop_reason but no tool results generated, breaking")
+                    break
 
-        elif response.stop_reason == "max_tokens":
-            # Partial response due to token limit — send what we have
-            text_parts = [b.text for b in response.content if b.type == "text" and b.text.strip()]
-            if text_parts:
-                text_combined = "\n".join(text_parts)
-                messages.append({"role": "assistant", "content": text_combined})
-                await _send_text(text_combined + "\n\n_(回复被截断，继续说话获取更多)_", chat_id, context)
-            return True, None
+            elif response.stop_reason == "max_tokens":
+                # Partial response due to token limit — send what we have
+                text_parts = [b.text for b in response.content if hasattr(b, 'text') and b.type == "text" and b.text and b.text.strip()]
+                if text_parts:
+                    text_combined = "\n".join(text_parts)
+                    messages.append({"role": "assistant", "content": text_combined})
+                    await _send_text(text_combined + "\n\n_(回复被截断，继续说话获取更多)_", chat_id, context)
+                return True, None
 
-        else:
-            logger.warning(f"Claude unexpected stop_reason: {response.stop_reason}")
-            break
+            else:
+                logger.warning(f"Claude unexpected stop_reason: {response.stop_reason}")
+                break
 
-    await _send_text("⚠️ 达到最大工具调用次数，任务可能未完成。", chat_id, context)
-    return True, None
+        logger.warning(f"[Claude] Hit max iterations ({config.MAX_TOOL_ITERATIONS})")
+        await _send_text("⚠️ 达到最大工具调用次数，任务可能未完成。", chat_id, context)
+        return True, None
+    finally:
+        await client.close()
 
 
 # ─── OpenAI ───────────────────────────────────────────────────────────────────
@@ -418,94 +502,137 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
     except ImportError:
         return False, "no_package"
 
-    client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+    client = AsyncOpenAI(api_key=config.OPENAI_API_KEY, timeout=120.0)
 
-    # Build OpenAI message list from simple text history
-    # Only include text-only messages to avoid broken tool_call/tool_result pairs
-    # from other providers (Claude's native format uses list content)
-    oai_msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    skip_next = False
-    for i, m in enumerate(messages):
-        content = m["content"]
-        if skip_next:
-            skip_next = False
-            continue
-        if isinstance(content, str):
-            oai_msgs.append({"role": m["role"], "content": content})
-        elif isinstance(content, list):
-            # Skip list-content messages (Claude native tool_use/tool_result format)
-            # and also skip the next message if it's a tool_result response to avoid
-            # unpaired tool_call messages that would cause OpenAI API errors
-            if m["role"] == "assistant":
-                # Only skip the next message if it is also a list (tool_result pair).
-                # If the next message is a plain string, it should not be skipped.
-                if i + 1 < len(messages) and isinstance(messages[i + 1]["content"], list):
-                    skip_next = True
+    try:
+        # Build OpenAI message list from simple text history
+        # Handle vision content and skip Claude-native tool_use/tool_result pairs
+        oai_msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+        skip_next = False
+        for i, m in enumerate(messages):
+            content = m["content"]
+            if skip_next:
+                skip_next = False
+                continue
+            if isinstance(content, str):
+                oai_msgs.append({"role": m["role"], "content": content})
+            elif isinstance(content, list):
+                if m["role"] == "user":
+                    # Check if this is a vision message (has image blocks)
+                    has_image = any(
+                        isinstance(p, dict) and p.get("type") in ("image", "image_url")
+                        for p in content
+                    )
+                    if has_image:
+                        # Convert Anthropic image format to OpenAI format
+                        oai_msgs.append({
+                            "role": "user",
+                            "content": _convert_vision_message_for_openai(content),
+                        })
+                    else:
+                        # Tool results from Claude — skip
+                        pass
+                elif m["role"] == "assistant":
+                    # Skip Claude-native tool_use/tool_result pairs
+                    # Only skip the next message if it is also a list (tool_result pair).
+                    if i + 1 < len(messages) and isinstance(messages[i + 1]["content"], list):
+                        skip_next = True
 
-    for _ in range(config.MAX_TOOL_ITERATIONS):
-        try:
-            resp = await client.chat.completions.create(
-                model=config.OPENAI_MODEL,
-                messages=oai_msgs,
-                tools=_tools_openai(selected_tools),
-                max_tokens=8192,
-            )
-        except Exception as e:
-            err = str(e).lower()
-            if "credit" in err or "billing" in err or "quota" in err or "insufficient" in err:
-                return False, "billing"
-            if "incorrect api key" in err or "authentication" in err:
-                return False, "auth"
-            return False, str(e)
+        for iteration in range(config.MAX_TOOL_ITERATIONS):
+            try:
+                resp = await client.chat.completions.create(
+                    model=config.OPENAI_MODEL,
+                    messages=oai_msgs,
+                    tools=_tools_openai(selected_tools),
+                    max_tokens=8192,
+                )
+            except Exception as e:
+                err = str(e).lower()
+                if "credit" in err or "billing" in err or "quota" in err or "insufficient" in err:
+                    return False, "billing"
+                if "incorrect api key" in err or "authentication" in err:
+                    return False, "auth"
+                if "rate_limit" in err or "429" in err:
+                    logger.warning("OpenAI rate limited, retrying in 3s...")
+                    await asyncio.sleep(3)
+                    continue
+                return False, str(e)
 
-        msg = resp.choices[0].message
-        oai_msgs.append(msg)
-        finish = resp.choices[0].finish_reason
-
-        if finish == "stop":
+            if not resp.choices:
+                logger.warning("OpenAI returned no choices")
+                return False, "empty_response"
+            msg = resp.choices[0].message
+            # Convert Message object to dict to avoid serialization issues
+            msg_dict = {"role": msg.role or "assistant"}
             if msg.content:
-                messages.append({"role": "assistant", "content": msg.content})
-                await _send_text(msg.content, chat_id, context)
-            return True, None
+                msg_dict["content"] = msg.content
+            if msg.tool_calls:
+                msg_dict["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+            oai_msgs.append(msg_dict)
+            finish = resp.choices[0].finish_reason
 
-        elif finish == "tool_calls":
-            tool_msgs = []
-            for tc in msg.tool_calls or []:
-                try:
-                    tool_input = json.loads(tc.function.arguments)
-                except (json.JSONDecodeError, TypeError) as e:
-                    logger.warning(f"[OpenAI] Failed to parse tool args for {tc.function.name}: {e}")
-                    tool_input = {}
+            logger.info(f"[OpenAI] iter={iteration} finish_reason={finish} tool_calls={len(msg.tool_calls or [])}")
 
-                if not await _safety_ok(tc.function.name, tool_input, chat_id, context):
+            if finish == "stop":
+                if msg.content:
+                    messages.append({"role": "assistant", "content": msg.content})
+                    await _send_text(msg.content, chat_id, context)
+                return True, None
+
+            elif finish == "tool_calls":
+                if not msg.tool_calls:
+                    logger.warning("[OpenAI] tool_calls finish but no tool_calls in message, breaking")
+                    break
+                tool_msgs = []
+                for tc in msg.tool_calls:
+                    try:
+                        tool_input = json.loads(tc.function.arguments)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.warning(f"[OpenAI] Failed to parse tool args for {tc.function.name}: {e}")
+                        tool_input = {}
+
+                    if not await _safety_ok(tc.function.name, tool_input, chat_id, context):
+                        tool_msgs.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": "Action denied by user.",
+                        })
+                        continue
+
+                    logger.info(f"[OpenAI] Tool call #{iteration}: {tc.function.name}({tc.function.arguments[:200]})")
+                    result = await _run_tool(tc.function.name, tool_input, chat_id, context)
                     tool_msgs.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": "Action denied by user.",
+                        "content": result,
                     })
-                    continue
+                oai_msgs.extend(tool_msgs)
 
-                logger.info(f"[OpenAI] Tool: {tc.function.name}({tc.function.arguments[:200]})")
-                result = await _run_tool(tc.function.name, tool_input, chat_id, context)
-                tool_msgs.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
-            oai_msgs.extend(tool_msgs)
+            elif finish == "length":
+                if msg.content:
+                    messages.append({"role": "assistant", "content": msg.content})
+                    await _send_text(msg.content + "\n\n_(回复被截断，继续说话获取更多)_", chat_id, context)
+                return True, None
 
-        elif finish == "length":
-            if msg.content:
-                messages.append({"role": "assistant", "content": msg.content})
-                await _send_text(msg.content + "\n\n_(回复被截断，继续说话获取更多)_", chat_id, context)
-            return True, None
+            else:
+                logger.warning(f"OpenAI unexpected finish_reason: {finish}")
+                break
 
-        else:
-            logger.warning(f"OpenAI unexpected finish_reason: {finish}")
-            break
-
-    await _send_text("⚠️ 达到最大工具调用次数，任务可能未完成。", chat_id, context)
-    return True, None
+        logger.warning(f"[OpenAI] Hit max iterations ({config.MAX_TOOL_ITERATIONS})")
+        await _send_text("⚠️ 达到最大工具调用次数，任务可能未完成。", chat_id, context)
+        return True, None
+    finally:
+        await client.close()
 
 
 # ─── Gemini ───────────────────────────────────────────────────────────────────
@@ -521,12 +648,51 @@ async def process_gemini(messages, chat_id, context, selected_tools=None):
 
     client = google_genai.Client(api_key=config.GEMINI_API_KEY)
 
-    # Build contents list (text only, provider-agnostic)
+    try:
+        return await _process_gemini_inner(client, messages, chat_id, context, selected_tools)
+    finally:
+        # Close client if it has a close method (resource cleanup)
+        _close = getattr(client, 'close', None) or getattr(client, 'aclose', None)
+        if _close:
+            try:
+                import inspect
+                if inspect.iscoroutinefunction(_close):
+                    await _close()
+                else:
+                    _close()
+            except Exception:
+                pass
+
+
+async def _process_gemini_inner(client, messages, chat_id, context, selected_tools=None):
+    from google.genai import types as gtypes
+
+    # Build contents list (handles plain text and vision/image list content)
     contents = []
     for m in messages:
+        role = "user" if m["role"] == "user" else "model"
         if isinstance(m["content"], str) and m["content"].strip():
-            role = "user" if m["role"] == "user" else "model"
             contents.append(gtypes.Content(role=role, parts=[gtypes.Part(text=m["content"])]))
+        elif isinstance(m["content"], list):
+            parts = []
+            for item in m["content"]:
+                if isinstance(item, dict):
+                    if item.get("type") == "text" and item.get("text", "").strip():
+                        parts.append(gtypes.Part(text=item["text"]))
+                    elif item.get("type") == "image_url":
+                        url = item.get("image_url", {}).get("url", "")
+                        if url.startswith("data:"):
+                            try:
+                                import base64 as _b64
+                                header, b64data = url.split(",", 1)
+                                mime = header.split(":")[1].split(";")[0]
+                                parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type=mime, data=_b64.b64decode(b64data))))
+                            except Exception:
+                                parts.append(gtypes.Part(text="[image]"))
+                        else:
+                            parts.append(gtypes.Part(text=f"[image: {url[:100]}]"))
+            if parts:
+                contents.append(gtypes.Content(role=role, parts=parts))
 
     if not contents:
         return False, "empty"
@@ -539,40 +705,50 @@ async def process_gemini(messages, chat_id, context, selected_tools=None):
     loop = asyncio.get_running_loop()
     for _ in range(config.MAX_TOOL_ITERATIONS):
         try:
-            response = await loop.run_in_executor(
-                None,
-                # Note: the default arg `c=contents` captures the list reference.
-                # Since `contents` is mutated in-place (appended to each iteration),
-                # the lambda always sees the latest state, which is the intended behavior.
-                lambda c=contents: client.models.generate_content(
-                    model=config.GEMINI_MODEL,
-                    contents=c,
-                    config=cfg,
-                )
+            # Snapshot contents list to avoid data race with executor thread
+            contents_snapshot = list(contents)
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda c=contents_snapshot: client.models.generate_content(
+                        model=config.GEMINI_MODEL,
+                        contents=c,
+                        config=cfg,
+                    )
+                ),
+                timeout=120.0,
             )
+        except asyncio.TimeoutError:
+            return False, "timeout"
         except Exception as e:
             err = str(e).lower()
             if "429" in err or "resource_exhausted" in err:
                 # Rate limit — retry once after short delay
-                logger.warning("Gemini rate limited, retrying in 5s...")
-                await asyncio.sleep(5)
+                logger.warning("Gemini rate limited, retrying in 10s...")
+                await asyncio.sleep(10)
                 try:
-                    response = await loop.run_in_executor(
-                        None,
-                        lambda c=contents: client.models.generate_content(
-                            model=config.GEMINI_MODEL,
-                            contents=c,
-                            config=cfg,
-                        )
+                    retry_snapshot = list(contents)
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda c=retry_snapshot: client.models.generate_content(
+                                model=config.GEMINI_MODEL,
+                                contents=c,
+                                config=cfg,
+                            )
+                        ),
+                        timeout=120.0,
                     )
+                except asyncio.TimeoutError:
+                    return False, "timeout"
                 except Exception:
-                    return False, "billing"
+                    return False, "rate_limit"
             elif "quota" in err or "billing" in err:
                 return False, "billing"
             elif ("api_key_invalid" in err or "api key not valid" in err or
                     "permission_denied" in err):
                 return False, "auth"
-            elif "not found" in err or "model" in err and "not" in err:
+            elif ("not found" in err) or ("model" in err and "not" in err):
                 logger.error(f"Gemini model error: {e}")
                 return False, f"Model {config.GEMINI_MODEL} not available: {str(e)[:200]}"
             else:
@@ -675,7 +851,10 @@ async def process_web_ai(messages, chat_id, context, selected_tools=None):
     For simple tasks: races platforms and returns the fastest response.
     Returns (success: bool, error_type: str|None).
     """
-    from web_ai import query_web_ai_parallel, query_web_ai_race, _available_platforms, PLATFORM_DISPLAY
+    try:
+        from web_ai import query_web_ai_parallel, query_web_ai_race, _available_platforms, PLATFORM_DISPLAY
+    except ImportError:
+        return False, "no_package"
 
     # Check if any platforms are available
     if not _available_platforms():
@@ -722,7 +901,11 @@ async def process_web_ai(messages, chat_id, context, selected_tools=None):
 
         else:
             # Race: return first platform that responds
-            response, platform = await query_web_ai_race(user_msg)
+            race_result = await query_web_ai_race(user_msg)
+            if not race_result or len(race_result) < 2:
+                return False, "no_response"
+
+            response, platform = race_result
 
             if not response:
                 return False, "no_response"
@@ -738,6 +921,65 @@ async def process_web_ai(messages, chat_id, context, selected_tools=None):
         return False, str(e)
 
 
+# ─── Vision helpers ────────────────────────────────────────────────────────────
+
+def _inject_image_into_messages(messages, image_base64: str):
+    """Modify the last user message to include an image block for vision APIs.
+
+    Works for both Claude (Anthropic) and OpenAI content formats.
+    The providers handle the format differences internally.
+    """
+    if not image_base64:
+        return
+    # Find the last user message and convert it to multi-part content
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            text_content = msg["content"]
+            # Store as list with text + image blocks (Anthropic format)
+            # process_openai will convert when building oai_msgs
+            msg["content"] = [
+                {"type": "text", "text": text_content},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_base64,
+                    },
+                },
+            ]
+            logger.info(f"[Vision] Injected image into message index {i}")
+            return
+    logger.warning("[Vision] No user message found to inject image into")
+
+
+def _convert_vision_message_for_openai(content):
+    """Convert Anthropic-format image content to OpenAI format."""
+    if not isinstance(content, list):
+        return content
+    oai_parts = []
+    for part in content:
+        if part.get("type") == "text":
+            oai_parts.append({"type": "text", "text": part["text"]})
+        elif part.get("type") == "image":
+            source = part.get("source", {})
+            oai_parts.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{source.get('media_type', 'image/jpeg')};base64,{source.get('data', '')}",
+                    "detail": "auto",
+                },
+            })
+        elif part.get("type") == "tool_result":
+            # These are Claude-native tool results, skip for OpenAI
+            pass
+        else:
+            # Pass through unknown types as-is
+            oai_parts.append(part)
+    return oai_parts if oai_parts else content
+
+
 # ─── Auto-switching router ────────────────────────────────────────────────────
 
 PROVIDER_FNS = {
@@ -750,10 +992,148 @@ PROVIDER_FNS = {
 PROVIDER_DISPLAY["web_ai"] = "Web AI (免费网页)"
 
 
-async def process_with_auto_fallback(messages, chat_id, context):
+# ─── Cached / Pattern-Based Response System (Never-Die Last Resort) ──────────
+
+import subprocess as _cached_sp
+
+# Common command patterns the bot can handle WITHOUT AI
+_CACHED_COMMAND_PATTERNS = [
+    # Screenshot
+    (re.compile(r"^(截图|screenshot|screen|屏幕|看看屏幕|ss)\s*$", re.IGNORECASE),
+     "screenshot", "Taking screenshot..."),
+    # Click at coordinates
+    (re.compile(r"^(?:点击|click)\s+(\d+)\s+(\d+)\s*$", re.IGNORECASE),
+     "click", None),
+    # Type text
+    (re.compile(r"^(?:输入|type|打字)\s+(.+)$", re.IGNORECASE),
+     "type", None),
+    # Status
+    (re.compile(r"^(状态|status|ping|在吗|alive)\s*$", re.IGNORECASE),
+     "status", None),
+    # Open URL
+    (re.compile(r"^(?:打开|open)\s+(https?://\S+)\s*$", re.IGNORECASE),
+     "open_url", None),
+    # Scroll
+    (re.compile(r"^(?:滚动|scroll)\s+(-?\d+)\s*$", re.IGNORECASE),
+     "scroll", None),
+]
+
+_NEVER_DIE_TEMPLATE = (
+    "All AI services are temporarily busy. I'll retry in {retry}s.\n"
+    "In the meantime, you can use:\n"
+    "  /panel — Quick actions\n"
+    "  /screenshot — Take screenshot\n"
+    "  /status — Check bot status\n"
+    "  /clear — Reset conversation"
+)
+
+
+async def _execute_cached_command(user_msg: str, chat_id: int, context) -> bool:
+    """Try to handle common commands directly via pattern matching, no AI needed.
+    Returns True if handled, False otherwise."""
+    import os as _os
+    pc_control = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "pc_control.py")
+
+    for pattern, cmd_type, default_reply in _CACHED_COMMAND_PATTERNS:
+        match = pattern.match(user_msg.strip())
+        if not match:
+            continue
+
+        try:
+            _loop = asyncio.get_running_loop()
+            if cmd_type == "screenshot":
+                await _loop.run_in_executor(None, lambda: _cached_sp.run(
+                    ["python", pc_control, "screenshot"],
+                    capture_output=True, timeout=15,
+                    cwd=_os.path.dirname(pc_control),
+                ))
+                await context.bot.send_message(chat_id=chat_id, text="Screenshot taken.")
+                # Screenshots are auto-forwarded by _forward_new_screenshots
+                return True
+
+            elif cmd_type == "click":
+                x, y = match.group(1), match.group(2)
+                await _loop.run_in_executor(None, lambda: _cached_sp.run(
+                    ["python", pc_control, "click", x, y, "--no-takeover"],
+                    capture_output=True, timeout=10,
+                    cwd=_os.path.dirname(pc_control),
+                ))
+                await context.bot.send_message(chat_id=chat_id, text=f"Clicked at ({x}, {y}).")
+                return True
+
+            elif cmd_type == "type":
+                text = match.group(1)
+                await _loop.run_in_executor(None, lambda: _cached_sp.run(
+                    ["python", pc_control, "type", text],
+                    capture_output=True, timeout=10,
+                    cwd=_os.path.dirname(pc_control),
+                ))
+                await context.bot.send_message(chat_id=chat_id, text=f"Typed: {text[:50]}")
+                return True
+
+            elif cmd_type == "status":
+                import platform as _plat
+                import psutil
+                try:
+                    # cpu_percent(interval=0.5) blocks — run in executor
+                    def _get_status():
+                        cpu = psutil.cpu_percent(interval=0.5)
+                        mem = psutil.virtual_memory()
+                        return cpu, mem.percent
+                    cpu, mem_pct = await _loop.run_in_executor(None, _get_status)
+                    status_text = (
+                        f"Bot is ALIVE\n"
+                        f"CPU: {cpu}% | RAM: {mem_pct}%\n"
+                        f"OS: {_plat.system()} {_plat.release()}\n"
+                        f"Provider: {config.CURRENT_PROVIDER}\n"
+                        f"Never-Die: {'ON' if getattr(config, 'NEVER_DIE_MODE', True) else 'OFF'}"
+                    )
+                except Exception:
+                    status_text = (
+                        f"Bot is ALIVE\n"
+                        f"Provider: {config.CURRENT_PROVIDER}\n"
+                        f"Never-Die: {'ON' if getattr(config, 'NEVER_DIE_MODE', True) else 'OFF'}"
+                    )
+                await context.bot.send_message(chat_id=chat_id, text=status_text)
+                return True
+
+            elif cmd_type == "open_url":
+                url = match.group(1)
+                # Validate URL to prevent command injection via cmd /c start
+                import urllib.parse as _urlparse
+                parsed = _urlparse.urlparse(url)
+                if parsed.scheme not in ("http", "https"):
+                    await context.bot.send_message(chat_id=chat_id, text="Only http/https URLs allowed.")
+                    return True
+                # Use webbrowser module instead of cmd /c start to avoid injection
+                import webbrowser as _wb
+                await _loop.run_in_executor(None, lambda u=url: _wb.open(u))
+                await context.bot.send_message(chat_id=chat_id, text=f"Opened: {url}")
+                return True
+
+            elif cmd_type == "scroll":
+                amount = match.group(1)
+                await _loop.run_in_executor(None, lambda: _cached_sp.run(
+                    ["python", pc_control, "scroll", amount],
+                    capture_output=True, timeout=10,
+                    cwd=_os.path.dirname(pc_control),
+                ))
+                await context.bot.send_message(chat_id=chat_id, text=f"Scrolled {amount}.")
+                return True
+
+        except Exception as e:
+            logger.warning(f"Cached command '{cmd_type}' failed: {e}")
+            continue
+
+    return False
+
+
+async def process_with_auto_fallback(messages, chat_id, context, image_data=None):
     """Try providers in priority order. Auto-switch on billing/auth errors.
 
     Falls back to free browser-based web AI if all API providers fail.
+    If NEVER_DIE_MODE is on (default), always responds — never silence.
+    image_data: optional base64-encoded image to include with the latest user message.
     """
     cost_order = ["gemini", "claude", "openai"]
     priority = [config.CURRENT_PROVIDER] + [
@@ -763,12 +1143,26 @@ async def process_with_auto_fallback(messages, chat_id, context):
     if "web_ai" not in priority:
         priority.append("web_ai")
 
+    # Inject image into messages if provided (vision support)
+    if image_data:
+        _inject_image_into_messages(messages, image_data)
+
     # Smart tool selection based on latest user message
     user_msg = ""
     for m in reversed(messages):
-        if m.get("role") == "user" and isinstance(m.get("content"), str):
-            user_msg = m["content"]
-            break
+        content = m.get("content")
+        if m.get("role") == "user":
+            if isinstance(content, str):
+                user_msg = content
+                break
+            elif isinstance(content, list):
+                # Multi-part message (with image) — extract text part
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        user_msg = part["text"]
+                        break
+                if user_msg:
+                    break
     selected_tools = _select_tools(user_msg)
     logger.info(f"Smart tools: {len(selected_tools)}/{len(TOOL_DEFINITIONS)} for '{user_msg[:50]}'")
 
@@ -779,14 +1173,18 @@ async def process_with_auto_fallback(messages, chat_id, context):
             continue
 
         logger.info(f"Trying provider: {provider}")
-        success, error = await fn(messages, chat_id, context, selected_tools)
+        try:
+            success, error = await fn(messages, chat_id, context, selected_tools)
+        except Exception as e:
+            logger.error(f"{provider} crashed unexpectedly: {e}", exc_info=True)
+            success, error = False, str(e)
 
         if success:
             if provider != config.CURRENT_PROVIDER:
                 config.CURRENT_PROVIDER = provider
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"✅ 已自动切换到 {PROVIDER_DISPLAY.get(provider, provider)}",
+                    text=f"Switched to {PROVIDER_DISPLAY.get(provider, provider)}",
                 )
             return True
 
@@ -799,7 +1197,7 @@ async def process_with_auto_fallback(messages, chat_id, context):
         if error in ("billing", "auth"):
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"⚠️ {PROVIDER_DISPLAY.get(provider, provider)} 无法使用（{'余额不足' if error == 'billing' else '认证失败'}），自动切换...",
+                text=f"{PROVIDER_DISPLAY.get(provider, provider)} unavailable ({'billing' if error == 'billing' else 'auth'}), switching...",
             )
             continue
 
@@ -807,11 +1205,31 @@ async def process_with_auto_fallback(messages, chat_id, context):
         logger.error(f"{provider} error: {error}")
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ {PROVIDER_DISPLAY.get(provider, provider)} 出错，尝试下一个...",
+            text=f"{PROVIDER_DISPLAY.get(provider, provider)} error, trying next...",
         )
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="❌ 所有 AI 服务（含免费网页）都不可用。\n请确认 Chrome 已登录 ChatGPT/Claude.ai/Gemini。",
-    )
-    return False
+    # ─── NEVER-DIE: All providers failed ─────────────────────────────────────
+    never_die = getattr(config, "NEVER_DIE_MODE", True)
+
+    if never_die:
+        # Try cached/pattern-based command execution first
+        if user_msg:
+            cached_ok = await _execute_cached_command(user_msg, chat_id, context)
+            if cached_ok:
+                logger.info("Never-Die: handled via cached command pattern")
+                return True
+
+        # Last resort: send helpful template response (NEVER silence)
+        retry_secs = getattr(config, "AUTO_RETRY_SECONDS", 60)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=_NEVER_DIE_TEMPLATE.format(retry=retry_secs),
+        )
+        logger.warning(f"Never-Die: all {len(tried)} providers failed, sent template response")
+        return True  # Return True so the bot doesn't crash — we DID respond
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="All AI services (including free web) are unavailable.\nCheck that Chrome is logged into ChatGPT/Claude.ai/Gemini.",
+        )
+        return False

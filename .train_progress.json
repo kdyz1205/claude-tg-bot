@@ -1,0 +1,97 @@
+{
+  "code_edit": {
+    "runs": 2,
+    "last_avg": 0.7000000000000001,
+    "fixes_applied": 0,
+    "history": [
+      {
+        "timestamp": "2026-03-27T20:44:15.887000",
+        "avg_score": 0.7000000000000001,
+        "fixes": 0,
+        "issues": {
+          "missing_content:fix,修复,+": 1
+        }
+      },
+      {
+        "timestamp": "2026-03-27T20:46:35.203442",
+        "avg_score": 0.7000000000000001,
+        "fixes": 0,
+        "issues": {
+          "missing_content:fix,修复,+": 1
+        }
+      }
+    ]
+  },
+  "file_ops": {
+    "runs": 2,
+    "last_avg": 0.7,
+    "fixes_applied": 0,
+    "history": [
+      {
+        "timestamp": "2026-03-27T20:46:08.891523",
+        "avg_score": 0.9333333333333335,
+        "fixes": 0,
+        "issues": {}
+      },
+      {
+        "timestamp": "2026-03-27T23:27:19.005208",
+        "rounds": 1,
+        "scores": [
+          0.7
+        ],
+        "total_fixes": 0
+      }
+    ]
+  },
+  "computer_control": {
+    "runs": 1,
+    "last_avg": 0.7250000000000001,
+    "fixes_applied": 0,
+    "history": [
+      {
+        "timestamp": "2026-03-27T20:46:57.096691",
+        "avg_score": 0.7250000000000001,
+        "fixes": 0,
+        "issues": {
+          "missing_content:×,2560,1440": 1
+        }
+      }
+    ]
+  },
+  "obedience": {
+    "runs": 8,
+    "last_avg": 0.7,
+    "fixes_applied": 3,
+    "history": [
+      {
+        "timestamp": "2026-03-27T20:55:45.011776",
+        "rounds": 2,
+        "scores": [
+          0.8,
+          0.8
+        ],
+        "total_fixes": 0
+      },
+      {
+        "timestamp": "2026-03-27T23:07:53.898262",
+        "rounds": 3,
+        "scores": [
+          0.73,
+          0.83,
+          0.5
+        ],
+        "total_fixes": 1
+      },
+      {
+        "timestamp": "2026-03-27T23:24:02.951096",
+        "rounds": 3,
+        "scores": [
+          0.73,
+          0.8,
+          0.7
+        ],
+        "total_fixes": 2
+      }
+    ]
+  }
+}

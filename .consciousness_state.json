@@ -1,0 +1,138 @@
+{
+ "performance_windows": [
+  {
+   "timestamp": 1774761026.2957385,
+   "metrics": {
+    "health": "healthy",
+    "consecutive_failures": 0,
+    "success_rate": 0,
+    "avg_score": 0.0
+   }
+  }
+ ],
+ "capability_gaps": [],
+ "evolution_log": [
+  {
+   "type": "bug_fix",
+   "description": "Fixed 6 blocking calls in bot.py (capture_screenshot + psutil wrapped in run_in_executor)",
+   "files": [],
+   "timestamp": 1774761026.2848213,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "bug_fix",
+   "description": "Fixed Gemini silently dropping vision/image messages in providers.py",
+   "files": [],
+   "timestamp": 1774761026.2865334,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "bug_fix",
+   "description": "Fixed web_ai.py cancelled tasks not awaited, browser_agent.py live list mutation",
+   "files": [],
+   "timestamp": 1774761026.2870047,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "bug_fix",
+   "description": "Fixed claude_code_web.py auto_approve 7-minute hang — added 5-min timeout",
+   "files": [],
+   "timestamp": 1774761026.287587,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "bug_fix",
+   "description": "Fixed base.py error screenshot masking original error",
+   "files": [],
+   "timestamp": 1774761026.2881367,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "bug_fix",
+   "description": "Fixed AdaptiveController duplicate singletons in tools.py",
+   "files": [],
+   "timestamp": 1774761026.288763,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "new_feature",
+   "description": "Built Autonomy Engine: self-directed observe-act-verify loops with goal management",
+   "files": [],
+   "timestamp": 1774761026.2895842,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "new_feature",
+   "description": "Built Consciousness Layer: self-awareness, performance tracking, capability gap detection",
+   "files": [],
+   "timestamp": 1774761026.290407,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "new_feature",
+   "description": "Built Reflexion Engine: self-critique after each action, insight extraction",
+   "files": [],
+   "timestamp": 1774761026.290948,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "new_feature",
+   "description": "Built RAG Solution Store: retrieves similar past solutions for new tasks",
+   "files": [],
+   "timestamp": 1774761026.2915044,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "new_feature",
+   "description": "Built Multi-Session Manager: /ms command for parallel Claude CLI sessions",
+   "files": [],
+   "timestamp": 1774761026.2934935,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "new_feature",
+   "description": "Wired IntelligenceSkill (1082 lines) into bot message loop — was dead code",
+   "files": [],
+   "timestamp": 1774761026.2940488,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "optimization",
+   "description": "Added /autonomy, /consciousness, /ms commands to Telegram bot",
+   "files": [],
+   "timestamp": 1774761026.2945783,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  },
+  {
+   "type": "learning",
+   "description": "Applied NLAH paper patterns: Reflexion, RAG, Test-Time Scaling to bot harness",
+   "files": [],
+   "timestamp": 1774761026.2951627,
+   "outcome": "success",
+   "notes": "Syntax validated, imports clean"
+  }
+ ],
+ "identity": {
+  "name": "TG Remote Controller",
+  "version": "4.0",
+  "created": "2025",
+  "purpose": "Remote PC control + autonomous coding via Telegram",
+  "strengths": [],
+  "weaknesses": [],
+  "last_self_reflection": 0
+ },
+ "saved_at": 1774761026.3200128
+}

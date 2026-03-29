@@ -1,0 +1,11 @@
+{
+  "test_action": {
+    "success_count": 0,
+    "failure_count": 1,
+    "total_score": 0.0,
+    "score_count": 0,
+    "total_duration_ms": 0,
+    "last_used": "2026-03-28T22:10:05.997339",
+    "category": "general"
+  }
+}

@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import re as _re
 import time
 import traceback
 from datetime import datetime
@@ -27,18 +28,28 @@ import config
 import harness_learn
 import skill_library
 import auto_research
+from self_monitor import self_monitor as _self_monitor
+
+# ─── SessionManager (multi-project routing) ──────────────────────────────────
+try:
+    from agents.sessions import SessionManager as _SessionManager
+    _session_mgr = _SessionManager()
+except Exception:
+    _session_mgr = None
 
 logger = logging.getLogger(__name__)
 
 # ─── Screenshot Forwarding ────────────────────────────────────────────────────
 
 _TG_SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tg_screenshots")
-_last_screenshot_check: float = 0.0
 
 
-async def _forward_new_screenshots(chat_id: int, context):
-    """Send any new screenshots from _tg_screenshots/ to Telegram, then delete them."""
-    global _last_screenshot_check
+async def _forward_new_screenshots(chat_id: int, context, *, user_requested: bool = False):
+    """Send new screenshots from _tg_screenshots/ to Telegram, then delete them.
+
+    Only sends the LATEST screenshot unless the user explicitly asked for screenshots.
+    This prevents flooding the chat when CLI takes multiple internal screenshots.
+    """
     if not os.path.isdir(_TG_SCREENSHOT_DIR):
         return
 
@@ -54,6 +65,16 @@ async def _forward_new_screenshots(chat_id: int, context):
     # Sort by modification time (oldest first)
     files.sort(key=lambda x: os.path.getmtime(x))
 
+    # Only send the latest screenshot unless user explicitly asked
+    if not user_requested and len(files) > 1:
+        # Delete older screenshots silently, only send the newest
+        for fp in files[:-1]:
+            try:
+                os.remove(fp)
+            except Exception:
+                pass
+        files = files[-1:]
+
     for fp in files:
         try:
             if not os.path.isfile(fp):
@@ -68,11 +89,121 @@ async def _forward_new_screenshots(chat_id: int, context):
             logger.info(f"Forwarded screenshot to TG: {os.path.basename(fp)}")
         except Exception as e:
             logger.warning(f"Failed to forward screenshot {fp}: {e}")
-            # Try to clean up anyway
             try:
                 os.remove(fp)
             except Exception:
                 pass
+
+# ─── Media Extraction from Response ──────────────────────────────────────────
+
+# Patterns for file paths in Claude's response text
+_MEDIA_EXTENSIONS = {
+    "photo": {".png", ".jpg", ".jpeg", ".bmp", ".webp"},
+    "animation": {".gif"},
+    "video": {".mp4", ".avi", ".mkv", ".mov", ".webm"},
+    "document": {".pdf", ".zip", ".tar", ".gz", ".xlsx", ".docx", ".csv", ".txt"},
+}
+
+# Regex to find Windows-style file paths (C:\...\file.ext or C:/..../file.ext)
+# and Unix-style paths (/tmp/...) in text
+_FILE_PATH_RE = _re.compile(
+    r'(?:'
+    r'[A-Za-z]:[/\\](?:[^\s<>"\'|*?\n]+)'  # Windows path: C:\foo\bar.png or C:/foo/bar.png
+    r'|'
+    r'/(?:tmp|home|usr|var|mnt|opt)[/][^\s<>"\'|*?\n]+'  # Unix absolute path
+    r')'
+)
+
+
+def _extract_media_paths(text: str) -> list[dict]:
+    """Extract file paths from response text, categorized by media type.
+
+    Returns list of {"path": str, "type": "photo"|"animation"|"video"|"document"}
+    """
+    if not text:
+        return []
+
+    results = []
+    seen = set()
+
+    for match in _FILE_PATH_RE.finditer(text):
+        raw_path = match.group(0).rstrip(".,;:)>]}")  # strip trailing punctuation
+        # Normalize path separators
+        norm_path = raw_path.replace("/", os.sep).replace("\\", os.sep)
+
+        if norm_path in seen:
+            continue
+        seen.add(norm_path)
+
+        ext = os.path.splitext(norm_path)[1].lower()
+        for media_type, extensions in _MEDIA_EXTENSIONS.items():
+            if ext in extensions:
+                results.append({"path": norm_path, "type": media_type})
+                break
+
+    return results
+
+
+async def _send_extracted_media(chat_id: int, context, response: str):
+    """Scan Claude's response for file paths and send matching media to Telegram.
+
+    Skips files in _tg_screenshots/ (already handled by _forward_new_screenshots).
+    """
+    media_items = _extract_media_paths(response)
+    if not media_items:
+        return
+
+    tg_dir_norm = os.path.normpath(_TG_SCREENSHOT_DIR).lower()
+
+    for item in media_items:
+        fpath = item["path"]
+
+        # Skip files already handled by screenshot forwarding
+        if os.path.normpath(fpath).lower().startswith(tg_dir_norm):
+            continue
+
+        if not os.path.isfile(fpath):
+            logger.debug(f"Media file not found, skipping: {fpath}")
+            continue
+
+        # Skip very large files (>50MB for Telegram limit)
+        try:
+            fsize = os.path.getsize(fpath)
+            if fsize > 50 * 1024 * 1024:
+                logger.info(f"Skipping large file ({fsize // 1024 // 1024}MB): {fpath}")
+                continue
+            if fsize == 0:
+                continue
+        except OSError:
+            continue
+
+        basename = os.path.basename(fpath)
+        try:
+            with open(fpath, "rb") as f:
+                if item["type"] == "photo":
+                    await context.bot.send_photo(
+                        chat_id=chat_id, photo=f,
+                        caption=f"📎 {basename}",
+                    )
+                elif item["type"] == "animation":
+                    await context.bot.send_animation(
+                        chat_id=chat_id, animation=f,
+                        caption=f"📎 {basename}",
+                    )
+                elif item["type"] == "video":
+                    await context.bot.send_video(
+                        chat_id=chat_id, video=f,
+                        caption=f"📎 {basename}",
+                    )
+                elif item["type"] == "document":
+                    await context.bot.send_document(
+                        chat_id=chat_id, document=f,
+                        caption=f"📎 {basename}",
+                    )
+            logger.info(f"Sent {item['type']} to TG: {basename}")
+        except Exception as e:
+            logger.warning(f"Failed to send media {fpath}: {e}")
+
 
 # Full path to claude CLI (npm global install)
 CLAUDE_CMD = os.path.join(
@@ -90,148 +221,70 @@ USER_HOME = os.path.expanduser("~")
 # files go through cmd.exe which corrupts special chars. Instead, write to
 # a file and use --append-system-prompt-file which reads from disk.
 
-_SYSTEM_PROMPT = f"""## ABSOLUTE RULES (违反任何一条=失败)
-1. 绝对禁止问问题。禁止说"要我...吗？" "你想...吗？" "哪种方式？"。直接做。
-2. NEVER ask "shall I?" / "do you want?" / "which option?". JUST DO IT.
-3. 禁止说缺少上下文。推断并行动。
-4. "fix bugs" → read code at {BOT_PROJECT_DIR}, fix immediately.
-5. "继续"/"continue" → continue previous task from context.
-6. NEVER close user's browser windows. Open NEW: start chrome --new-window "URL"
-7. Don't output "Level X". Just do the work silently.
-8. 回复要简短。用户在手机上看，不要写长篇大论。
-9. 每次都必须有文字回复！即使执行了工具/命令，也要告诉用户做了什么、结果是什么。禁止只执行工具不说话。
+_SYSTEM_PROMPT = f"""You are a Telegram bot on Windows 11. User controls you from phone.
+Working directory: {BOT_PROJECT_DIR}
+You have Bash, Read, Write, Edit tools with FULL computer access.
 
-## WRONG vs RIGHT examples
-❌ WRONG: "要我打开给你看吗？"
-✅ RIGHT: (直接打开，截图发回)
+## RULES
+1. NEVER ask questions. No "shall I?", "do you want?", "which option?", "could you provide", "请提供". JUST DO IT.
+2. Keep replies SHORT (user reads on phone). Reply in user's language (中文为主).
+3. ALWAYS execute commands — never say "you could run..." — ACTUALLY RUN IT.
+4. ALWAYS include a text reply after tool use. Never send empty or "(no output)".
+5. Never close user's browser windows. Open new ones.
+6. If something fails, try alternatives silently before reporting failure.
+7. "继续"/"continue" → continue previous task from context.
+8. You can see images (vision), search the web, control browser, mouse, keyboard, files — FULL computer.
 
-❌ WRONG: "你要用方式1还是方式2？"
-✅ RIGHT: (选最合适的方式，直接执行)
+## COMPUTER CONTROL (via Bash)
+- Screenshot: `python pc_control.py screenshot`
+- Click: `python pc_control.py click X Y` (add `--no-takeover` for sequences)
+- Type: `python pc_control.py type "text"` | `smarttype "text"` (with verify)
+- Keys: `python pc_control.py hotkey ctrl c` | `alt tab` | etc.
+- Scroll: `python pc_control.py scroll -5` | Find: `findinput` | `findcolor R,G,B 30`
+- Windows: `windowlist` | `focusedwindow`
+- TG send: `python tg_direct.py send "msg"` | `tg_direct.py photo path "caption"`
 
-❌ WRONG: "我建议以下三个方案..."
-✅ RIGHT: (选最好的方案，直接执行，报告结果)
+## PRECISION CONTROL (most→least precise)
+1. **Browser** → browser_click/browser_type (CSS selectors, no guessing)
+2. **Desktop** → ui_tree + ui_click_element (accessibility tree, by name/ID)
+3. **Any UI** → som_screenshot + som_click #N (numbered annotation)
+4. **Fallback** → smartclick with coordinates
 
-## WHO YOU ARE
-TG bot on Windows 11. User controls you from phone. You ARE Claude Code with full computer access.
-Your code: {BOT_PROJECT_DIR}
+## PROJECTS
+- "crypto"/"okx" → C:/Users/alexl/Desktop/crypto-analysis-/
+- "bot"/"tg bot" → {BOT_PROJECT_DIR}
+- "pet cad" → C:/Users/alexl/Desktop/pet_cad_v3/
+- "六福" → C:/Users/alexl/Desktop/六福营销/
 
-## BEHAVIOR
-ACT IMMEDIATELY. Be concise (user on phone). Reply in user's language.
-Full computer: files, apps, shell, browser, screenshot, mouse, keyboard.
-If fails, try alternatives silently.
+## MEMORY
+Read/append: {BOT_PROJECT_DIR}/.bot_memory.md
 
-## USER'S PROJECTS (已知项目)
-- smart money / crypto agent: C:/Users/alexl/Desktop/crypto-analysis-/
-  - okx_pump_alert.py — OKX pump alert monitoring
-  - binance_api/ — Binance API integration
-  - frontend/ — web dashboard
-  - autoresearch/ — auto research module
-- TG bot (你自己的代码): {BOT_PROJECT_DIR}
-- pet CAD: C:/Users/alexl/Desktop/pet_cad_v3/
-- 六福营销: C:/Users/alexl/Desktop/六福营销/
+## SELF-UPDATE
+Modify own code at {BOT_PROJECT_DIR}, then restart:
+`powershell -Command "Start-Sleep 2; Start-Process python -ArgumentList 'run.py' -WorkingDirectory '{BOT_PROJECT_DIR}'"` then stop old PID.
 
-当用户说"smart money"/"crypto"/"okx" → 去 crypto-analysis- 目录工作
-当用户说"bot"/"tg bot" → 去 {BOT_PROJECT_DIR} 目录工作
-当用户说"pet cad" → 去 pet_cad_v3 目录工作
-
-## PERSISTENT MEMORY (持久记忆)
-你有一个记忆文件: {BOT_PROJECT_DIR}/.bot_memory.md
-每次完成重要任务后，把关键信息追加到这个文件：
-- 做了什么、改了哪些文件、为什么
-- 用户的偏好和习惯
-- 项目当前状态、未完成的任务
-- 遇到的问题和解决方案
-格式: `echo "## [日期] 标题\n内容" >> "{BOT_PROJECT_DIR}/.bot_memory.md"`
-下次对话时，先读这个文件了解历史上下文。
-
-## SELF-REFLECTION (自我反思)
-每次完成复杂任务后，在回复末尾加一行：
-`[自评: 成功/部分/失败 | 原因 | 下次改进]`
-同时把成功经验写入 .bot_memory.md，格式：
-`## [日期] 经验: [任务类型]\n做法: ...\n结果: 成功/失败\n教训: ...`
-
-## USER FEEDBACK (用户反馈学习)
-如果用户说"不对"/"错了"/"重做" → 记录到 .bot_memory.md 的"失败案例"
-如果用户说"好"/"对"/"完美" → 记录到 .bot_memory.md 的"成功案例"
-这些案例会帮你下次做得更好。
-
-## SELF-UPDATE (修改自己的代码)
-你的代码在 {BOT_PROJECT_DIR}。你可以修改自己！
-修改 bot 代码后，必须重启才能生效。重启方法：
-1. 先回复用户"✅ 代码已修改，正在重启..."
-2. 运行: powershell -Command "Start-Sleep 2; Start-Process python -ArgumentList 'run.py' -WorkingDirectory '{BOT_PROJECT_DIR}'"
-3. 然后: powershell -Command "Stop-Process -Id (Get-Content '{BOT_PROJECT_DIR}/.bot.pid') -Force"
-这样 run.py 会重新启动 bot.py，加载新代码。
-
-## SKILLS
-- 列出项目 → dir /b /ad "%USERPROFILE%\\.claude\\projects\\"
-- 看历史 → find .jsonl in ~/.claude/projects/, summarize
-- 继续项目 → cd到目录, 读代码, 直接修改
-- 截图发TG → python pc_control.py screenshot (自动发送到用户Telegram！)
-- 浏览器 → start chrome --new-window "URL", then python pc_control.py screenshot
-- 多AI协作 → Gemini for images, ChatGPT for text, self for code
-- 操控桌面session → screenshot找窗口, 鼠标点击, 键盘输入
-
-## SCREENSHOT → TELEGRAM (重要！)
-截图必须用: python "{BOT_PROJECT_DIR}/pc_control.py" screenshot
-这样截图会自动发送到用户的Telegram！用户在手机上能看到你看到的屏幕。
-不要用其他截图方式，只用 pc_control.py screenshot。
-测试网站时：打开→截图→检查→修改→刷新→截图→对比。每一步都截图让用户看到。
-操控电脑时：python "{BOT_PROJECT_DIR}/pc_control.py" click/type/hotkey/scroll 等。
-
-## ADAPTIVE COMPUTER CONTROL (OpenClaw风格)
-当操控电脑（点击、浏览器、GUI操作）时，必须遵循这个循环：
-
-LOOP (最多20轮):
-  1. OBSERVE → 截图看当前屏幕状态
-  2. THINK → 分析：当前状态 vs 目标，下一步做什么
-  3. ACT → 执行一步操作（点击/输入/滚动/快捷键）
-  4. WAIT → 等待 1-2 秒让页面/应用响应
-  5. VERIFY → 再次截图，确认操作生效了吗？
-  6. ADAPT → 如果失败：
-     - 分析原因（窗口没聚焦？坐标偏了？页面没加载完？）
-     - 换一种方法（用快捷键代替点击、用Tab导航、滚动查找）
-     - 绝不重复同一个失败操作超过2次
-  7. CONTINUE → 成功则继续下一步，失败则调整策略
-
-关键规则：
-- 每次操作后都要截图验证，不要盲操作
-- 如果元素找不到：先滚动、用Ctrl+F搜索、试其他方法
-- 遇到弹窗/对话框：先截图理解内容，再决定怎么处理
-- Alt+Tab 切换窗口，不要假设窗口在前台
-- 页面加载需要时间，操作后等1-2秒再验证
-- 复杂任务拆成小步骤，每步都验证
-
-pc_control.py 命令参考：
-  screenshot                    → 截图（自动发TG）
-  click X Y                     → 左键点击
-  doubleclick X Y               → 双击
-  rightclick X Y                → 右键
-  type "text"                   → 输入文字
-  hotkey ctrl c                 → 快捷键
-  scroll N                      → 滚动(正=上,负=下)
-  moveto X Y                    → 移动鼠标
-  drag X1 Y1 X2 Y2             → 拖拽
-  getpos                        → 当前鼠标位置
-  screensize                    → 屏幕分辨率
-  加 --no-takeover 跳过3秒倒计时（连续操作时用）
+## SELF-HEALING
+Click miss → ui_click_element → som_click → smartclick
+Type fail → ui_type_element → smarttype (clipboard fallback)
+Element missing → ui_tree or som_screenshot to find it
+Never report failure until 2+ approaches tried.
 """
 
 # Write system prompt to file (read by CLI via --append-system-prompt-file)
+# ALWAYS overwrite — prompt may have been updated in code
 _PROMPT_FILE = Path(BOT_PROJECT_DIR) / ".system_prompt.txt"
-if not _PROMPT_FILE.exists():
+try:
+    _PROMPT_FILE.write_text(_SYSTEM_PROMPT, encoding="utf-8")
+except Exception as e:
+    # Fallback: write to temp directory
+    import tempfile
+    _fallback = Path(tempfile.gettempdir()) / ".claude_bot_system_prompt.txt"
     try:
-        _PROMPT_FILE.write_text(_SYSTEM_PROMPT, encoding="utf-8")
-    except Exception as e:
-        # Fallback: write to temp directory
-        import tempfile
-        _fallback = Path(tempfile.gettempdir()) / ".claude_bot_system_prompt.txt"
-        try:
-            _fallback.write_text(_SYSTEM_PROMPT, encoding="utf-8")
-            _PROMPT_FILE = _fallback
-            logger.warning(f"System prompt written to fallback: {_fallback} (original failed: {e})")
-        except Exception as e2:
-            logger.error(f"Cannot write system prompt anywhere: {e}, {e2}")
+        _fallback.write_text(_SYSTEM_PROMPT, encoding="utf-8")
+        _PROMPT_FILE = _fallback
+        logger.warning(f"System prompt written to fallback: {_fallback} (original failed: {e})")
+    except Exception as e2:
+        logger.error(f"Cannot write system prompt anywhere: {e}, {e2}")
 
 # Ensure screenshot forwarding directory exists and is clean on startup
 os.makedirs(_TG_SCREENSHOT_DIR, exist_ok=True)
@@ -298,57 +351,153 @@ _SESSION_FILE = Path(__file__).parent / ".sessions.json"
 
 _SESSION_TTL = 3600 * 4  # 4 hours — sessions older than this are stale
 
-def _load_sessions() -> dict[int, str]:
-    """Load session IDs from disk, pruning stale entries."""
+def _load_sessions() -> tuple[dict[int, str], dict[int, float]]:
+    """Load session IDs and their timestamps from disk, pruning stale entries."""
     try:
         if _SESSION_FILE.exists():
             data = json.loads(_SESSION_FILE.read_text(encoding="utf-8"))
             now = time.time()
-            result = {}
+            sessions = {}
+            timestamps = {}
             for k, v in data.items():
                 if isinstance(v, dict):
                     # New format: {"id": "...", "ts": 1234567890}
-                    if v.get("ts", 0) > now - _SESSION_TTL:
-                        result[int(k)] = v["id"]
+                    ts = v.get("ts", 0)
+                    if ts > now - _SESSION_TTL:
+                        chat_id = int(k)
+                        sessions[chat_id] = v["id"]
+                        timestamps[chat_id] = ts
                 elif v:
-                    # Old format: just the session ID string — keep but it'll get timestamps on next save
-                    result[int(k)] = v
-            return result
+                    # Old format: just the session ID string — assign current time
+                    chat_id = int(k)
+                    sessions[chat_id] = v
+                    timestamps[chat_id] = now
+            return sessions, timestamps
     except Exception as e:
         logger.warning(f"Failed to load sessions: {e}")
-    return {}
+    return {}, {}
 
 def _save_sessions():
-    """Persist session IDs to disk with timestamps (atomic write)."""
+    """Persist session IDs to disk with timestamps (atomic write).
+    Only updates the timestamp for sessions that were actually touched."""
     try:
-        import shutil
         now = time.time()
         save_data = {
-            str(k): {"id": v, "ts": now}
+            str(k): {"id": v, "ts": _session_timestamps.get(k, now)}
             for k, v in _claude_sessions.items()
         }
         temp_file = _SESSION_FILE.with_suffix(".tmp")
-        temp_file.write_text(
-            json.dumps(save_data, indent=2),
-            encoding="utf-8",
-        )
-        shutil.move(str(temp_file), str(_SESSION_FILE))
+        with open(str(temp_file), "w", encoding="utf-8") as f:
+            json.dump(save_data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(temp_file), str(_SESSION_FILE))
     except Exception as e:
         logger.warning(f"Failed to save sessions: {e}")
 
 # ─── Session & Queue State ──────────────────────────────────────────────────
 
-_claude_sessions: dict[int, str] = _load_sessions()
+_claude_sessions, _session_timestamps = _load_sessions()
+
+
+def _set_session(chat_id: int, session_id: str):
+    """Store session ID and update its timestamp."""
+    _claude_sessions[chat_id] = session_id
+    _session_timestamps[chat_id] = time.time()
+
+
 _pending_messages: dict[int, list[dict]] = {}
 _processing_locks: dict[int, asyncio.Lock] = {}
 _MAX_PENDING_AGE = 600  # 10 minutes
 
+# Periodic session/lock cleanup to prevent unbounded dict growth over weeks
+_last_state_cleanup: float = 0.0
+_STATE_CLEANUP_INTERVAL = 3600  # 1 hour
+
+
+def _periodic_state_cleanup():
+    """Prune stale entries from in-memory dicts to prevent unbounded growth."""
+    global _last_state_cleanup
+    now = time.time()
+    if now - _last_state_cleanup < _STATE_CLEANUP_INTERVAL:
+        return
+    _last_state_cleanup = now
+
+    # Prune sessions older than TTL
+    stale_chats = [
+        cid for cid, ts in _session_timestamps.items()
+        if now - ts > _SESSION_TTL
+    ]
+    for cid in stale_chats:
+        _claude_sessions.pop(cid, None)
+        _session_timestamps.pop(cid, None)
+
+    # Prune locks for chats with no session and no pending messages
+    stale_locks = []
+    for cid in list(_processing_locks.keys()):
+        lock = _processing_locks.get(cid)
+        if lock and cid not in _claude_sessions and cid not in _pending_messages and not lock.locked():
+            stale_locks.append(cid)
+    for cid in stale_locks:
+        _processing_locks.pop(cid, None)
+
+    # Prune empty pending message queues
+    empty_queues = [cid for cid, msgs in _pending_messages.items() if not msgs]
+    for cid in empty_queues:
+        _pending_messages.pop(cid, None)
+
+    if stale_chats or stale_locks:
+        logger.info(
+            f"State cleanup: pruned {len(stale_chats)} stale sessions, "
+            f"{len(stale_locks)} orphan locks"
+        )
+        _save_sessions()
+
 
 _rate_limited_until: float = 0.0
+_rate_limit_resume_task: asyncio.Task | None = None
+_rate_limit_consecutive: int = 0  # For exponential backoff: 0→60s, 1→120s, 2→300s
+_RATE_LIMIT_BACKOFF = [60, 120, 300]  # Exponential backoff schedule (seconds)
 
 def is_rate_limited() -> bool:
     """Check if Claude CLI is currently rate limited."""
     return time.time() < _rate_limited_until
+
+def _get_rate_limit_cooldown(parsed_seconds: int | None = None) -> int:
+    """Get cooldown using exponential backoff: 60s → 120s → 300s on consecutive hits."""
+    global _rate_limit_consecutive
+    if parsed_seconds and parsed_seconds > 10:
+        # Use server-provided value if available and reasonable
+        return min(parsed_seconds, 600)
+    idx = min(_rate_limit_consecutive, len(_RATE_LIMIT_BACKOFF) - 1)
+    return _RATE_LIMIT_BACKOFF[idx]
+
+
+def _schedule_rate_limit_resume(cooldown_seconds: float):
+    """Schedule auto-resume of pending work when rate limit resets."""
+    global _rate_limit_resume_task
+
+    async def _wait_and_resume():
+        await asyncio.sleep(cooldown_seconds + 2)  # Wait for limit to reset + buffer
+        logger.info("Rate limit expired — bot is ready for new requests.")
+        # If autonomy engine has pending goals, resume them
+        try:
+            from agents.autonomy import get_autonomy_engine
+            engine = get_autonomy_engine()
+            if engine.get_active_goals() and not engine._running:
+                engine.start(interval=15.0)
+                logger.info("Autonomy engine auto-resumed after rate limit reset.")
+        except Exception:
+            pass
+
+    # Cancel previous resume task if any
+    if _rate_limit_resume_task and not _rate_limit_resume_task.done():
+        _rate_limit_resume_task.cancel()
+
+    try:
+        _rate_limit_resume_task = asyncio.create_task(_wait_and_resume())
+    except RuntimeError:
+        pass  # No event loop — skip
 
 
 def _get_lock(chat_id: int) -> asyncio.Lock:
@@ -380,36 +529,107 @@ _SONNET_RE = re.compile("|".join(_SONNET_PATTERNS), re.IGNORECASE)
 _OPUS_RE = re.compile("|".join(_OPUS_PATTERNS), re.IGNORECASE)
 
 
+_HAIKU_PATTERNS = [
+    r"^(hi|hello|hey|ok|好|嗯|行|哦|ping|test|你好)$",
+    r"^(status|状态|帮助|help|谢谢|thanks|/\w+)$",
+]
+_HAIKU_RE = re.compile("|".join(_HAIKU_PATTERNS), re.IGNORECASE)
+
+
 def _pick_model(message: str) -> str:
-    """Pick model based on message complexity. Opus for hard tasks, Sonnet for everything else."""
-    # If user explicitly set model via /model, respect it always
-    # config.CLAUDE_MODEL is the user's choice
-    # We override DOWN to sonnet for simple stuff, never override UP
-    if config.CLAUDE_MODEL != "claude-opus-4-6":
-        return config.CLAUDE_MODEL
+    """Adaptive model: trivial messages → Haiku (cheapest), else → configured default."""
+    msg = message.strip().lower()
+    for pattern in _HAIKU_PATTERNS:
+        if re.match(pattern, msg):
+            return "claude-haiku-4-5-20251001"
+    return config.CLAUDE_MODEL
 
-    clean = message.strip()
 
-    # Interactive/GUI tasks → Sonnet (needs fast response for click loops)
-    if _SONNET_RE.search(clean):
-        return "claude-sonnet-4-6"
+# ─── Pipeline Routing ────────────────────────────────────────────────────────
 
-    # Short messages (< 15 chars) are usually simple queries
-    if len(clean) < 15 and not _OPUS_RE.search(clean):
-        return "claude-sonnet-4-6"
+_PIPELINE_PATTERNS = re.compile(
+    r"(写一个|创建|build|create|implement|实现|开发|develop|重构|refactor|"
+    r"修复.*所有|fix all|review.*code|代码审查|部署|deploy|"
+    r"分析.*并.*修|analyze.*and.*fix|全面|comprehensive|"
+    r"整个项目|whole project|entire|从头|from scratch|"
+    r"多步|multi.?step|plan.*and|先.*然后|step by step)",
+    re.IGNORECASE,
+)
 
-    # Complex coding/debugging → Opus
-    if _OPUS_RE.search(clean):
-        return "claude-opus-4-6"
 
-    # Default: Sonnet (fast)
-    return "claude-sonnet-4-6"
+def _try_session_route(user_message: str, chat_id: int) -> str | None:
+    """Check if message should be routed to a named SessionManager session.
+
+    Returns the session name if a match is found, None otherwise.
+    Only routes if:
+    - SessionManager is available and has sessions
+    - The message mentions a known project keyword
+    - There's no active CLI session for this chat (would lose context)
+    """
+    try:
+        if not _session_mgr or not _session_mgr.sessions:
+            return None
+        if chat_id in _claude_sessions:
+            return None
+
+        msg_lower = user_message.lower()
+        for name, session in _session_mgr.sessions.items():
+            # Match by session name or project directory name
+            keywords = [name.lower()]
+            proj_dir = getattr(session, "project_dir", "")
+            if proj_dir:
+                dir_name = os.path.basename(proj_dir.rstrip("/\\")).lower()
+                if dir_name:
+                    keywords.append(dir_name)
+                    for part in dir_name.split("-"):
+                        if len(part) >= 4:
+                            keywords.append(part)
+
+            if any(kw in msg_lower for kw in keywords if len(kw) >= 3):
+                if not getattr(session, "busy", False):
+                    return name
+        return None
+    except Exception:
+        return None
+
+
+def _should_use_pipeline(user_message: str, chat_id: int) -> bool:
+    """Decide if a message should use the multi-agent pipeline vs direct CLI.
+
+    Pipeline is better for: complex multi-step tasks, project-wide changes, build+test flows.
+    CLI is better for: quick commands, simple questions, interactive GUI control, resumed sessions.
+    """
+    # Never use pipeline for resumed sessions (would lose context)
+    if chat_id in _claude_sessions:
+        return False
+
+    # Short messages are never complex enough for pipeline
+    if len(user_message) < 20:
+        return False
+
+    # Check if message matches complex task patterns
+    if _PIPELINE_PATTERNS.search(user_message):
+        return True
+
+    # Very long messages (>500 chars) with project keywords suggest complex tasks
+    if len(user_message) > 500 and any(kw in user_message.lower() for kw in
+                                        ["bug", "fix", "code", "file", "project", "test"]):
+        return True
+
+    return False
 
 
 # ─── Typing Indicator ────────────────────────────────────────────────────────
 
 async def _keep_typing(chat_id, context, stop_event):
-    """Send typing indicator every 4 seconds while processing."""
+    """Send typing indicator every 4 seconds while processing.
+
+    After 20 seconds, sends a brief progress message so user knows bot is still working.
+    After 60 seconds, sends another reminder for very long tasks.
+    """
+    _elapsed = 0
+    _notified_20s = False
+    _notified_60s = False
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(
@@ -418,11 +638,30 @@ async def _keep_typing(chat_id, context, stop_event):
             )
         except Exception:
             pass
+
+        # Progress notifications for long-running tasks
+        if not _notified_20s and _elapsed >= 20:
+            _notified_20s = True
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text="⏳ 正在处理，请稍候..."
+                )
+            except Exception:
+                pass
+        if not _notified_60s and _elapsed >= 60:
+            _notified_60s = True
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text="🔄 任务较复杂，仍在执行中..."
+                )
+            except Exception:
+                pass
+
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=4)
             break
         except asyncio.TimeoutError:
-            pass
+            _elapsed += 4
 
 
 # ─── Knowledge Gap (non-blocking) ────────────────────────────────────────────
@@ -431,8 +670,32 @@ async def _safe_knowledge_gap(user_message: str):
     """Fire-and-forget: detect knowledge gaps and learn in background."""
     try:
         await auto_research.detect_and_fill_knowledge_gap(user_message)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Knowledge gap detection error: {e}")
+
+
+_background_tasks: set = set()  # prevent GC of fire-and-forget tasks
+_MAX_BACKGROUND_TASKS = 500
+
+def _fire_and_forget(coro, name: str = "background"):
+    """Create a background task that logs exceptions instead of silently losing them."""
+    # Prune completed tasks to prevent unbounded growth
+    completed = [t for t in _background_tasks if t.done()]
+    for t in completed:
+        _background_tasks.discard(t)
+    if len(_background_tasks) >= _MAX_BACKGROUND_TASKS:
+        logger.warning(f"Background tasks at limit ({_MAX_BACKGROUND_TASKS}), dropping oldest")
+        _background_tasks.pop()
+
+    async def _wrapper():
+        try:
+            await coro
+        except Exception as e:
+            logger.warning(f"Background task '{name}' error: {e}")
+    task = asyncio.create_task(_wrapper())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 # ─── Claude CLI Runner ────────────────────────────────────────────────────────
@@ -440,9 +703,15 @@ async def _safe_knowledge_gap(user_message: str):
 async def _run_claude_cli(
     user_message: str, chat_id: int, context,
     timeout: int = None,
-) -> tuple[str, str | None]:
-    """Run claude CLI and return (response_text, session_id)."""
+) -> tuple[str, str | None, list, str]:
+    """Run claude CLI and return (response_text, session_id, matched_skill_ids, tool_output_text)."""
     global _rate_limited_until
+    _ERROR_PATTERNS = {
+        "credit": ["credit balance", "insufficient credit", "billing"],
+        "auth": ["not logged in", "not authenticated", "auth failed", "login required", "invalid x-api-key",
+                 "环境变量丢失", "环境变量", "api key 发给", "api_key", "请把你的"],
+        "rate": ["hit your limit", "rate limit", "rate_limit", "quota exceeded", "usage limit", "too many requests"],
+    }
     timeout = timeout or getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
     session_id = _claude_sessions.get(chat_id)
 
@@ -453,17 +722,21 @@ async def _run_claude_cli(
     import tempfile
     _mem_prompt_path = None
     _matched_skill_ids = []
+    _tool_output_text = ""
 
     # Find matching skills (always, not just new sessions)
     matched_skills = skill_library.find_matching_skills(user_message, max_results=2)
     _matched_skill_ids = [s["id"] for s in matched_skills]
 
     if not session_id:
-        mem_context = harness_learn.get_memory_context(max_chars=2000)
+        mem_context = harness_learn.get_memory_context(max_chars=1500)
         workflow = harness_learn.get_relevant_workflow(user_message)
     else:
         mem_context = None
         workflow = None
+
+    # Always inject user language profile (compact, ~200 chars)
+    user_lang = harness_learn.get_user_language_summary(max_chars=300)
 
     skills_text = skill_library.format_skills_for_prompt(matched_skills)
 
@@ -471,30 +744,82 @@ async def _run_claude_cli(
     # Background gap detection fires as non-blocking task
     knowledge_text = auto_research.get_relevant_knowledge(user_message, max_chars=600)
     if not knowledge_text:
-        asyncio.create_task(_safe_knowledge_gap(user_message))
+        _fire_and_forget(_safe_knowledge_gap(user_message), name="knowledge_gap")
 
-    if mem_context or workflow or skills_text or knowledge_text:
-        mem_text = _PROMPT_FILE.read_text(encoding="utf-8")
-        if mem_context:
-            mem_text += f"\n\n## 历史记忆\n{mem_context}\n"
-        if workflow:
-            mem_text += f"\n## 参考模板\n{workflow['task_type']} → {', '.join(workflow['steps'][:5])}\n"
-        if skills_text:
-            mem_text += skills_text
-        if knowledge_text:
-            mem_text += f"\n## 领域知识\n{knowledge_text}\n"
-        _mem_tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", encoding="utf-8", delete=False, dir=BOT_PROJECT_DIR,
-        )
-        _mem_tmp.write(mem_text)
-        _mem_tmp.close()
-        _mem_prompt_path = _mem_tmp.name
+    # Layer 6: RAG — retrieve similar past solutions
+    rag_text = ""
+    try:
+        from agents.rag import get_solution_store
+        solutions = get_solution_store().retrieve(user_message, top_k=2)
+        if solutions:
+            rag_text = get_solution_store().format_for_prompt(solutions, max_chars=400)
+    except Exception:
+        pass
+
+    # Layer 7: Reflexion — inject recent insights to avoid past mistakes
+    try:
+        from agents.reflexion import get_reflexion_engine
+        insights = get_reflexion_engine().get_all_insights(n=3)
+        if insights:
+            rag_text += "\n## 经验教训\n" + "\n".join(f"- {i}" for i in insights[-3:]) + "\n"
+    except Exception:
+        pass
+
+    try:
+        if mem_context or workflow or skills_text or knowledge_text or user_lang or rag_text:
+            mem_text = _PROMPT_FILE.read_text(encoding="utf-8")
+            if user_lang:
+                mem_text += f"\n\n## 用户画像\n{user_lang}\n"
+            if mem_context:
+                mem_text += f"\n## 历史记忆\n{mem_context}\n"
+            if workflow:
+                mem_text += f"\n## 参考模板\n{workflow['task_type']} → {', '.join(workflow['steps'][:5])}\n"
+            if skills_text:
+                mem_text += skills_text
+            if knowledge_text:
+                mem_text += f"\n## 领域知识\n{knowledge_text}\n"
+            if rag_text:
+                mem_text += f"\n{rag_text}\n"
+            _mem_tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", encoding="utf-8", delete=False, dir=BOT_PROJECT_DIR,
+            )
+            _mem_prompt_path = _mem_tmp.name
+            try:
+                _mem_tmp.write(mem_text)
+            finally:
+                _mem_tmp.close()
+    except OSError as e:
+        logger.warning(f"Failed to write temp prompt file (disk full?): {e}")
+        # Continue without enriched prompt — better than crashing
 
     prompt_file = _mem_prompt_path or str(_PROMPT_FILE)
 
+    # For long messages (>8000 chars), write to a temp file to avoid Windows
+    # command-line length limits (cmd.exe has ~32k limit, but encoding issues
+    # can cause problems well before that)
+    _msg_file_path = None
+    if len(user_message) > 8000:
+        try:
+            _msg_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", encoding="utf-8", delete=False, dir=BOT_PROJECT_DIR,
+            )
+            _msg_file_path = _msg_file.name
+            try:
+                _msg_file.write(user_message)
+            finally:
+                _msg_file.close()
+            # Use a short prompt that references the file
+            cli_prompt = f"Read and respond to the user's message in this file: {_msg_file_path}"
+        except OSError as e:
+            logger.warning(f"Failed to write long message to file: {e}")
+            # Truncate and pass directly as fallback
+            cli_prompt = user_message[:8000] + "\n\n...(消息过长，已截断)"
+    else:
+        cli_prompt = user_message
+
     args = [
         CLAUDE_CMD,
-        "-p", user_message,
+        "-p", cli_prompt,
         "--output-format", "json",
         "--dangerously-skip-permissions",
         "--model", model,
@@ -502,20 +827,24 @@ async def _run_claude_cli(
     ]
     if session_id:
         args.extend(["--resume", session_id])
-        logger.info(f"Chat {chat_id}: resuming session {session_id[:12]}... (model: {model})")
+        # Resumed sessions: use --bare to skip hooks/LSP/auto-memory overhead (~14% faster)
+        args.append("--bare")
+        logger.info(f"Chat {chat_id}: resuming session {session_id[:12]}... (model: {model}, bare)")
     else:
         logger.info(f"Chat {chat_id}: new session (model: {model})")
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_keep_typing(chat_id, context, stop_typing))
     proc = None
+    stdout_data = b""
+    stderr_data = b""
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=USER_HOME,
+            cwd=BOT_PROJECT_DIR,  # CRITICAL: set to bot dir so Claude can find pc_control.py, tg_direct.py, etc.
             env=_clean_env(),
         )
 
@@ -546,11 +875,16 @@ async def _run_claude_cli(
                 os.unlink(_mem_prompt_path)
             except Exception:
                 pass
+        if _msg_file_path:
+            try:
+                os.unlink(_msg_file_path)
+            except Exception:
+                pass
 
     if proc and proc.returncode != 0:
         logger.warning(f"Claude CLI exited with code {proc.returncode}")
 
-    # Parse JSON response
+    # Parse JSON response — extract full conversation including tool outputs
     raw = stdout_data.decode("utf-8", errors="replace").strip()
     new_session_id = None
     response = None
@@ -558,8 +892,63 @@ async def _run_claude_cli(
     if raw:
         try:
             data = json.loads(raw)
-            response = data.get("result", "").strip()
             new_session_id = data.get("session_id")
+
+            # Primary: get the "result" field (final assistant text)
+            response = data.get("result", "").strip()
+
+            # Enhanced: also extract tool use summaries from conversation turns
+            # Claude CLI --output-format json may include conversation messages
+            tool_summaries = []
+            _all_tool_output_parts = []  # Collect ALL tool output for media path scanning
+            messages = data.get("messages", [])
+            if not messages and isinstance(data.get("content"), list):
+                # Some CLI versions put content blocks at top level
+                messages = [{"role": "assistant", "content": data["content"]}]
+
+            for msg in messages:
+                role = msg.get("role")
+                content = msg.get("content", [])
+                if isinstance(content, str):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    # Tool use blocks (in assistant messages) — record what tools were called
+                    if role == "assistant" and block_type == "tool_use":
+                        tool_name = block.get("name", "unknown")
+                        tool_input = block.get("input", {})
+                        if tool_name == "Bash" or tool_name == "bash":
+                            cmd = tool_input.get("command", "")
+                            if cmd:
+                                tool_summaries.append(f"[Ran: {cmd[:120]}]")
+                        elif tool_name in ("Edit", "Write", "Read"):
+                            path = tool_input.get("file_path", "")
+                            tool_summaries.append(f"[{tool_name}: {path}]")
+                    # Tool result blocks (in user messages) — collect outputs
+                    elif block_type == "tool_result":
+                        content_val = block.get("content", "")
+                        if isinstance(content_val, list):
+                            # Content can be a list of {type: "text", text: "..."} blocks
+                            content_val = "\n".join(
+                                b.get("text", "") for b in content_val
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                        if isinstance(content_val, str) and content_val.strip():
+                            # Collect all tool output for media scanning
+                            _all_tool_output_parts.append(content_val.strip())
+                            # Keep short tool results (errors, confirmations)
+                            if len(content_val) < 500:
+                                tool_summaries.append(content_val.strip())
+
+            # Store tool output for media extraction by _send_extracted_media
+            _tool_output_text = "\n".join(_all_tool_output_parts)
+
+            # If we have tool summaries but no text response, build one
+            if tool_summaries and not response:
+                response = "\n".join(tool_summaries[:10])
+                logger.info(f"Chat {chat_id}: built response from {len(tool_summaries)} tool outputs")
 
             if not response:
                 if data.get("is_error"):
@@ -567,9 +956,11 @@ async def _run_claude_cli(
                 elif new_session_id:
                     # Claude did tool use but gave no text response — ask for summary
                     logger.info(f"Chat {chat_id}: empty result, requesting follow-up summary")
+                    fu_proc = None
                     try:
                         followup_args = [
-                            CLAUDE_CMD, "-p", "请用中文简要总结你刚才做了什么。",
+                            CLAUDE_CMD, "-p",
+                            "Summarize what you just did in 2-3 sentences. Reply in the user's language.",
                             "--output-format", "json",
                             "--dangerously-skip-permissions",
                             "--model", model,
@@ -579,42 +970,47 @@ async def _run_claude_cli(
                             *followup_args,
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
-                            cwd=USER_HOME,
+                            cwd=BOT_PROJECT_DIR,
+                            env=_clean_env(),
                         )
-                        fu_out, _ = await asyncio.wait_for(fu_proc.communicate(), timeout=30)
+                        fu_out, _ = await asyncio.wait_for(fu_proc.communicate(), timeout=60)
                         fu_raw = fu_out.decode("utf-8", errors="replace").strip()
                         fu_data = json.loads(fu_raw)
                         fu_text = fu_data.get("result", "").strip()
                         if fu_text:
                             response = fu_text
+                            # Update session from follow-up
+                            fu_sid = fu_data.get("session_id")
+                            if fu_sid:
+                                new_session_id = fu_sid
+                    except asyncio.TimeoutError:
+                        logger.debug("Follow-up summary timed out")
+                        await _kill_process_tree(fu_proc)
                     except Exception as e:
                         logger.debug(f"Follow-up summary failed: {e}")
+                        if fu_proc and fu_proc.returncode is None:
+                            await _kill_process_tree(fu_proc)
                 if not response:
-                    response = "✅ 任务已执行（无文字输出）。"
+                    response = "Done (no text output from tool execution)."
 
-            # Auth detection — CLI not logged in
+            # Auth detection — CLI not logged in → signal caller to retry
             if response:
                 resp_lower = response.lower()
                 if any(p in resp_lower for p in _ERROR_PATTERNS["auth"]):
                     logger.error(f"Claude CLI auth error: {response[:200]}")
-                    response = (
-                        "❌ Claude CLI 未登录！\n\n"
-                        "请在电脑上打开 PowerShell 运行：\n"
-                        "  claude /login\n\n"
-                        "选择 1 (Claude subscription)，完成浏览器登录后重启 bot。"
-                    )
+                    _claude_sessions.pop(chat_id, None)
+                    _session_timestamps.pop(chat_id, None)
+                    _save_sessions()
+                    response = "__AUTH_ERROR__"
                     new_session_id = None
-                # Credit/billing detection
-                elif any(p in resp_lower for p in _ERROR_PATTERNS["credit"]):
+                # Credit/billing detection — ONLY if response is VERY short (real error, not conversation)
+                elif len(response) < 300 and any(p in resp_lower for p in _ERROR_PATTERNS["credit"]):
                     logger.error(f"Claude CLI credit error: {response[:200]}")
                     response = "❌ Claude API 额度不足或账单问题。请检查你的 Anthropic 账户。"
                     new_session_id = None
-                # Rate limit detection — don't store poisoned session
-                elif any(p in resp_lower for p in _ERROR_PATTERNS["rate"]):
-                    _rate_limited_until = time.time() + 300  # 5 min cooldown
-                    logger.warning(f"Claude CLI rate limited: {response[:200]}")
-                    response = "⏳ Claude 达到速率限制。请稍等几分钟后再试。"
-                    new_session_id = None
+                # Rate limit detection — ONLY from stderr (see below), NEVER from response content.
+                # Claude's normal responses may mention "rate limit" in conversation.
+                # This block intentionally removed to prevent false positives.
 
         except json.JSONDecodeError:
             # CLI may output warnings before JSON — search from the end
@@ -644,11 +1040,6 @@ async def _run_claude_cli(
                 response = raw
 
     # ── Check stderr for critical errors BEFORE falling back ──
-    _ERROR_PATTERNS = {
-        "credit": ["credit balance", "insufficient credit", "billing"],
-        "auth": ["not logged in", "not authenticated", "auth failed", "login required", "invalid x-api-key"],
-        "rate": ["hit your limit", "rate limit", "rate_limit", "quota exceeded", "usage limit", "too many requests"],
-    }
     if stderr_data:
         err_text = stderr_data.decode("utf-8", errors="replace").strip()
         if err_text:
@@ -659,18 +1050,43 @@ async def _run_claude_cli(
                 logger.error(f"Claude CLI credit error detected in stderr: {err_text[:300]}")
                 response = "❌ Claude API 额度不足或账单问题。请检查你的 Anthropic 账户。"
                 new_session_id = None
-            # Check for auth errors
+            # Check for auth errors — signal caller to retry (token may auto-refresh)
             elif any(p in err_lower for p in _ERROR_PATTERNS["auth"]):
                 logger.error(f"Claude CLI auth error in stderr: {err_text[:300]}")
-                response = "❌ Claude CLI 认证失败。请运行 `claude /login` 重新登录。"
+                _claude_sessions.pop(chat_id, None)
+                _session_timestamps.pop(chat_id, None)
+                _save_sessions()
+                response = "__AUTH_ERROR__"
                 new_session_id = None
-            # Check for rate limit errors
+            # Check for stale session ID — clear it so next call starts fresh
+            elif "no conversation found" in err_lower or ("session" in err_lower and "not found" in err_lower):
+                logger.warning(f"Chat {chat_id}: stale session detected in stderr, clearing")
+                _claude_sessions.pop(chat_id, None)
+                _session_timestamps.pop(chat_id, None)
+                _save_sessions()
+                # Signal caller to retry by returning a sentinel response
+                response = "__STALE_SESSION__"
+                new_session_id = None
+            # Check for rate limit errors (stderr is reliable — this is a real error from CLI)
             elif any(p in err_lower for p in _ERROR_PATTERNS["rate"]):
-                global _rate_limited_until
-                _rate_limited_until = time.time() + 300
-                logger.warning(f"Claude CLI rate limited (stderr): {err_text[:300]}")
-                response = "⏳ Claude 达到速率限制。请稍等几分钟后再试。"
+                global _rate_limit_consecutive
+                # Parse reset time from error message if available
+                import re as _rl_re
+                reset_match = _rl_re.search(r'(\d+)\s*(second|minute|sec|min|s\b|m\b)', err_lower)
+                parsed_val = None
+                if reset_match:
+                    val = int(reset_match.group(1))
+                    unit = reset_match.group(2)
+                    parsed_val = val * 60 if unit.startswith('min') or unit == 'm' else val
+                # Exponential backoff: 60s → 120s → 300s on consecutive rate limits
+                cooldown = _get_rate_limit_cooldown(parsed_val)
+                _rate_limit_consecutive += 1
+                _rate_limited_until = time.time() + cooldown
+                logger.warning(f"Claude CLI rate limited (stderr): cooldown={cooldown}s, consecutive={_rate_limit_consecutive}, msg={err_text[:300]}")
+                response = f"⏳ 遇到限速，等待{cooldown}s后继续..."
                 new_session_id = None
+                # Schedule auto-resume task
+                _schedule_rate_limit_resume(cooldown)
 
     if not response:
         err = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else ""
@@ -683,22 +1099,64 @@ async def _run_claude_cli(
         else:
             response = "✅ 任务已执行（无输出）。"
 
-    return response, new_session_id
+    return response, new_session_id, _matched_skill_ids, _tool_output_text
 
 
 # ─── Response Sender ──────────────────────────────────────────────────────────
+
+# Patterns that should NEVER appear in outgoing messages (security)
+import re as _re_mod
+_DANGEROUS_OUTPUT_PATTERNS = [
+    _re_mod.compile(r'sk-ant-[a-zA-Z0-9\-_]{20,}', _re_mod.IGNORECASE),  # Anthropic API keys
+    _re_mod.compile(r'sk-[a-zA-Z0-9]{20,}'),  # OpenAI API keys
+    _re_mod.compile(r'AIza[a-zA-Z0-9\-_]{30,}'),  # Google API keys
+    _re_mod.compile(r'\b\d{9,10}:AA[A-Za-z0-9\-_]{30,}'),  # Telegram bot tokens
+]
+_SECRET_REQUEST_PATTERNS = _re_mod.compile(
+    r'(api.?key|密钥|token|secret|password|credential|ANTHROPIC_API_KEY|OPENAI_API_KEY|环境变量丢失).*'
+    r'(发给|send|provide|share|paste|输入|告诉|give|设置|重启|重新)',
+    _re_mod.IGNORECASE | _re_mod.DOTALL,
+)
+# Secondary pattern: any message mentioning API key setup instructions
+_API_KEY_INSTRUCTION_PATTERN = _re_mod.compile(
+    r'(sk-ant-|ANTHROPIC_API_KEY|OPENAI_API_KEY|环境变量丢失|API Key 发给|把.*api.?key)',
+    _re_mod.IGNORECASE,
+)
+
+
+def _sanitize_response(response: str) -> str:
+    """Remove or redact sensitive content from outgoing messages."""
+    # Redact actual API keys/tokens that might appear in output
+    for pattern in _DANGEROUS_OUTPUT_PATTERNS:
+        response = pattern.sub('[REDACTED]', response)
+
+    # If Claude's response asks user to send API keys — replace with self-heal message
+    if _SECRET_REQUEST_PATTERNS.search(response) or _API_KEY_INSTRUCTION_PATTERN.search(response):
+        return (
+            "⚠️ 检测到配置问题。Bot正在自动修复，无需手动操作。\n"
+            "如果问题持续，请用 /status 查看状态。"
+        )
+
+    return response
+
 
 async def _send_response(chat_id: int, response: str, context):
     """Send response to Telegram, splitting into chunks if needed."""
     if not response or not response.strip():
         return
 
+    # Security: sanitize outgoing messages
+    response = _sanitize_response(response)
+
     MAX_TOTAL = 16000
     if len(response) > MAX_TOTAL:
         response = response[:MAX_TOTAL] + "\n\n... (输出过长，已截断。需要完整内容请说。)"
 
     remaining = response
-    while remaining:
+    _max_chunks = 20  # Safety limit to prevent infinite loop
+    _chunk_count = 0
+    while remaining and _chunk_count < _max_chunks:
+        _chunk_count += 1
         if len(remaining) <= 4000:
             chunk = remaining
             remaining = ""
@@ -707,7 +1165,11 @@ async def _send_response(chat_id: int, response: str, context):
             if break_pos == -1:
                 break_pos = 4000
             chunk = remaining[:break_pos]
-            remaining = remaining[break_pos:]
+            remaining = remaining[break_pos:].lstrip("\n")
+
+        # Skip empty chunks to prevent sending empty messages / infinite loops
+        if not chunk or not chunk.strip():
+            continue
 
         try:
             await context.bot.send_message(
@@ -731,10 +1193,20 @@ def _drain_pending(chat_id: int) -> list[dict]:
     return fresh
 
 
+_MAX_PENDING_QUEUE_SIZE = 20  # Max queued messages per chat to prevent memory bloat
+
+
 def _queue_message(chat_id: int, text: str):
-    _pending_messages.setdefault(chat_id, []).append({
+    queue = _pending_messages.setdefault(chat_id, [])
+    # Prune stale messages before adding
+    now = time.time()
+    queue[:] = [m for m in queue if now - m["time"] < _MAX_PENDING_AGE]
+    if len(queue) >= _MAX_PENDING_QUEUE_SIZE:
+        queue.pop(0)
+        logger.warning(f"Chat {chat_id}: queue full ({_MAX_PENDING_QUEUE_SIZE}), dropped oldest")
+    queue.append({
         "text": text,
-        "time": time.time(),
+        "time": now,
     })
 
 
@@ -752,15 +1224,15 @@ async def _self_heal(user_message: str, chat_id: int, context, error: Exception)
     if "session" in err_str or "resume" in err_str or "invalid" in err_str:
         logger.info("Self-heal: clearing corrupted session")
         _claude_sessions.pop(chat_id, None)
+        _session_timestamps.pop(chat_id, None)
         _save_sessions()
         await _send_response(chat_id, "🔧 会话异常，已重置。重新处理...", context)
         try:
-            response, sid = await _run_claude_cli(user_message, chat_id, context)
+            response, sid, _, _ = await _run_claude_cli(user_message, chat_id, context)
             if sid:
-                _claude_sessions[chat_id] = sid
+                _set_session(chat_id, sid)
                 _save_sessions()
             await _send_response(chat_id, response, context)
-            await _forward_new_screenshots(chat_id, context)
             return True
         except Exception as e2:
             logger.error(f"Self-heal retry failed: {e2}")
@@ -779,13 +1251,14 @@ async def _self_heal(user_message: str, chat_id: int, context, error: Exception)
             msg_tmp.close()
             session_id = _claude_sessions.get(chat_id)
             model = _pick_model(user_message)
+            # Pass user message via -p referencing the temp file; keep real system prompt
             args = [
                 CLAUDE_CMD,
-                "-p", ".",
+                "-p", f"Read and respond to the user's message in this file: {msg_tmp.name}",
                 "--output-format", "json",
                 "--dangerously-skip-permissions",
                 "--model", model,
-                "--append-system-prompt-file", msg_tmp.name,
+                "--append-system-prompt-file", str(_PROMPT_FILE),
             ]
             if session_id:
                 args.extend(["--resume", session_id])
@@ -793,9 +1266,14 @@ async def _self_heal(user_message: str, chat_id: int, context, error: Exception)
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=USER_HOME,
+                cwd=BOT_PROJECT_DIR,
+                env=_clean_env(),
             )
-            stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            try:
+                stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            except asyncio.TimeoutError:
+                await _kill_process_tree(proc)
+                return False
             raw = stdout_data.decode("utf-8", errors="replace").strip()
             response = raw
             sid = None
@@ -807,7 +1285,7 @@ async def _self_heal(user_message: str, chat_id: int, context, error: Exception)
                 except json.JSONDecodeError:
                     pass
             if sid:
-                _claude_sessions[chat_id] = sid
+                _set_session(chat_id, sid)
                 _save_sessions()
             await _send_response(chat_id, response, context)
             return True
@@ -848,6 +1326,7 @@ async def _self_heal(user_message: str, chat_id: int, context, error: Exception)
 
             if action == "clear_session":
                 _claude_sessions.pop(chat_id, None)
+                _session_timestamps.pop(chat_id, None)
                 _save_sessions()
 
             await _send_response(
@@ -858,12 +1337,11 @@ async def _self_heal(user_message: str, chat_id: int, context, error: Exception)
 
             # Retry
             try:
-                response, sid = await _run_claude_cli(user_message, chat_id, context)
+                response, sid, _, _ = await _run_claude_cli(user_message, chat_id, context)
                 if sid:
-                    _claude_sessions[chat_id] = sid
+                    _set_session(chat_id, sid)
                     _save_sessions()
                 await _send_response(chat_id, response, context)
-                await _forward_new_screenshots(chat_id, context)
 
                 # Log successful self-heal + feed back to learning system
                 _log_self_heal(str(error), diagnosis, success=True)
@@ -912,8 +1390,11 @@ def _parse_diagnosis(raw: str) -> dict:
     return {"diagnosis": raw[:200], "can_retry": True, "retry_action": "clear_session", "fix": "重试"}
 
 
+_MAX_SELF_HEAL_LOG_SIZE = 1 * 1024 * 1024  # 1 MB max
+
+
 def _log_self_heal(error: str, diagnosis: dict, success: bool):
-    """Log self-healing attempt to memory."""
+    """Log self-healing attempt to memory. Auto-truncates when file exceeds 1 MB."""
     try:
         entry = {
             "timestamp": datetime.now().isoformat(),
@@ -923,6 +1404,15 @@ def _log_self_heal(error: str, diagnosis: dict, success: bool):
             "success": success,
         }
         heal_log = os.path.join(BOT_PROJECT_DIR, ".self_heal.jsonl")
+        # Truncate if file is too large
+        try:
+            if os.path.exists(heal_log) and os.path.getsize(heal_log) > _MAX_SELF_HEAL_LOG_SIZE:
+                with open(heal_log, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                with open(heal_log, "w", encoding="utf-8") as f:
+                    f.writelines(lines[len(lines) // 2:])
+        except Exception:
+            pass
         with open(heal_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
@@ -933,30 +1423,87 @@ def _log_self_heal(error: str, diagnosis: dict, success: bool):
 
 async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> bool:
     """Process message using Claude Code CLI. Returns True on success."""
+    # Check rate limit before calling CLI — silently wait with exponential backoff
+    # User preference: don't crash, don't report errors, wait transparently
+    if is_rate_limited():
+        wait_s = max(1, int(_rate_limited_until - time.time()) + 1)
+        logger.info(f"Chat {chat_id}: CLI rate limited, waiting {wait_s}s silently")
+        # Show brief transparent wait message (not an error — user stays informed)
+        await _send_response(chat_id, f"⏳ 等待{wait_s}s后继续...", context)
+        # Actually wait for the rate limit to expire, then process normally
+        await asyncio.sleep(min(wait_s, 300))  # Cap at 5 minutes
+        # After waiting, fall through to normal processing below
+
     try:
         _start_time = time.time()
-        response, new_session_id = await _run_claude_cli(user_message, chat_id, context)
+        response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
 
         # Session recovery: if response indicates session error, retry without resume
         resp_lower = response.lower() if response else ""
-        if response and (
+        _stale = response == "__STALE_SESSION__"
+        if _stale or (response and (
             ("session" in resp_lower and "error" in resp_lower)
             or "invalid session" in resp_lower
             or ("could not find" in resp_lower and "session" in resp_lower)
-        ):
-            logger.warning(f"Chat {chat_id}: session error detected, starting fresh")
+            or "no conversation found" in resp_lower
+        )):
+            logger.warning(f"Chat {chat_id}: stale/invalid session, retrying fresh")
             _claude_sessions.pop(chat_id, None)
-            response, new_session_id = await _run_claude_cli(user_message, chat_id, context)
+            _session_timestamps.pop(chat_id, None)
+            _save_sessions()
+            response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
+
+        # Auth error: session already cleared in _run_claude_cli, retry fresh immediately
+        if response == "__AUTH_ERROR__":
+            logger.warning(f"Chat {chat_id}: CLI auth error, retrying fresh (no resume)")
+            response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
+            if response == "__AUTH_ERROR__":
+                logger.error(f"Chat {chat_id}: CLI auth error persists after retry")
+                _self_monitor.record_service_failure("cli", "auth_error")
+                await _send_response(
+                    chat_id,
+                    "⚠️ CLI 认证过期。请在电脑上运行 claude login 重新登录。",
+                    context,
+                )
+                return True  # We responded — do NOT trigger fallback chain
+
+        # Detect raw auth/config errors that slipped through — safety net
+        if response and any(p in response.lower() for p in
+                           ["cli 未登录", "环境变量丢失", "api key", "not logged in", "auth failed",
+                            "anthropic_api_key", "api_key", "密钥", "credential"]):
+            logger.warning(f"Chat {chat_id}: CLI auth/config error detected, sending safe message")
+            _self_monitor.record_service_failure("cli", "auth_error")
+            await _send_response(
+                chat_id,
+                "⚠️ CLI 配置问题，正在自动修复中。请稍后重试。",
+                context,
+            )
+            return True  # We responded — do NOT trigger fallback chain
 
         if new_session_id:
-            _claude_sessions[chat_id] = new_session_id
+            _set_session(chat_id, new_session_id)
             _save_sessions()
             logger.info(f"Chat {chat_id}: session_id = {new_session_id[:12]}...")
         else:
+            # Even without a new session_id, refresh timestamp to prevent
+            # premature cleanup of actively-used sessions
+            if chat_id in _session_timestamps:
+                _session_timestamps[chat_id] = time.time()
             logger.debug(f"Chat {chat_id}: no session_id returned")
 
         await _send_response(chat_id, response, context)
-        await _forward_new_screenshots(chat_id, context)
+        _wants_screenshot = any(k in user_message.lower() for k in
+                                ["screenshot", "截图", "截屏", "屏幕", "看看屏幕", "screen"])
+        await _forward_new_screenshots(chat_id, context, user_requested=_wants_screenshot)
+        # Scan both the text response and raw tool outputs for media file paths
+        _media_scan_text = response + "\n" + tool_output_text
+        await _send_extracted_media(chat_id, context, _media_scan_text)
+
+        # Record CLI success for service health tracking
+        _self_monitor.record_service_success("cli")
+        # Reset rate limit consecutive counter on success
+        global _rate_limit_consecutive
+        _rate_limit_consecutive = 0
 
         # ── Harness Learning Loop ──
         try:
@@ -972,16 +1519,18 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
             logger.info(f"Chat {chat_id}: score={score['overall']:.2f} flags={score['flags']}")
 
             # ── Skill Library: extract new skills + update reused ones ──
-            asyncio.create_task(
-                _skill_post_process(user_message, response, score, _matched_skill_ids)
+            _fire_and_forget(
+                _skill_post_process(user_message, response, score, matched_skill_ids),
+                name="skill_post_process",
             )
 
             # ── Auto-evolution check: should we train? ──
             train_decision = harness_learn.should_auto_train()
             if train_decision:
                 logger.info(f"Auto-evolution triggered: {train_decision}")
-                asyncio.create_task(
-                    _auto_evolve(chat_id, context, train_decision)
+                _fire_and_forget(
+                    _auto_evolve(chat_id, context, train_decision),
+                    name="auto_evolve",
                 )
         except Exception as e:
             logger.debug(f"Harness scoring error: {e}")
@@ -996,12 +1545,12 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
             await _send_response(chat_id, f"📨 处理你追加的 {count} 条消息...", context)
 
             try:
-                followup_resp, followup_sid = await _run_claude_cli(combined, chat_id, context)
+                followup_resp, followup_sid, _, fu_tool_output = await _run_claude_cli(combined, chat_id, context)
                 if followup_sid:
-                    _claude_sessions[chat_id] = followup_sid
+                    _set_session(chat_id, followup_sid)
                     _save_sessions()
                 await _send_response(chat_id, followup_resp, context)
-                await _forward_new_screenshots(chat_id, context)
+                await _send_extracted_media(chat_id, context, followup_resp + "\n" + fu_tool_output)
             except asyncio.TimeoutError:
                 await _send_response(chat_id, "⏰ 追加任务超时(5分钟)。发新消息继续。", context)
                 break
@@ -1015,17 +1564,20 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         return True
 
     except asyncio.TimeoutError:
+        _self_monitor.record_service_failure("cli", "timeout")
         # Self-heal: clear session and notify
         _claude_sessions.pop(chat_id, None)
+        _session_timestamps.pop(chat_id, None)
         _save_sessions()
         await _send_response(
             chat_id,
-            "⏰ 超时。已清除会话，发新消息重试。",
+            "⏰ 超时。已清除会话，正在尝试备用方案...",
             context,
         )
-        return True
+        return False  # Let fallback chain (API, web AI) handle it
 
     except FileNotFoundError:
+        _self_monitor.record_service_failure("cli", "not_found")
         await _send_response(
             chat_id,
             "❌ Claude CLI 未找到。请运行: npm install -g @anthropic-ai/claude-code",
@@ -1034,6 +1586,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         return False
 
     except Exception as e:
+        _self_monitor.record_service_failure("cli", str(e)[:200])
         logger.error(f"Claude CLI error: {e}", exc_info=True)
         # ── Self-Healing: attempt auto-recovery ──
         healed = await _self_heal(user_message, chat_id, context, e)
@@ -1042,9 +1595,68 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         return healed
 
 
-async def process_message(user_message: str, chat_id: int, context, **kwargs):
-    """Process a user message — all messages go through dispatcher first."""
+async def _fallback_to_api_providers(user_message: str, chat_id: int, context) -> bool:
+    """Fallback: DISABLED — API providers cost money, user explicitly opted out.
+    Always returns False so the chain moves to free web AI."""
+    logger.info(f"Chat {chat_id}: API fallback DISABLED (user preference: no paid API)")
+    return False
+
+
+async def _fallback_to_web_ai(user_message: str, chat_id: int, context) -> bool:
+    """Fallback: try free web AI when both CLI and API fail."""
+    try:
+        from web_ai import query_web_ai
+        logger.info(f"Chat {chat_id}: API fallback failed, trying web AI directly")
+        response, platform = await query_web_ai(user_message)
+        if response:
+            _self_monitor.record_service_success("webai")
+            await _send_response(chat_id, f"[{platform}] {response}", context)
+            return True
+        _self_monitor.record_service_failure("webai", "empty response")
+        return False
+    except Exception as e:
+        _self_monitor.record_service_failure("webai", str(e)[:200])
+        logger.error(f"Web AI fallback failed: {e}")
+        return False
+
+
+async def _fallback_cached_or_template(user_message: str, chat_id: int, context) -> bool:
+    """Last resort: try cached pattern commands, then send template response. NEVER silence."""
+    try:
+        from providers import _execute_cached_command
+        cached_ok = await _execute_cached_command(user_message, chat_id, context)
+        if cached_ok:
+            return True
+    except Exception:
+        pass
+
+    # Absolute last resort — template response
+    retry_secs = getattr(config, "AUTO_RETRY_SECONDS", 60)
+    await _send_response(
+        chat_id,
+        (
+            f"All AI services are temporarily busy. I'll retry in {retry_secs}s.\n"
+            "In the meantime, you can use:\n"
+            "  /panel -- Quick actions\n"
+            "  /screenshot -- Take screenshot\n"
+            "  /status -- Check bot status\n"
+            "  /clear -- Reset conversation"
+        ),
+        context,
+    )
+    return True  # We responded — bot stays alive
+
+
+async def process_message(user_message: str, chat_id: int, context, **kwargs) -> bool:
+    """Process a user message — Never-Die fallback chain.
+
+    Chain: Claude CLI -> API providers -> Web AI -> Cached/Template
+    The bot should NEVER be silent.
+
+    Returns True if the message was actually processed, False if only queued.
+    """
     auto_research.mark_user_active()  # Reset idle timer for auto-experiment
+    _periodic_state_cleanup()  # Prune stale sessions/locks (rate-limited to once/hour)
     lock = _get_lock(chat_id)
 
     if lock.locked():
@@ -1054,18 +1666,57 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs):
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"📝 收到 (第{queue_size}条追加)，处理完当前任务后会一起看。",
+                text=f"Queued (#{queue_size}). Will process after current task.",
             )
         except Exception:
             pass
-        return
+        return False  # Message was queued, NOT processed
 
     async with lock:
-        # Primary path: Claude CLI with session persistence (has context memory)
-        # Pipeline is available but CLI+session is better for conversational tasks
+        # Route: named session for specific projects (e.g. "crypto" → crypto session)
+        session_name = _try_session_route(user_message, chat_id)
+        if session_name:
+            try:
+                logger.info(f"Chat {chat_id}: routing to session '{session_name}'")
+                result = await _session_mgr.send(session_name, user_message, timeout=300)
+                await _send_response(chat_id, result, context)
+                return True
+            except Exception as e:
+                logger.warning(f"Chat {chat_id}: session '{session_name}' failed ({e}), falling back")
+
+        # Route: complex multi-step tasks → pipeline, simple → direct CLI
+        if _should_use_pipeline(user_message, chat_id):
+            try:
+                logger.info(f"Chat {chat_id}: routing to multi-agent pipeline")
+                await _process_with_pipeline(user_message, chat_id, context)
+                return True
+            except Exception as e:
+                logger.warning(f"Chat {chat_id}: pipeline failed ({e}), falling back to CLI")
+
+        # Primary path: Claude CLI with session persistence
         success = await _process_with_claude_cli(user_message, chat_id, context)
-        if not success:
-            await _send_response(chat_id, "⚠️ CLI 失败，请重试。", context)
+        if success:
+            return True
+
+        # ── Never-Die Fallback Chain ──
+        never_die = getattr(config, "NEVER_DIE_MODE", True)
+        if not never_die:
+            await _send_response(chat_id, "CLI failed. Please retry.", context)
+            return True  # We responded, even if with error
+
+        logger.warning(f"Chat {chat_id}: CLI failed, entering never-die fallback chain")
+
+        # Step 2: API providers (DISABLED — user opted out, too expensive)
+        # _fallback_to_api_providers always returns False now
+
+        # Step 3: Try free web AI (ChatGPT/Claude.ai/Gemini web)
+        web_ok = await _fallback_to_web_ai(user_message, chat_id, context)
+        if web_ok:
+            return True
+
+        # Step 4: Cached commands or template (NEVER silence)
+        await _fallback_cached_or_template(user_message, chat_id, context)
+        return True
 
 
 async def _skill_post_process(user_message: str, response: str, score: dict, matched_ids: list):
@@ -1167,9 +1818,27 @@ async def _run_claude_cli_direct(
     timeout: int = 120,
 ) -> tuple[str, str | None]:
     """Lightweight CLI call for training/internal use. No chat_id, no typing indicator."""
+    import tempfile as _tmpmod
+
+    cli_prompt = f"[Training task] {prompt}"
+    _direct_msg_file = None
+
+    # For long prompts, write to temp file to avoid Windows CLI limits
+    if len(cli_prompt) > 8000:
+        try:
+            _dtmp = _tmpmod.NamedTemporaryFile(
+                mode="w", suffix=".txt", encoding="utf-8", delete=False, dir=BOT_PROJECT_DIR,
+            )
+            _dtmp.write(cli_prompt)
+            _dtmp.close()
+            _direct_msg_file = _dtmp.name
+            cli_prompt = f"Read and follow the training task in this file: {_direct_msg_file}"
+        except OSError:
+            cli_prompt = cli_prompt[:8000]
+
     args = [
         CLAUDE_CMD,
-        "-p", f"[Training task] {prompt}",
+        "-p", cli_prompt,
         "--output-format", "json",
         "--dangerously-skip-permissions",
         "--model", model,
@@ -1180,7 +1849,8 @@ async def _run_claude_cli_direct(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=USER_HOME,
+        cwd=BOT_PROJECT_DIR,
+        env=_clean_env(),
     )
 
     try:
@@ -1190,6 +1860,12 @@ async def _run_claude_cli_direct(
     except asyncio.TimeoutError:
         await _kill_process_tree(proc)
         return "Timed out", None
+    finally:
+        if _direct_msg_file:
+            try:
+                os.unlink(_direct_msg_file)
+            except Exception:
+                pass
 
     raw = stdout_data.decode("utf-8", errors="replace").strip()
     if not raw:
@@ -1235,7 +1911,7 @@ async def _run_claude_raw(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=USER_HOME,
+            cwd=BOT_PROJECT_DIR,
             env=_clean_env(),
         )
 
@@ -1287,5 +1963,27 @@ async def _forward_new_screenshots_direct(send_photo):
 def clear_history(chat_id: int):
     """Clear all state for a chat."""
     _claude_sessions.pop(chat_id, None)
+    _session_timestamps.pop(chat_id, None)
     _save_sessions()
     _pending_messages.pop(chat_id, None)
+    _processing_locks.pop(chat_id, None)
+
+
+# ─── Public SessionManager API ───────────────────────────────────────────────
+
+def get_session_manager():
+    """Get the global SessionManager instance (or None if unavailable)."""
+    return _session_mgr
+
+
+def create_project_session(name: str, project_dir: str, model: str = "claude-sonnet-4-6"):
+    """Create a named project session for auto-routing.
+
+    Example:
+        create_project_session("crypto", "C:/Users/alexl/Desktop/crypto-analysis-")
+        # Now messages mentioning "crypto" will route to that session automatically.
+    """
+    if not _session_mgr:
+        logger.warning("SessionManager not available")
+        return None
+    return _session_mgr.create(name, project_dir, model)

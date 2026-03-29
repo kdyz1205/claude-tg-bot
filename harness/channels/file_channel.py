@@ -61,8 +61,19 @@ class FileChannel:
             return None
 
         # Read and remove the oldest
-        handoff = Handoff.load(files[0])
-        files[0].unlink()
+        try:
+            handoff = Handoff.load(files[0])
+        except Exception:
+            # Move corrupted file aside so it doesn't block the queue
+            try:
+                files[0].rename(files[0].with_suffix(".json.bad"))
+            except Exception:
+                pass
+            return None
+        try:
+            files[0].unlink()
+        except OSError:
+            pass  # File consumed even if deletion fails
         return handoff
 
     def receive_all(self, agent_name: str) -> list[Handoff]:
@@ -70,14 +81,26 @@ class FileChannel:
         inbox = self._inbox(agent_name)
         handoffs = []
         for f in sorted(inbox.glob("*.json")):
-            handoffs.append(Handoff.load(f))
-            f.unlink()
+            try:
+                handoffs.append(Handoff.load(f))
+                f.unlink()
+            except Exception:
+                try:
+                    f.rename(f.with_suffix(".json.bad"))
+                except Exception:
+                    pass
         return handoffs
 
     def peek(self, agent_name: str) -> list[Handoff]:
         """View pending handoffs without consuming them."""
         inbox = self._inbox(agent_name)
-        return [Handoff.load(f) for f in sorted(inbox.glob("*.json"))]
+        results = []
+        for f in sorted(inbox.glob("*.json")):
+            try:
+                results.append(Handoff.load(f))
+            except Exception:
+                pass
+        return results
 
     def broadcast(self, handoff: Handoff):
         """Send a handoff to the shared broadcast directory."""
@@ -88,4 +111,7 @@ class FileChannel:
 
     def list_agents(self) -> list[str]:
         """List all agents that have directories."""
-        return [d.name for d in self.base_dir.iterdir() if d.is_dir() and d.name != "shared"]
+        try:
+            return [d.name for d in self.base_dir.iterdir() if d.is_dir() and d.name != "shared"]
+        except (FileNotFoundError, PermissionError):
+            return []

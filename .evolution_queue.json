@@ -1,0 +1,75 @@
+{
+  "version": "1.0",
+  "strategy": "每次完成一个任务后，学到的东西告诉主bot，主bot决定下一步进化什么",
+  "current_index": 0,
+  "tasks": [
+    {
+      "id": 1,
+      "priority": "critical",
+      "name": "技能自动合成系统",
+      "prompt": "实现一个skill_synthesizer.py：每次完成任务后，自动分析任务模式，如果该模式出现3次以上就自动生成一个新的skill文件。读取.bot_scores.jsonl和.reflections.jsonl找出最常见的任务类型，为每类生成对应skill。最终输出：生成了哪些新skill，以及下一步推荐进化的方向（基于当前最弱的能力）",
+      "why": "元能力：让每个任务都自动变成未来更好的工具，复利最高",
+      "expected_output": "新skill文件列表 + 下一步建议",
+      "status": "pending"
+    },
+    {
+      "id": 2,
+      "priority": "high",
+      "name": "视觉UI定位升级",
+      "prompt": "升级pc_control.py：加入find_by_text(text)方法，用Windows内置OCR(Windows.Media.Ocr)扫描屏幕，返回包含该文字的UI元素坐标。这样再也不用硬编码坐标，任何文字都能找到。测试：find_by_text('Reply...')找到Claude Code输入框",
+      "why": "可靠性：固定坐标会因分辨率/布局变化而失效，视觉定位永远准确",
+      "expected_output": "windows_ocr.py + find_by_text功能 + 测试结果",
+      "status": "pending"
+    },
+    {
+      "id": 3,
+      "priority": "high",
+      "name": "任务分解智能化",
+      "prompt": "分析.bot_scores.jsonl中评分最低的10个任务，找出失败原因。如果是因为任务太复杂没拆解好，写一个task_decomposer.py：接受复杂任务描述，输出分步执行计划，每步有验证条件。集成进主处理流程，超过500字的任务请求自动触发分解",
+      "why": "智能性：复杂任务失败通常是因为没有规划，分解后成功率大幅提升",
+      "expected_output": "task_decomposer.py + 集成 + 之前失败任务的改进分析",
+      "status": "pending"
+    },
+    {
+      "id": 4,
+      "priority": "medium",
+      "name": "知识库结构化 + 跨session记忆",
+      "prompt": "建立结构化知识库.knowledge/：categories=[errors, patterns, apis, shortcuts, solutions]。把.bot_memory.md、action_memory.json、.reflections.jsonl的内容分类重组存入。实现knowledge_query.py：根据当前任务类型，自动检索最相关的历史知识。测试：查询'screenshot'返回所有截图相关经验",
+      "why": "记忆力：目前记忆散乱，结构化后可以精准检索，不再重复同样的错误",
+      "expected_output": ".knowledge/目录结构 + knowledge_query.py + 迁移报告",
+      "status": "pending"
+    },
+    {
+      "id": 5,
+      "priority": "medium",
+      "name": "自我监控 + 预测性维护",
+      "prompt": "升级self_monitor.py：1)监控bot响应时间，若>30s自动提速（简化回复）2)检测重复错误（同类错误3次→自动修复代码）3)主动报告：每天早上9点发TG总结（昨日任务数、成功率、学到的新技能）4)预测用户意图：根据历史模式，如果用户说'crypto'则预加载相关知识",
+      "why": "可靠性+主动性：从被动响应变成主动维护，减少用户干预",
+      "expected_output": "升级的self_monitor.py + 定时任务配置",
+      "status": "pending"
+    },
+    {
+      "id": 6,
+      "priority": "medium",
+      "name": "多模型路由优化",
+      "prompt": "分析哪类任务用哪个模型最合适：代码修复→Opus（需要推理）、快速回复→Haiku（节省额度）、创意任务→Sonnet（平衡）。实现smart_router.py：根据任务类型自动选模型，并追踪每个模型的成功率和成本。当月度quota用了80%自动切换到更省的模型",
+      "why": "效率：不同任务用最合适的模型，省quota也提升质量",
+      "expected_output": "smart_router.py + 路由规则 + quota追踪",
+      "status": "pending"
+    },
+    {
+      "id": 7,
+      "priority": "evolving",
+      "name": "下一步由前6个任务的结果决定",
+      "prompt": "分析任务1-6的执行结果，总结：1)哪些改进最有效果？2)发现了哪些新的弱点？3)下5个最有价值的进化方向是什么？把结论发给主bot（我）",
+      "why": "闭环：进化应该是数据驱动的，而不是猜测",
+      "expected_output": "进化报告 + 下一轮任务建议",
+      "status": "pending"
+    }
+  ],
+  "meta": {
+    "loop_principle": "每个任务完成后，结果告诉我下一步学什么。越做越精准，越做越深入",
+    "compounding": "技能生成技能 > 记忆驱动技能 > 监控发现问题 > 技能解决问题",
+    "created": "2026-03-29"
+  }
+}

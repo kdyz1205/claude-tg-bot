@@ -70,14 +70,23 @@ class ClaudeCodeWebAgent(BrowserAgent):
 
         logger.info(f"[claude_code] Task sent ({len(prompt)} chars)")
 
-    async def auto_approve(self, max_approvals: int = 20):
+    async def auto_approve(self, max_approvals: int = 20, timeout_seconds: float = 300):
         """
         Auto-approve tool calls in Claude Code.
         Claude Code asks for permission before running commands/editing files.
         This auto-clicks approve buttons.
+
+        timeout_seconds: hard cap on how long this loop may run (default 5 minutes).
         """
         approved = 0
+        if self._page is None:
+            return approved
+        _loop = asyncio.get_running_loop()
+        deadline = _loop.time() + timeout_seconds
         for _ in range(max_approvals * 10):  # Check every 2s
+            if _loop.time() >= deadline:
+                logger.warning(f"[claude_code] auto_approve hit {timeout_seconds}s timeout after {approved} approvals")
+                break
             try:
                 accept_btn = await self._page.query_selector(self.SELECTORS["accept_button"])
                 if accept_btn:
