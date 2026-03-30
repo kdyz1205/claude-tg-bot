@@ -367,8 +367,12 @@ def _load_onchain_alerted() -> dict:
 
 def _save_onchain_alerted(data: dict) -> None:
     try:
-        with open(_ONCHAIN_ALERTED_FILE, "w", encoding="utf-8") as f:
+        tmp_path = _ONCHAIN_ALERTED_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, _ONCHAIN_ALERTED_FILE)
     except Exception:
         pass
 
@@ -399,7 +403,7 @@ async def scan_onchain_filter(filter_set: dict = None, client: httpx.AsyncClient
         filter_set = ONCHAIN_FILTER_SET_1
     own_client = client is None
     if own_client:
-        client = httpx.AsyncClient(follow_redirects=True)
+        client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(20.0))
 
     results = []
     try:
@@ -408,7 +412,8 @@ async def scan_onchain_filter(filter_set: dict = None, client: httpx.AsyncClient
             "https://api.dexscreener.com/token-boosts/top/v1",
             timeout=12.0,
         )
-        boosts = resp.json() if isinstance(resp.json(), list) else []
+        _boosts_data = resp.json()
+        boosts = _boosts_data if isinstance(_boosts_data, list) else []
 
         # Also search for new pairs across chains
         try:
@@ -416,7 +421,8 @@ async def scan_onchain_filter(filter_set: dict = None, client: httpx.AsyncClient
                 "https://api.dexscreener.com/token-profiles/latest/v1",
                 timeout=12.0,
             )
-            profiles = resp2.json() if isinstance(resp2.json(), list) else []
+            _profiles_data = resp2.json()
+            profiles = _profiles_data if isinstance(_profiles_data, list) else []
         except Exception:
             profiles = []
 

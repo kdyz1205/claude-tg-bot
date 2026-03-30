@@ -583,7 +583,7 @@ def is_rate_limited() -> bool:
 def _get_rate_limit_cooldown(parsed_seconds: int | None = None) -> int:
     """Get cooldown using exponential backoff: 60s → 120s → 300s on consecutive hits."""
     global _rate_limit_consecutive
-    if parsed_seconds and parsed_seconds > 10:
+    if parsed_seconds is not None and parsed_seconds > 0:
         # Use server-provided value if available and reasonable
         return min(parsed_seconds, 600)
     idx = min(_rate_limit_consecutive, len(_RATE_LIMIT_BACKOFF) - 1)
@@ -1255,10 +1255,9 @@ async def _run_claude_cli(
                 new_session_id = None
             # Check for rate limit errors (stderr is reliable — this is a real error from CLI)
             elif any(p in err_lower for p in _ERROR_PATTERNS["rate"]):
-                global _rate_limit_consecutive
+                global _rate_limit_consecutive, _rate_limited_until
                 # Parse reset time from error message if available
-                import re as _rl_re
-                reset_match = _rl_re.search(r'(\d+)\s*(second|minute|sec|min|s\b|m\b)', err_lower)
+                reset_match = re.search(r'(\d+)\s*(second|minute|sec|min|s\b|m\b)', err_lower)
                 parsed_val = None
                 if reset_match:
                     val = int(reset_match.group(1))

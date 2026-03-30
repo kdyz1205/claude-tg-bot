@@ -907,7 +907,7 @@ def compute_optimized_config(signals: list, stats: dict, cfg: dict) -> tuple:
             tf_stats[tf]["total"] += d.get("total", 0)
     tf_stats = {k: v for k, v in tf_stats.items() if v.get("total", 0) > 0}
     if tf_stats:
-        best_tf = max(tf_stats, key=lambda t: tf_stats[t]["wins"] / tf_stats[t]["total"])
+        best_tf = max(tf_stats, key=lambda t: tf_stats[t]["wins"] / max(tf_stats[t]["total"], 1))
         if best_tf != cfg.get("timeframe"):
             changes["timeframe"] = {"old": cfg.get("timeframe"), "new": best_tf}
             new_cfg["timeframe"] = best_tf
@@ -986,8 +986,7 @@ def run_optimization(trigger: str = "weekly") -> dict:
             "changes":    {},
         }
         if log:
-            log[-1]["status"]          = "rolled_back"
-            log[-1]["rollback_reason"] = rollback_reason
+            entry["rolled_back_entry"] = log[-1].get("timestamp", "?")
         _append_optimization_log(entry)
         return {
             "status":       "rolled_back",
@@ -1419,7 +1418,7 @@ class StrategyOptimizer:
         await asyncio.sleep(1800)  # initial delay: 30 min
         while self._running:
             try:
-                loop   = asyncio.get_event_loop()
+                loop   = asyncio.get_running_loop()
                 result = await loop.run_in_executor(None, run_ga_evolution, "daily")
                 if self._notify and result.get("status") == "ok":
                     await self._notify(format_ga_result(result))
@@ -1443,7 +1442,7 @@ class StrategyOptimizer:
     async def evolve_now(self) -> dict:
         """Phase 2: run GA evolution immediately (for /strategy_evolve command)."""
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, run_ga_evolution, "manual")
         except Exception as e:
             logger.error("GA evolve_now failed: %s", e)

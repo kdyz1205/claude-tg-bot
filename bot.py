@@ -1347,7 +1347,8 @@ async def _send_health(context, chat_id):
         disk_path = "C:\\" if sys.platform == "win32" else "/"
         disk = psutil.disk_usage(disk_path)
         boot = psutil.boot_time()
-        os_uptime = datetime.datetime.now() - datetime.datetime.fromtimestamp(boot)
+        uptime_seconds = time.time() - boot
+        os_uptime = datetime.timedelta(seconds=int(uptime_seconds))
         bot_uptime_secs = int(time.time() - _BOT_START_TIME)
         bot_h, bot_rem = divmod(bot_uptime_secs, 3600)
         bot_m, bot_s = divmod(bot_rem, 60)
@@ -2989,10 +2990,12 @@ async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "on":
             if not market_monitor._running:
+                _bot = context.bot
+                _chat_id = update.effective_chat.id
                 async def _send(text):
                     try:
-                        await update.message.get_bot().send_message(
-                            chat_id=update.effective_chat.id, text=text[:4000]
+                        await _bot.send_message(
+                            chat_id=_chat_id, text=text[:4096]
                         )
                     except Exception:
                         pass
@@ -3431,6 +3434,8 @@ async def _quick_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_session_control_callback(update, context):
     """Handle session_control inline button presses (sc_ prefix)."""
     query = update.callback_query
+    if not query or not query.from_user:
+        return
     if not _is_authorized(query.from_user.id):
         await query.answer("⛔ Unauthorized", show_alert=True)
         return
@@ -3482,6 +3487,8 @@ async def handle_session_control_callback(update, context):
 
 async def handle_quick_action_callback(update, context):
     query = update.callback_query
+    if not query or not query.from_user:
+        return
     if not _is_authorized(query.from_user.id):
         await query.answer("⛔ Unauthorized", show_alert=True)
         return
