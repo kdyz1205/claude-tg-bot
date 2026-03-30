@@ -105,7 +105,7 @@ def format_arb_stats(stats: dict = None) -> str:
     best = stats.get("best_signal")
     if best:
         ts_b = datetime.fromtimestamp(best.get("timestamp", 0)).strftime("%m-%d %H:%M")
-        lines.append(f"最佳: {best['symbol']} 入场${best['entry_price']:.4f} 收益{best.get('final_pnl_pct', 0):+.2f}% [{ts_b}]")
+        lines.append(f"最佳: {best.get('symbol', '?')} 入场${best.get('entry_price', 0):.4f} 收益{best.get('final_pnl_pct', 0):+.2f}% [{ts_b}]")
     return "\n".join(lines)
 
 
@@ -149,11 +149,11 @@ async def update_pending_signals() -> None:
             if now < check_time:
                 continue
 
-            price = await _fetch_price(sig["symbol"])
+            price = await _fetch_price(sig.get("symbol", ""))
             if price is None:
                 continue
 
-            entry = sig["entry_price"]
+            entry = sig.get("entry_price", 0)
             direction = sig.get("direction", "long")
             if not entry or entry <= 0:
                 continue
@@ -210,8 +210,8 @@ def compute_stats(signals: list = None) -> dict:
     wins = [s for s in resolved if s.get("status") == "win"]
     pnls = [s.get("final_pnl_pct", 0) for s in resolved]
 
-    base["win_rate"] = round(len(wins) / len(resolved) * 100, 1)
-    base["avg_pnl_pct"] = round(sum(pnls) / len(pnls), 3)
+    base["win_rate"] = round(len(wins) / len(resolved) * 100, 1) if resolved else 0
+    base["avg_pnl_pct"] = round(sum(pnls) / len(pnls), 3) if pnls else 0
     base["best_signal"] = max(resolved, key=lambda s: s.get("final_pnl_pct", 0))
     base["worst_signal"] = min(resolved, key=lambda s: s.get("final_pnl_pct", 0))
 
@@ -303,11 +303,11 @@ def format_report(stats: dict, title: str = "信号表现报告") -> str:
     if best:
         ts_b = datetime.fromtimestamp(best.get("timestamp", 0)).strftime("%m-%d %H:%M")
         lines.append(f"🏆 最佳  {best['symbol']} {best.get('signal_type','')} ({ts_b})")
-        lines.append(f"       入场: ${best['entry_price']:.2f}  收益: {best['final_pnl_pct']:+.2f}%")
+        lines.append(f"       入场: ${best.get('entry_price', 0):.2f}  收益: {best.get('final_pnl_pct', 0):+.2f}%")
     if worst:
         ts_w = datetime.fromtimestamp(worst.get("timestamp", 0)).strftime("%m-%d %H:%M")
         lines.append(f"📉 最差  {worst['symbol']} {worst.get('signal_type','')} ({ts_w})")
-        lines.append(f"       入场: ${worst['entry_price']:.2f}  收益: {worst['final_pnl_pct']:+.2f}%")
+        lines.append(f"       入场: ${worst.get('entry_price', 0):.2f}  收益: {worst.get('final_pnl_pct', 0):+.2f}%")
     if best or worst:
         lines.append("")
 
@@ -414,7 +414,7 @@ async def _fetch_price(symbol: str) -> Optional[float]:
             resp = await client.get(url)
             data = resp.json()
             if data.get("code") == "0" and data.get("data"):
-                return float(data["data"][0]["last"])
+                return float(data["data"][0].get("last", 0)) or None
     except Exception as e:
         logger.warning("profit_tracker: failed to fetch %s: %s", symbol, e)
     return None

@@ -52,6 +52,8 @@ def _save_state(s: dict):
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(s, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, str(STATE_FILE))
     except Exception as e:
         logger.error(f"codex_charger save_state error: {e}")

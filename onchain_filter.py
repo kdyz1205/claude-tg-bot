@@ -136,14 +136,14 @@ def _load_alerted():
     global _alerted
     try:
         if os.path.exists(ALERTED_FILE):
-            with open(ALERTED_FILE, "r") as f:
+            with open(ALERTED_FILE, "r", encoding="utf-8") as f:
                 _alerted = json.load(f)
     except Exception:
         _alerted = {}
 
 def _save_alerted():
     try:
-        with open(ALERTED_FILE, "w") as f:
+        with open(ALERTED_FILE, "w", encoding="utf-8") as f:
             json.dump(_alerted, f)
     except Exception:
         pass
@@ -171,9 +171,9 @@ def _rsi(closes: list, period: int = 14) -> Optional[float]:
         losses.append(max(-d, 0))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
+    if avg_loss < 1e-10:
         return 100.0
-    rs = avg_gain / avg_loss
+    rs = avg_gain / (avg_loss + 1e-10)
     return 100 - 100 / (1 + rs)
 
 
@@ -370,20 +370,21 @@ def format_filtered(signals: list) -> str:
     ]
 
     for sig in signals:
-        emoji = "🟢" if sig["direction"] == "long" else ("🔴" if sig["direction"] == "short" else "⚪")
-        vol3_k = sig["vol_3m_usdt"] / 1000
-        vol5_k = sig["vol_5m_usdt"] / 1000
+        direction = sig.get("direction", "neutral")
+        emoji = "🟢" if direction == "long" else ("🔴" if direction == "short" else "⚪")
+        vol3_k = sig.get("vol_3m_usdt", 0) / 1000
+        vol5_k = sig.get("vol_5m_usdt", 0) / 1000
 
         lines.append(
-            f"{emoji} **{sig['symbol']}** {sig['direction'].upper()} "
-            f"| 评分:{sig['score']}"
+            f"{emoji} **{sig.get('symbol', '?')}** {direction.upper()} "
+            f"| 评分:{sig.get('score', 0)}"
         )
         lines.append(
-            f"  💰 ${sig['price']:.4f}  RSI:{sig.get('rsi', '-')}"
+            f"  💰 ${sig.get('price', 0):.4f}  RSI:{sig.get('rsi', '-')}"
         )
         lines.append(
-            f"  📊 3m量:{sig['vol_3m']:,.0f} (${vol3_k:,.0f}K)"
-            f"  5m量:{sig['vol_5m']:,.0f} (${vol5_k:,.0f}K)"
+            f"  📊 3m量:{sig.get('vol_3m', 0):,.0f} (${vol3_k:,.0f}K)"
+            f"  5m量:{sig.get('vol_5m', 0):,.0f} (${vol5_k:,.0f}K)"
         )
         lines.append("")
 

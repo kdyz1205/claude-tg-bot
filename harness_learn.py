@@ -308,7 +308,7 @@ def get_relevant_workflow(task_description: str) -> dict | None:
 
 # ─── Memory Management ───────────────────────────────────────────────────────
 
-_last_memory_update: float = 0.0
+_last_memory_update: float = 0.0  # asyncio single-threaded: no race condition on this counter
 
 def update_memory_with_insights(insights: list[str]):
     """Update the performance section in memory file. Rate-limited to once per hour.
@@ -484,7 +484,7 @@ def post_interaction_loop(
 # ─── User Language Learning ──────────────────────────────────────────────────
 
 _USER_LANG_FILE = os.path.join(BOT_DIR, ".user_language.json")
-_last_lang_update: float = 0
+_last_lang_update: float = 0  # asyncio single-threaded: no race condition on this counter
 
 
 def _learn_user_language(user_message: str, response: str):
@@ -672,7 +672,7 @@ def should_auto_train() -> dict | None:
     Called after every interaction.
     """
     global _INTERACTION_COUNT, _last_auto_train_time
-    _INTERACTION_COUNT += 1
+    _INTERACTION_COUNT += 1  # asyncio single-threaded: no race condition on this counter
 
     # Don't check every single interaction — check every 5
     if _INTERACTION_COUNT % 5 != 0:
@@ -688,7 +688,7 @@ def should_auto_train() -> dict | None:
         return None
 
     # Check overall average
-    avg_overall = sum(s.get("overall", 0) for s in scores) / len(scores)
+    avg_overall = sum(s.get("overall", 0) for s in scores) / len(scores) if scores else 0
     if avg_overall >= _AUTO_TRAIN_SCORE_THRESHOLD:
         return None  # Doing fine, no training needed
 

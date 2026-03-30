@@ -35,14 +35,13 @@ SKILL_LIBRARY_DIR = BASE / ".skill_library" / "skills"
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 
-_devnull_fh = open(os.devnull, "w")  # noqa: SIM115 — module-level handle, must stay open for logging lifetime
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(_devnull_fh),
+        logging.NullHandler(),  # suppress console output without leaked file handle
     ]
 )
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -241,8 +240,8 @@ def run_task(task, state):
         return "failed", ""
 
     except subprocess.TimeoutExpired:
-        log.warning(f"Task {task_id} timed out (10 min) — treating as done")
-        return "done", "[timeout - task likely completed]"
+        log.warning(f"Task {task_id} timed out (10 min) — marking as failed")
+        return "failed", "[timeout - task did not complete in time]"
     except FileNotFoundError:
         log.error(f"claude.cmd not found! PATH: {os.environ.get('PATH', '')[:200]}")
         return "failed", ""
@@ -322,7 +321,10 @@ def _check_claude_cli_available() -> bool:
 def health_check(state) -> bool:
     """Pre-task health check. Returns True if safe to proceed."""
     bot_pid = _get_bot_pid()
-    if bot_pid and not _is_process_alive(bot_pid):
+    if bot_pid is None:
+        log.warning("Bot PID is None — bot not running")
+        return False
+    if not _is_process_alive(bot_pid):
         log.warning(f"Bot PID {bot_pid} is dead!")
         _restart_bot()
 

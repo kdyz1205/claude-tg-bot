@@ -219,11 +219,15 @@ def main():
     kwargs = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    proc = subprocess.Popen(
-        [sys.executable, "run.py"],
-        cwd=str(bot_dir),
-        **kwargs,
-    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "run.py"],
+            cwd=str(bot_dir),
+            **kwargs,
+        )
+    except (FileNotFoundError, OSError) as e:
+        log(f"  FATAL: Failed to start bot: {e}")
+        sys.exit(1)
     log(f"  Bot started! PID: {proc.pid}")
     log("")
     log("=" * 55)

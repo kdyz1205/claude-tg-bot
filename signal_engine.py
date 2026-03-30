@@ -570,11 +570,11 @@ def record_signal_performance(sig: dict) -> None:
         pass
     entry = {
         "id": str(uuid.uuid4())[:8],
-        "symbol": sig["symbol"],
-        "direction": sig["direction"],
+        "symbol": sig.get("symbol", "UNKNOWN"),
+        "direction": sig.get("direction", "neutral"),
         "confidence": sig.get("confidence", 0),
-        "entry_price": sig["entry_price"],
-        "timestamp": sig["timestamp"],
+        "entry_price": sig.get("entry_price", 0),
+        "timestamp": sig.get("timestamp", time.time()),
         "cfg_snapshot": cfg_snapshot,
         # 4h outcome (original)
         "outcome": None,
@@ -600,14 +600,15 @@ async def _check_pending_outcomes() -> None:
 
     # Gather symbols needing any kind of outcome update
     needs_price = set()
-    for s in perf["signals"]:
-        age = now - s["timestamp"]
-        if s["outcome"] is None and age >= OUTCOME_CHECK_DELAY:
-            needs_price.add(s["symbol"])
+    for s in perf.get("signals", []):
+        age = now - s.get("timestamp", 0)
+        if s.get("outcome") is None and age >= OUTCOME_CHECK_DELAY:
+            needs_price.add(s.get("symbol", ""))
         if s.get("outcome_24h") is None and age >= OUTCOME_CHECK_24H:
-            needs_price.add(s["symbol"])
+            needs_price.add(s.get("symbol", ""))
         if s.get("outcome_72h") is None and age >= OUTCOME_CHECK_72H:
-            needs_price.add(s["symbol"])
+            needs_price.add(s.get("symbol", ""))
+    needs_price.discard("")
 
     if not needs_price:
         return
@@ -620,14 +621,14 @@ async def _check_pending_outcomes() -> None:
                 resp = await client.get(url)
                 data = resp.json()
                 if data.get("code") == "0" and data.get("data"):
-                    current_prices[sym] = float(data["data"][0]["last"])
+                    current_prices[sym] = float(data["data"][0].get("last", 0))
             except Exception:
                 pass
 
     changed = False
-    for entry in perf["signals"]:
-        age = now - entry["timestamp"]
-        price = current_prices.get(entry["symbol"])
+    for entry in perf.get("signals", []):
+        age = now - entry.get("timestamp", 0)
+        price = current_prices.get(entry.get("symbol", ""))
         if price is None:
             continue
 
@@ -637,22 +638,22 @@ async def _check_pending_outcomes() -> None:
             return "win" if cur_price < entry_price else "loss"
 
         # 4h outcome
-        if entry["outcome"] is None and age >= OUTCOME_CHECK_DELAY:
+        if entry.get("outcome") is None and age >= OUTCOME_CHECK_DELAY:
             entry["outcome_price"] = price
             entry["outcome_time"] = now
-            entry["outcome"] = _win_loss(entry["direction"], entry["entry_price"], price)
+            entry["outcome"] = _win_loss(entry.get("direction", "long"), entry.get("entry_price", 0), price)
             changed = True
 
         # 24h outcome
         if entry.get("outcome_24h") is None and age >= OUTCOME_CHECK_24H:
             entry["outcome_price_24h"] = price
-            entry["outcome_24h"] = _win_loss(entry["direction"], entry["entry_price"], price)
+            entry["outcome_24h"] = _win_loss(entry.get("direction", "long"), entry.get("entry_price", 0), price)
             changed = True
 
         # 72h outcome
         if entry.get("outcome_72h") is None and age >= OUTCOME_CHECK_72H:
             entry["outcome_price_72h"] = price
-            entry["outcome_72h"] = _win_loss(entry["direction"], entry["entry_price"], price)
+            entry["outcome_72h"] = _win_loss(entry.get("direction", "long"), entry.get("entry_price", 0), price)
             changed = True
 
     if changed:
@@ -765,7 +766,7 @@ def _adaptive_threshold() -> int:
         if len(recent) < 10:
             return CONFIDENCE_THRESHOLD  # not enough data
         wins = sum(1 for s in recent if s["outcome"] == "win")
-        wr = wins / len(recent)
+        wr = wins / len(recent) if recent else 0
         if wr >= 0.65:
             return max(60, CONFIDENCE_THRESHOLD - 5)   # performing well → slightly lower bar
         elif wr < 0.45:
@@ -955,9 +956,9 @@ async def scan_all(cfg: dict = None) -> list:
 
 
 def format_signal(sig: dict) -> str:
-    direction_emoji = "🟢" if sig["direction"] == "long" else "🔴"
-    strength = "⚡" * sig["score"]
-    conf = sig.get("confidence", 0)
+    direction_emoji = "🟢" if sig.get("direction") == "long" else "🔴"
+    strength = "⚡" * sig.get("score", 0)
+    conf = max(0, min(100, sig.get("confidence", 0)))
     conf_bar = "█" * (conf // 10) + "░" * (10 - conf // 10)
 
     ex_dirs = sig.get("exchange_dirs", {})
@@ -984,10 +985,10 @@ def format_signal(sig: dict) -> str:
         ob_note = "  📕 大卖单压力"
 
     lines = [
-        f"{direction_emoji} **{sig['symbol']}** {sig['direction'].upper()}  {strength}",
+        f"{direction_emoji} **{sig.get('symbol', '?')}** {sig.get('direction', '?').upper()}  {strength}",
         f"  置信度: {conf}/100  [{conf_bar}]",
-        f"  类型: {sig['signal_type']}  |  {sig['timeframe']}",
-        f"  价格: ${sig['entry_price']:.4f}",
+        f"  类型: {sig.get('signal_type', '?')}  |  {sig.get('timeframe', '?')}",
+        f"  价格: ${sig.get('entry_price', 0):.4f}",
         f"  RSI: {sig.get('rsi', 'N/A')}  |  MACD: {sig.get('macd', 'N/A')}",
         f"  MA快: {sig.get('ma_fast', 'N/A')}  MA慢: {sig.get('ma_slow', 'N/A')}",
     ]
@@ -1079,10 +1080,10 @@ class SignalEngine:
                         if self._record:
                             try:
                                 self._record(
-                                    sig["symbol"],
-                                    sig["direction"],
-                                    sig["signal_type"],
-                                    sig["entry_price"],
+                                    sig.get("symbol", "UNKNOWN"),
+                                    sig.get("direction", "neutral"),
+                                    sig.get("signal_type", "unknown"),
+                                    sig.get("entry_price", 0),
                                 )
                             except Exception as e:
                                 logger.warning("SignalEngine: record failed: %s", e)

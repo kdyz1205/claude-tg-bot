@@ -85,7 +85,9 @@ def _detect_ui_elements_cv(image: np.ndarray, min_area: int = 300) -> list[dict]
 
     for i, cnt in enumerate(contours):
         # Skip inner contours (children of other contours)
-        if hierarchy is not None and hierarchy[0][i][3] != -1:
+        if hierarchy is None:
+            continue
+        if hierarchy[0][i][3] != -1:
             # Allow one level of nesting
             parent = hierarchy[0][i][3]
             if hierarchy[0][parent][3] != -1:
@@ -167,7 +169,7 @@ def _try_ocr_text(img_rgb: np.ndarray, elem: dict) -> str:
         import pytesseract
         pil_crop = Image.fromarray(crop)
         cw, ch = pil_crop.size
-        if cw < 80:
+        if cw < 80 and cw > 0:
             factor = max(2, 80 // cw)
             pil_crop = pil_crop.resize(
                 (cw * factor, ch * factor), Image.NEAREST,
@@ -1267,7 +1269,7 @@ def _extract_full_ocr(image_path: str) -> tuple[str, float]:
         )
         words = [
             (t, int(c))
-            for t, c in zip(data["text"], data["conf"])
+            for t, c in zip(data.get("text", []), data.get("conf", []))
             if t.strip() and int(c) > 0
         ]
         if not words:

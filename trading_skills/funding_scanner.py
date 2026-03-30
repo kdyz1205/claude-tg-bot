@@ -289,16 +289,16 @@ class FundingRateScanner:
         rates = [h["fundingRate"] * 100 for h in history]  # → percentage
         n = len(rates)
 
-        avg = sum(rates) / n
-        variance = sum((r - avg) ** 2 for r in rates) / n
+        avg = sum(rates) / n if n else 0
+        variance = sum((r - avg) ** 2 for r in rates) / n if n else 0
         std = variance ** 0.5
 
         positive_count = sum(1 for r in rates if r > 0)
-        positive_pct = positive_count / n * 100
+        positive_pct = positive_count / n * 100 if n else 0
 
         # "Above threshold" = absolute value exceeds a common minimum (0.01 %)
         above_threshold_count = sum(1 for r in rates if abs(r) >= 0.01)
-        above_threshold_pct = above_threshold_count / n * 100
+        above_threshold_pct = above_threshold_count / n * 100 if n else 0
 
         # ---- Trend detection (simple linear regression slope sign) ----
         # history is newest-first; reverse so index 0 = oldest.
@@ -334,7 +334,7 @@ class FundingRateScanner:
         recent = rates[:21]  # newest 7 days (~21 periods)
         if recent:
             recent_avg_abs = sum(abs(r) for r in recent) / len(recent)
-            overall_avg_abs = sum(abs(r) for r in rates) / n
+            overall_avg_abs = sum(abs(r) for r in rates) / n if n else 0
             ratio = recent_avg_abs / (overall_avg_abs + 1e-9)
             # If recent magnitude is >1.5x overall, reversion risk is elevated.
             mean_reversion_risk = round(

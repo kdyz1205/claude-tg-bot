@@ -531,6 +531,13 @@ if __name__ == "__main__":
             q["completed_tasks"] = []
             save_queue(q)
             print("Queue reset to task 1")
-    else:
-        interval = int(sys.argv[1]) if len(sys.argv) > 1 else 180
+    elif len(sys.argv) > 1:
+        try:
+            interval = int(sys.argv[1])
+        except ValueError:
+            print(f"Unknown command: {sys.argv[1]}")
+            print("Usage: evolve_watcher.py [status|advance|reset|<interval_seconds>]")
+            sys.exit(1)
         run_loop(interval)
+    else:
+        run_loop(180)

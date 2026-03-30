@@ -18,11 +18,14 @@ IDLE_KEYWORDS = ["Reply...", "Reply…"]
 BUSY_KEYWORDS = ["Processing", "Thinking", "Crafting", "Tinkering", "Coalescing", "Reflecting", "Pondering", "Synthesizing", "Creating", "Creati"]
 
 def screenshot():
-    result = subprocess.run(
-        ["python", "pc_control.py", "screenshot"],
-        capture_output=True, text=True, cwd=str(Path(__file__).parent),
-        timeout=30,
-    )
+    try:
+        result = subprocess.run(
+            ["python", "pc_control.py", "screenshot"],
+            capture_output=True, text=True, cwd=str(Path(__file__).parent),
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
     # Find screenshot path
     for line in result.stdout.split("\n"):
         if "Screenshot saved:" in line:
@@ -77,8 +80,8 @@ def mark_task_sent(task_id):
         print(f"Error reading queue for mark: {e}")
         return
 
-    for task in data["tasks"]:
-        if task["id"] == task_id:
+    for task in data.get("tasks", []):
+        if task.get("id") == task_id:
             task["status"] = "sent"
             task["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
 

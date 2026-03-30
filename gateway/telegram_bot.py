@@ -83,8 +83,11 @@ class TelegramBot:
                 import time
                 time.sleep(min(retry_after, 120))
                 # Retry once
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    return json.loads(resp.read().decode())
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        return json.loads(resp.read().decode())
+                except Exception:
+                    return {"ok": False, "description": "retry failed"}
             raise
 
     def send_message(self, chat_id: int, text: str, parse_mode: str = "Markdown"):

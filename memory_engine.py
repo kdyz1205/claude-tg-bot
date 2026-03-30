@@ -97,7 +97,7 @@ def _save(mem: dict) -> None:
 
 
 def _total_entries(mem: dict) -> int:
-    return len(mem["shortcuts"]) + len(mem["patterns"]) + len(mem["summaries"])
+    return len(mem.get("shortcuts", [])) + len(mem.get("patterns", [])) + len(mem.get("summaries", []))
 
 
 def _cleanup(mem: dict) -> None:

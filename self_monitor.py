@@ -495,7 +495,10 @@ class SelfMonitor:
                     try:
                         free_kb = int(parts[1])
                         total_kb = int(parts[2])
-                        used_pct = round((1 - free_kb / total_kb) * 100, 1)
+                        if total_kb > 0:
+                            used_pct = round((1 - free_kb / total_kb) * 100, 1)
+                        else:
+                            continue
                         return {"usage_pct": used_pct, "status": "ok" if used_pct < 85 else "high"}
                     except (ValueError, ZeroDivisionError):
                         continue

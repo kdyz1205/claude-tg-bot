@@ -142,6 +142,15 @@ def _append_evolution_log(entry: dict) -> None:
     line = json.dumps(entry, ensure_ascii=False)
     with open(EVOLUTION_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+    # Truncate to last 5000 lines to prevent unbounded growth
+    try:
+        with open(EVOLUTION_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) > 5000:
+            with open(EVOLUTION_LOG_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines[-5000:])
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -287,7 +296,7 @@ def _backtest_ma_ribbon(o, h, l, c, v, params: dict) -> dict:
             elif pos == -1 and not np.isnan(atr14[i]):
                 sl = min(sl, c[i] + atr_mult * atr14[i])
             peak_eq = max(peak_eq, equity)
-            max_dd  = max(max_dd, (peak_eq - equity) / peak_eq)
+            max_dd  = max(max_dd, (peak_eq - equity) / peak_eq if peak_eq > 0 else 0)
         if pos == 0 and not np.isnan(atr14[i]):
             sig = 0
             if bull[i] and not bull[i - 1] and adx_ok[i] and vol_ok[i]:
@@ -347,7 +356,7 @@ def _backtest_rsi(c, params: dict) -> dict:
             elif rsi[i - 1] <= overbought and rsi[i] > overbought:
                 pos = -1; entry = c[i]
         peak_eq = max(peak_eq, equity)
-        max_dd  = max(max_dd, (peak_eq - equity) / peak_eq)
+        max_dd  = max(max_dd, (peak_eq - equity) / peak_eq if peak_eq > 0 else 0)
 
     sharpe   = _sharpe(returns)
     win_rate = wins / trades * 100 if trades else 0.0
@@ -404,7 +413,7 @@ def _backtest_macd(c, params: dict) -> dict:
             if bull_x: pos = 1; entry = c[i]
             elif bear_x: pos = -1; entry = c[i]
         peak_eq = max(peak_eq, equity)
-        max_dd  = max(max_dd, (peak_eq - equity) / peak_eq)
+        max_dd  = max(max_dd, (peak_eq - equity) / peak_eq if peak_eq > 0 else 0)
 
     sharpe   = _sharpe(returns)
     win_rate = wins / trades * 100 if trades else 0.0
@@ -819,7 +828,7 @@ def _analyze_by_rsi_range(signals: list, cfg: dict) -> dict:
     resolved = [s for s in signals if s.get("status") in ("win", "loss")]
     if not resolved:
         return {}
-    win_rate   = sum(1 for s in resolved if s["status"] == "win") / len(resolved) * 100
+    win_rate   = (sum(1 for s in resolved if s["status"] == "win") / len(resolved) * 100) if resolved else 0
     current_ob = cfg.get("rsi_overbought", 70)
     current_os = cfg.get("rsi_oversold", 30)
     new_ob, new_os = current_ob, current_os
@@ -1963,14 +1972,14 @@ class PerformanceOptimizer:
     # ── persist daily push timestamp across restarts ──
     def _load_last_daily_push(self) -> float:
         try:
-            with open(self._DAILY_PUSH_FILE, "r") as f:
+            with open(self._DAILY_PUSH_FILE, "r", encoding="utf-8") as f:
                 return float(f.read().strip())
         except Exception:
             return 0.0
 
     def _save_last_daily_push(self, ts: float) -> None:
         try:
-            with open(self._DAILY_PUSH_FILE, "w") as f:
+            with open(self._DAILY_PUSH_FILE, "w", encoding="utf-8") as f:
                 f.write(str(ts))
         except Exception:
             pass
@@ -2071,7 +2080,7 @@ class PerformanceOptimizer:
                 logger.info("P3: Bayesian opt skipped: %s", result.get("status"))
 
         # 3. Daily push at 09:00 (UTC+8 approximate: check once per day)
-        today_9am = (now // 86400) * 86400 + 1 * 3600  # 09:00 UTC+1 approx
+        today_9am = (now // 86400) * 86400 + 1 * 3600  # 01:00 UTC = 09:00 UTC+8
         if (now >= today_9am
                 and self._last_daily_push < today_9am
                 and self._notify):
@@ -2231,7 +2240,7 @@ def _ga24_evaluate(chromosome: dict, signals: list) -> float:
         return 0.05 * len(filtered) / max(len(signals), 1)
 
     wins       = sum(1 for s in filtered if s.get(outcome_key) == "win")
-    win_rate   = wins / len(filtered)
+    win_rate   = wins / len(filtered) if filtered else 0
     coverage   = len(filtered) / max(len(signals), 1)
     bonus      = min(coverage * 0.2, 0.10)
     return round(win_rate + bonus, 4)

@@ -156,7 +156,7 @@ def _pick_experiment() -> dict | None:
     worst_dim = None
     worst_avg = 1.0
     for dim, vals in dim_scores.items():
-        avg = sum(vals) / len(vals)
+        avg = sum(vals) / len(vals) if vals else 0
         if avg < worst_avg:
             worst_avg = avg
             worst_dim = dim
@@ -385,8 +385,8 @@ async def _experiment_prompt_tweak(experiment: dict) -> dict:
         logger.info(f"Hypothesis confirmed: {hypothesis['prediction']}")
         return {"success": True, "summary": f"Hypothesis confirmed! {baseline:.0%} → {new_score:.0%}: {hypothesis['prediction']}"}
 
-    except (Exception, asyncio.CancelledError) as e:
-        # Restore original on failure or cancellation (atomic write)
+    except asyncio.CancelledError:
+        # Restore original on cancellation (atomic write), then re-raise
         try:
             _err_tmp = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".txt", dir=BOT_DIR, delete=False, encoding="utf-8",
@@ -398,8 +398,20 @@ async def _experiment_prompt_tweak(experiment: dict) -> dict:
             os.replace(_err_tmp.name, prompt_path)
         except Exception:
             pass
-        if isinstance(e, asyncio.CancelledError):
-            raise  # Re-raise cancellation after cleanup
+        raise
+    except Exception as e:
+        # Restore original on failure (atomic write)
+        try:
+            _err_tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", dir=BOT_DIR, delete=False, encoding="utf-8",
+            )
+            _err_tmp.write(original)
+            _err_tmp.flush()
+            os.fsync(_err_tmp.fileno())
+            _err_tmp.close()
+            os.replace(_err_tmp.name, prompt_path)
+        except Exception:
+            pass
         return {"success": False, "summary": f"Experiment failed: {e}"}
 
 
@@ -490,7 +502,7 @@ async def _generate_hypothesis(target: str) -> dict | None:
         return None
 
     # Calculate baseline
-    avg_overall = sum(s.get("overall", 0) for s in scores) / len(scores)
+    avg_overall = sum(s.get("overall", 0) for s in scores) / len(scores) if scores else 0
 
     # Ask Claude to find pattern and generate hypothesis
     prompt = f"""你是一个科学实验设计师。分析以下失败案例，生成一个可验证的假设。

@@ -101,6 +101,7 @@ async def _get_prices() -> dict:
         params = {"ids": "ethereum,binancecoin,solana", "vs_currencies": "usd"}
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, params=params)
+            resp.raise_for_status()
             data = resp.json()
         _PRICE_CACHE.update({
             "ETH": data.get("ethereum", {}).get("usd", 3000),
@@ -200,7 +201,7 @@ def _classify_erc20(tx: dict, address: str) -> Optional[dict]:
     if token not in _STABLECOINS:
         return None  # no free per-token price source; skip
     try:
-        decimals = int(tx.get("tokenDecimal", 18))
+        decimals = min(int(tx.get("tokenDecimal", 18)), 18)
         amount_usd = int(tx.get("value", "0")) / (10 ** decimals)
     except Exception:
         return None
@@ -476,16 +477,16 @@ class OnchainTracker:
     # ── Formatting ────────────────────────────────────────────────────────
 
     def _format_signal(self, sig: dict) -> str:
-        action_emoji = "🟢" if sig["action"] == "receive" else "🔴"
+        action_emoji = "🟢" if sig.get("action") == "receive" else "🔴"
         confidence_tag = " ⚡HIGH CONFIDENCE" if sig.get("dual_confirmed") else ""
-        ts = datetime.fromtimestamp(sig["timestamp"]).strftime("%H:%M:%S")
+        ts = datetime.fromtimestamp(sig.get("timestamp", 0)).strftime("%H:%M:%S")
         lines = [
             f"🐋 链上巨鲸动向{confidence_tag}",
-            f"  地址: {sig['address_label']} ({sig['address'][:8]}...)",
-            f"  {action_emoji} {sig['action'].upper()} {sig['token']}",
-            f"  金额: ${sig['amount_usd']:,.0f}",
+            f"  地址: {sig.get('address_label', '?')} ({sig.get('address', '?')[:8]}...)",
+            f"  {action_emoji} {sig.get('action', '?').upper()} {sig.get('token', '?')}",
+            f"  金额: ${sig.get('amount_usd', 0):,.0f}",
             f"  时间: {ts}",
-            f"  TxHash: {sig['tx_hash'][:16]}...",
+            f"  TxHash: {sig.get('tx_hash', '?')[:16]}...",
         ]
         if sig.get("dual_confirmed"):
             lines.append(
@@ -504,13 +505,13 @@ class OnchainTracker:
         # Token summary
         token_stats: dict = {}
         for sig in signals:
-            t = sig["token"]
+            t = sig.get("token", "UNKNOWN")
             if t not in token_stats:
                 token_stats[t] = {"buy": 0, "sell": 0, "count": 0}
-            if sig["action"] == "receive":
-                token_stats[t]["buy"] += sig["amount_usd"]
+            if sig.get("action") == "receive":
+                token_stats[t]["buy"] += sig.get("amount_usd", 0)
             else:
-                token_stats[t]["sell"] += sig["amount_usd"]
+                token_stats[t]["sell"] += sig.get("amount_usd", 0)
             token_stats[t]["count"] += 1
 
         for token, stats in sorted(
@@ -524,13 +525,13 @@ class OnchainTracker:
             )
 
         lines.append("\n最近5笔:")
-        for sig in sorted(signals, key=lambda x: x["timestamp"], reverse=True)[:5]:
-            ts = datetime.fromtimestamp(sig["timestamp"]).strftime("%H:%M")
-            emoji = "🟢" if sig["action"] == "receive" else "🔴"
+        for sig in sorted(signals, key=lambda x: x.get("timestamp", 0), reverse=True)[:5]:
+            ts = datetime.fromtimestamp(sig.get("timestamp", 0)).strftime("%H:%M")
+            emoji = "🟢" if sig.get("action") == "receive" else "🔴"
             tag = " ⚡" if sig.get("dual_confirmed") else ""
             lines.append(
-                f"  {emoji}{tag} {sig['address_label']}: "
-                f"{sig['action']} {sig['token']} ${sig['amount_usd']:,.0f} @{ts}"
+                f"  {emoji}{tag} {sig.get('address_label', '?')}: "
+                f"{sig.get('action', '?')} {sig.get('token', '?')} ${sig.get('amount_usd', 0):,.0f} @{ts}"
             )
 
         lines.append(f"\n监控地址: {len(self._addresses)}个")
@@ -717,16 +718,17 @@ class SmartMoneyTracker:
 
     def _register_signal_for_perf(self, sig: dict):
         """Register a new signal to be evaluated 24h later."""
+        sig_ts = sig.get("timestamp", time.time())
         rec = {
             "tx_hash": sig.get("tx_hash", ""),
-            "token": sig["token"],
-            "token_name": sig.get("token_name", sig["token"]),
+            "token": sig.get("token", "UNKNOWN"),
+            "token_name": sig.get("token_name", sig.get("token", "UNKNOWN")),
             "contract_address": sig.get("contract_address", ""),
             "entry_price": sig.get("entry_price", 0),
-            "amount_usd": sig["amount_usd"],
+            "amount_usd": sig.get("amount_usd", 0),
             "address_label": sig.get("address_label", ""),
-            "timestamp": sig["timestamp"],
-            "check_at": sig["timestamp"] + 86400,  # evaluate 24h later
+            "timestamp": sig_ts,
+            "check_at": sig_ts + 86400,  # evaluate 24h later
             "result": None,  # None=pending, True=profit, False=loss
             "exit_price": None,
             "pnl_pct": None,
@@ -760,7 +762,7 @@ class SmartMoneyTracker:
                     updated = True
                     logger.info(
                         "SmartMoney perf: %s %s entry=%.6f exit=%.6f pnl=%.1f%%",
-                        rec["address_label"], rec["token"], entry_price, current_price, pnl_pct
+                        rec.get("address_label", "?"), rec.get("token", "?"), entry_price, current_price, pnl_pct
                     )
                 await asyncio.sleep(0.5)
             except Exception as e:
@@ -1004,11 +1006,12 @@ class SmartMoneyTracker:
     # ── Formatting ────────────────────────────────────────────────────────
 
     def _format_buy_signal(self, sig: dict) -> str:
-        ts = datetime.fromtimestamp(sig["timestamp"]).strftime("%H:%M:%S")
-        net_emoji = {"eth": "🔷", "bsc": "🟡", "sol": "☀️"}.get(sig["network"], "🔗")
-        addr_masked = sig.get("address_masked", sig["address"][:10])
-        token = sig["token"]
-        amount_usd = sig["amount_usd"]
+        ts = datetime.fromtimestamp(sig.get("timestamp", 0)).strftime("%H:%M:%S")
+        network = sig.get("network", "?")
+        net_emoji = {"eth": "🔷", "bsc": "🟡", "sol": "☀️"}.get(network, "🔗")
+        addr_masked = sig.get("address_masked", sig.get("address", "?")[:10])
+        token = sig.get("token", "UNKNOWN")
+        amount_usd = sig.get("amount_usd", 0)
 
         p = sig.get("current_price", 0)
         if p >= 1:
@@ -1019,12 +1022,12 @@ class SmartMoneyTracker:
             price_str = f"${p:.8f}" if p else "未知"
 
         sol_min = SMART_MIN_SOL * _PRICE_CACHE.get("SOL", 150)
-        threshold = f"{SMART_MIN_SOL} SOL" if sig["network"] == "sol" else f"${SMART_MIN_BUY_USD // 1000}k"
+        threshold = f"{SMART_MIN_SOL} SOL" if network == "sol" else f"${SMART_MIN_BUY_USD // 1000}k"
         return "\n".join([
             f"🚨 [聪明钱信号] {net_emoji}",
-            f"地址{addr_masked} ({sig['address_label']}) 买入 {token} ${amount_usd:,.0f}",
-            f"数量: {sig['token_amount']:,.2f} {token}  现价: {price_str}",
-            f"时间: {ts}  网络: {sig['network'].upper()}",
+            f"地址{addr_masked} ({sig.get('address_label', '?')}) 买入 {token} ${amount_usd:,.0f}",
+            f"数量: {sig.get('token_amount', 0):,.2f} {token}  现价: {price_str}",
+            f"时间: {ts}  网络: {network.upper()}",
             f"| 跟单建议: 买入",
         ])
 
@@ -1048,9 +1051,9 @@ class SmartMoneyTracker:
             return f"📭 过去{hours}小时无大额聪明钱买入(>${SMART_MIN_BUY_USD // 1000}k)"
         lines = [f"📊 近{hours}h聪明钱买入 ({len(activity)}笔)\n"]
         for sig in sorted(activity, key=lambda x: x.get("timestamp", 0), reverse=True)[:10]:
-            ts = datetime.fromtimestamp(sig["timestamp"]).strftime("%H:%M")
+            ts = datetime.fromtimestamp(sig.get("timestamp", 0)).strftime("%H:%M")
             lines.append(
-                f"🟢 {sig['address_label']}: 买{sig['token']} ${sig['amount_usd']:,.0f} @{ts}"
+                f"🟢 {sig.get('address_label', '?')}: 买{sig.get('token', '?')} ${sig.get('amount_usd', 0):,.0f} @{ts}"
             )
         return "\n".join(lines)
 

@@ -1123,7 +1123,7 @@ class SessionLearner:
         # 4. Check for tasks that take too many steps
         long_tasks = [p for p in patterns if p.get("steps_taken", 0) > 15]
         if len(long_tasks) >= 3:
-            avg_steps = sum(p["steps_taken"] for p in long_tasks) / len(long_tasks)
+            avg_steps = sum(p["steps_taken"] for p in long_tasks) / len(long_tasks) if long_tasks else 0
             curriculum.append({
                 "skill": "task_efficiency",
                 "gap_description": f"{len(long_tasks)} tasks took >15 steps (avg {avg_steps:.0f})",

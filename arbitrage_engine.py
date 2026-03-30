@@ -465,7 +465,7 @@ class ArbEngine:
     def _record_opportunity(self, sig: dict) -> None:
         """Record a WS-detected opportunity to history."""
         record = dict(sig)
-        record["date"] = datetime.fromtimestamp(sig["timestamp"]).strftime("%Y-%m-%d")
+        record["date"] = datetime.fromtimestamp(sig.get("timestamp", time.time())).strftime("%Y-%m-%d")
         self._history.append(record)
         if len(self._history) > 10_000:
             self._history = self._history[-5_000:]
@@ -484,15 +484,15 @@ class ArbEngine:
                 data = {}
             arb_list = data.get("arb_signals", [])
             entry = {
-                "pair": sig["pair"],
-                "buy_exchange": sig["buy_exchange"],
-                "sell_exchange": sig["sell_exchange"],
-                "spread_pct": sig["spread_pct"],
+                "pair": sig.get("pair", "?"),
+                "buy_exchange": sig.get("buy_exchange", "?"),
+                "sell_exchange": sig.get("sell_exchange", "?"),
+                "spread_pct": sig.get("spread_pct", 0),
                 "net_profit_pct": sig.get("net_profit_pct", 0),
                 "net_profit_usdt": sig.get("net_profit_usdt", 0),
-                "buy_price": sig["buy_price"],
-                "sell_price": sig["sell_price"],
-                "timestamp": sig["timestamp"],
+                "buy_price": sig.get("buy_price", 0),
+                "sell_price": sig.get("sell_price", 0),
+                "timestamp": sig.get("timestamp", time.time()),
                 "date": sig.get("date", ""),
                 "source": sig.get("source", "websocket"),
             }
@@ -511,20 +511,30 @@ class ArbEngine:
     def _append_signal_jsonl(sig: dict) -> None:
         """Append a single arb signal as a JSONL line to ARB_SIGNALS_FILE."""
         try:
+            sig_ts = sig.get("timestamp", time.time())
             entry = {
-                "ts": sig["timestamp"],
-                "date": sig.get("date", datetime.fromtimestamp(sig["timestamp"]).strftime("%Y-%m-%d")),
-                "pair": sig["pair"],
-                "buy_exchange": sig["buy_exchange"],
-                "sell_exchange": sig["sell_exchange"],
-                "spread_pct": sig["spread_pct"],
+                "ts": sig_ts,
+                "date": sig.get("date", datetime.fromtimestamp(sig_ts).strftime("%Y-%m-%d")),
+                "pair": sig.get("pair", "?"),
+                "buy_exchange": sig.get("buy_exchange", "?"),
+                "sell_exchange": sig.get("sell_exchange", "?"),
+                "spread_pct": sig.get("spread_pct", 0),
                 "net_profit_pct": sig.get("net_profit_pct", 0),
-                "buy_price": sig["buy_price"],
-                "sell_price": sig["sell_price"],
+                "buy_price": sig.get("buy_price", 0),
+                "sell_price": sig.get("sell_price", 0),
                 "source": sig.get("source", "websocket"),
             }
             with open(ARB_SIGNALS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # Truncate to last 5000 lines to prevent unbounded growth
+            try:
+                with open(ARB_SIGNALS_FILE, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                if len(lines) > 5000:
+                    with open(ARB_SIGNALS_FILE, "w", encoding="utf-8") as f:
+                        f.writelines(lines[-5000:])
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("ArbEngine _append_signal_jsonl error: %s", e)
 
@@ -534,11 +544,11 @@ class ArbEngine:
         try:
             from profit_tracker import record_arb_signal
             record_arb_signal(
-                pair=sig["pair"],
-                buy_exchange=sig["buy_exchange"],
-                sell_exchange=sig["sell_exchange"],
-                spread_pct=sig["spread_pct"],
-                buy_price=sig["buy_price"],
+                pair=sig.get("pair", "?"),
+                buy_exchange=sig.get("buy_exchange", "?"),
+                sell_exchange=sig.get("sell_exchange", "?"),
+                spread_pct=sig.get("spread_pct", 0),
+                buy_price=sig.get("buy_price", 0),
             )
         except Exception as e:
             logger.debug("ArbEngine profit_tracker record skipped: %s", e)
@@ -718,27 +728,27 @@ def _format_rest_alert(sig: dict) -> str:
         vol_m = sig["volume_24h_usdt"] / 1_000_000
         vol_str = f"\n  成交量: ${vol_m:.1f}M (24h)"
     return (
-        f"🔀 套利信号 [{sig['source'].replace('_',' ')}]\n"
-        f"**{sig['pair']}**  价差: **{sig['spread_pct']:.3f}%**\n"
-        f"  买入 {sig['buy_exchange']} @ ${sig['buy_price']:,.4f}\n"
-        f"  卖出 {sig['sell_exchange']} @ ${sig['sell_price']:,.4f}\n"
-        f"  净利润: **{sig['net_profit_pct']:.3f}%** (手续费+滑点后)\n"
-        f"  预估利润 (1000U): **${sig['net_profit_usdt']:.2f}**"
+        f"🔀 套利信号 [{sig.get('source', 'unknown').replace('_',' ')}]\n"
+        f"**{sig.get('pair', '?')}**  价差: **{sig.get('spread_pct', 0):.3f}%**\n"
+        f"  买入 {sig.get('buy_exchange', '?')} @ ${sig.get('buy_price', 0):,.4f}\n"
+        f"  卖出 {sig.get('sell_exchange', '?')} @ ${sig.get('sell_price', 0):,.4f}\n"
+        f"  净利润: **{sig.get('net_profit_pct', 0):.3f}%** (手续费+滑点后)\n"
+        f"  预估利润 (1000U): **${sig.get('net_profit_usdt', 0):.2f}**"
         f"{vol_str}"
     )
 
 
 def format_arb_signal(sig: dict) -> str:
     """Format a single arb signal for display."""
-    age     = int(time.time() - sig["timestamp"])
+    age     = int(time.time() - sig.get("timestamp", time.time()))
     net_str = (
-        f"  净利润: **{sig['net_profit_pct']:.3f}%** | ${sig['net_profit_usdt']:.2f}\n"
+        f"  净利润: **{sig.get('net_profit_pct', 0):.3f}%** | ${sig.get('net_profit_usdt', 0):.2f}\n"
         if "net_profit_pct" in sig else ""
     )
     return (
-        f"💹 **{sig['pair']}**  |  价差: **{sig['spread_pct']:.3f}%**\n"
-        f"  买入 {sig['buy_exchange']} @ ${sig['buy_price']:,.4f}\n"
-        f"  卖出 {sig['sell_exchange']} @ ${sig['sell_price']:,.4f}\n"
+        f"💹 **{sig.get('pair', '?')}**  |  价差: **{sig.get('spread_pct', 0):.3f}%**\n"
+        f"  买入 {sig.get('buy_exchange', '?')} @ ${sig.get('buy_price', 0):,.4f}\n"
+        f"  卖出 {sig.get('sell_exchange', '?')} @ ${sig.get('sell_price', 0):,.4f}\n"
         f"{net_str}"
         f"  更新: {age}s 前"
     )

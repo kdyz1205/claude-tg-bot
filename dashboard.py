@@ -91,7 +91,7 @@ if _flask_available:
                 data = json.load(f)
             return {
                 "tasks": [
-                    {"id": t["id"], "name": t["name"], "status": t["status"]}
+                    {"id": t.get("id", "?"), "name": t.get("name", "?"), "status": t.get("status", "unknown")}
                     for t in data.get("tasks", [])
                 ],
                 "completed_count": len(data.get("completed_tasks", [])),
@@ -337,15 +337,19 @@ def start_dashboard(host: str = "0.0.0.0", port: int = 8080) -> bool:
     if _server_started:
         return True
 
-    _server_started = True
-
     # Suppress Flask/Werkzeug startup noise
     import logging
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
     def _run():
-        app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+        try:
+            app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+        except Exception as e:
+            global _server_started
+            _server_started = False
+            logging.getLogger(__name__).error("Dashboard failed to start: %s", e)
 
+    _server_started = True
     _server_thread = threading.Thread(target=_run, name="dashboard-server", daemon=True)
     _server_thread.start()
 

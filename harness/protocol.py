@@ -70,7 +70,7 @@ class Message:
     @classmethod
     def from_dict(cls, data: dict) -> Message:
         data = dict(data)  # Don't mutate the caller's dict
-        data["msg_type"] = MessageType(data["msg_type"])
+        data["msg_type"] = MessageType(data.get("msg_type", "text"))
         # Only pass known fields to avoid TypeError on extra keys
         valid_keys = {"msg_type", "sender", "receiver", "content", "timestamp", "metadata"}
         return cls(**{k: v for k, v in data.items() if k in valid_keys})
@@ -165,7 +165,10 @@ class Handoff:
 
     @classmethod
     def from_json(cls, json_str: str) -> Handoff:
-        data = json.loads(json_str)
+        try:
+            data = json.loads(json_str)
+        except (json.JSONDecodeError, TypeError):
+            raise ValueError(f"Invalid JSON for Handoff: {json_str[:200]}")
         data["files"] = [FilePayload.from_dict(f) for f in data.get("files", [])]
         data["messages"] = [Message.from_dict(m) for m in data.get("messages", [])]
         # Filter to only known fields to prevent TypeError on unexpected keys

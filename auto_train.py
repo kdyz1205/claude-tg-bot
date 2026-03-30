@@ -319,7 +319,7 @@ async def _run_training_loop(domain_id, send_status, send_photo, model, loops):
             break
 
         # ── Round score ──
-        avg_score = sum(r["score"] for r in round_results) / len(round_results)
+        avg_score = sum(r["score"] for r in round_results) / len(round_results) if round_results else 0
         avg_normalized = avg_score / 10.0  # 0-1 for progress tracking
         round_scores.append(avg_normalized)
 

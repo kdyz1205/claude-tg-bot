@@ -137,7 +137,7 @@ class Harness:
         # Create agents
         for agent_def in config.get("agents", []):
             agent_config = AgentConfig(
-                name=agent_def["name"],
+                name=agent_def.get("name", "unnamed"),
                 role=AgentRole(agent_def.get("role", "custom")),
                 description=agent_def.get("description", ""),
                 capabilities=agent_def.get("capabilities", []),

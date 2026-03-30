@@ -478,10 +478,14 @@ def get_task_status() -> dict:
     queued = {cid: list(msgs) for cid, msgs in _pending_messages.items() if msgs}
     workers = {cid: not t.done() for cid, t in _chat_workers.items() if not t.done()}
     sem = _cli_semaphore
+    try:
+        sem_available = sem._value if sem else MAX_CONCURRENT_CLI
+    except AttributeError:
+        sem_available = MAX_CONCURRENT_CLI
     concurrent_slots = {
         "max": MAX_CONCURRENT_CLI,
-        "available": sem._value if sem else MAX_CONCURRENT_CLI,
-        "in_use": MAX_CONCURRENT_CLI - sem._value if sem else 0,
+        "available": sem_available,
+        "in_use": MAX_CONCURRENT_CLI - sem_available,
     }
     return {"running": running, "queued": queued, "workers": workers, "concurrent": concurrent_slots}
 
@@ -546,6 +550,8 @@ def _periodic_state_cleanup():
         _save_sessions()
 
 
+# Safe to read/write without locks: asyncio is cooperative (single-threaded),
+# so no concurrent mutation between await points.
 _rate_limited_until: float = 0.0
 _rate_limit_resume_task: asyncio.Task | None = None
 _rate_limit_consecutive: int = 0  # For exponential backoff: 0→60s, 1→120s, 2→300s
@@ -790,8 +796,11 @@ def _fire_and_forget(coro, name: str = "background"):
     for t in completed:
         _background_tasks.discard(t)
     if len(_background_tasks) >= _MAX_BACKGROUND_TASKS:
-        logger.warning(f"Background tasks at limit ({_MAX_BACKGROUND_TASKS}), dropping oldest")
-        _background_tasks.pop()
+        logger.warning(f"Background tasks at limit ({_MAX_BACKGROUND_TASKS}), dropping completed")
+        # Discard all completed tasks first; sets are unordered so pop() is arbitrary
+        done = [t for t in _background_tasks if t.done()]
+        for t in done:
+            _background_tasks.discard(t)
 
     async def _wrapper():
         try:
@@ -830,7 +839,7 @@ async def _run_queued_tasks(chat_id: int, context) -> None:
                 for m in reversed(all_pending[1:]):
                     _pending_messages.setdefault(chat_id, []).insert(0, m)
                 tid = msg.get("task_id", "?")
-                text = msg["text"]
+                text = msg.get("text", "")
                 remaining = len(_pending_messages.get(chat_id, []))
                 queue_note = f" (+{remaining}条)" if remaining else ""
                 logger.info(f"Chat {chat_id}: worker processing #{tid}{queue_note}")
@@ -869,7 +878,8 @@ async def _run_claude_cli(
                  "环境变量丢失", "环境变量", "api key 发给", "api_key", "请把你的"],
         "rate": ["hit your limit", "rate limit", "rate_limit", "quota exceeded", "usage limit", "too many requests"],
     }
-    timeout = timeout or getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
+    if timeout is None:
+        timeout = getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
     session_id = _claude_sessions.get(chat_id)
 
     # Adaptive model: simple queries → Sonnet (fast), complex → Opus
@@ -1857,8 +1867,20 @@ _chat_contexts: dict[int, dict] = {}
 _CONTEXT_TTL = 3600 * 2  # 2 hours idle → reset context
 
 
+def _cleanup_chat_contexts() -> None:
+    """Remove stale entries when dict exceeds 100 entries."""
+    if len(_chat_contexts) <= 100:
+        return
+    now = time.time()
+    stale = [cid for cid, ctx in _chat_contexts.items()
+             if now - ctx.get("last_updated", 0) > 3600]
+    for cid in stale:
+        del _chat_contexts[cid]
+
+
 def _get_chat_context(chat_id: int) -> dict:
     """Get or create conversation context for a chat."""
+    _cleanup_chat_contexts()
     now = time.time()
     ctx = _chat_contexts.get(chat_id)
     if ctx is None or now - ctx.get("last_updated", 0) > _CONTEXT_TTL:
@@ -2042,8 +2064,20 @@ _proactive_cooldown: dict[int, float] = {}
 _PROACTIVE_COOLDOWN_SECS = 300  # 5 min between suggestions per chat
 
 
+def _cleanup_proactive_cooldown() -> None:
+    """Remove stale entries when dict exceeds 50 entries."""
+    if len(_proactive_cooldown) <= 50:
+        return
+    now = time.time()
+    stale = [cid for cid, ts in _proactive_cooldown.items()
+             if now - ts > 3600]
+    for cid in stale:
+        del _proactive_cooldown[cid]
+
+
 def _get_proactive_suggestion(message: str, response: str, chat_id: int) -> str | None:
     """Generate a follow-up suggestion after certain analyses. Rate-limited."""
+    _cleanup_proactive_cooldown()
     now = time.time()
     if now - _proactive_cooldown.get(chat_id, 0) < _PROACTIVE_COOLDOWN_SECS:
         return None

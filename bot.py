@@ -1532,8 +1532,8 @@ async def _send_learn_brief(context, chat_id):
         stats = kb.get("stats", {})
         text = (
             f"🧠 Session Learning\n\n"
-            f"Patterns: {kb['total_patterns']}\n"
-            f"Sessions analyzed: {kb['total_sessions']}\n"
+            f"Patterns: {kb.get('total_patterns', 0)}\n"
+            f"Sessions analyzed: {kb.get('total_sessions', 0)}\n"
             f"Strategies: {len(kb.get('strategies_by_type', {}))}\n"
             f"Last scan: {stats.get('last_scan', 'never')}\n\n"
             f"Use /learn for full scan, /learn report for details."
@@ -1614,7 +1614,7 @@ async def _send_okx_top30(context, chat_id):
                 "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
             )
             resp.raise_for_status()
-            data = resp.json()["data"]
+            data = resp.json().get("data") or []
 
         usdt = [d for d in data if d["instId"].endswith("-USDT-SWAP")]
         usdt.sort(key=lambda x: float(x.get("volCcy24h", 0) or 0), reverse=True)
@@ -1625,7 +1625,7 @@ async def _send_okx_top30(context, chat_id):
             sym = t.get("instId", "?").replace("-USDT-SWAP", "")
             price = float(t.get("last", 0))
             open24 = float(t.get("open24h", 0) or 0)
-            chg = ((price - open24) / open24 * 100) if open24 else 0
+            chg = ((price - open24) / open24 * 100) if abs(open24) > 0.0001 else 0
             vol = float(t.get("volCcy24h", 0) or 0)
             vol_str = f"{vol/1e6:.0f}M" if vol >= 1e6 else f"{vol:,.0f}"
             emoji = "+" if chg >= 0 else ""
@@ -2614,7 +2614,7 @@ async def okx_top30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
             )
             resp.raise_for_status()
-            data = resp.json()["data"]
+            data = resp.json().get("data") or []
 
         usdt = [d for d in data if d["instId"].endswith("-USDT-SWAP")]
         usdt.sort(key=lambda x: float(x.get("volCcy24h", 0) or 0), reverse=True)
@@ -2628,7 +2628,7 @@ async def okx_top30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sym = t.get("instId", "?").replace("-USDT-SWAP", "")
             price = float(t.get("last", 0))
             open24 = float(t.get("open24h", 0) or 0)
-            chg = ((price - open24) / open24 * 100) if open24 else 0
+            chg = ((price - open24) / open24 * 100) if abs(open24) > 0.0001 else 0
             vol = float(t.get("volCcy24h", 0) or 0)
 
             if vol >= 1_000_000_000:
@@ -2830,7 +2830,7 @@ async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Market Monitor started.\n"
                 "Watching: BTC/ETH/SOL\n"
                 "Alerts: 24h breakout + 1h change >3%\n"
-                f"Interval: every {market_monitor.status().split('interval:')[1].strip() if 'interval:' in market_monitor.status() else '300s'}"
+                f"Interval: every {(lambda s: s.split('interval:')[1].strip() if 'interval:' in s else '300s')(str(market_monitor.status()))}"
             )
         elif action == "off":
             if market_monitor._running:

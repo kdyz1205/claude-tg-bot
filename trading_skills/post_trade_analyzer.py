@@ -1286,7 +1286,7 @@ class PostTradeAnalyzer:
         if num_trades < 3:
             return None
 
-        win_rate = sum(1 for x in sym_pnl[worst_sym] if x > 0) / num_trades
+        win_rate = sum(1 for x in sym_pnl[worst_sym] if x > 0) / num_trades if num_trades else 0
         if win_rate > 0.35:
             return None  # not consistently losing
 

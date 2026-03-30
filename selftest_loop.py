@@ -120,10 +120,14 @@ def deploy(bot_dir):
         log("  WARNING: File may not be the patched version!")
 
     # Verify syntax — use separate argument to avoid path quoting issues
-    r = subprocess.run([sys.executable, "-c",
-        "import sys, py_compile; py_compile.compile(sys.argv[1], doraise=True); print('OK')",
-        str(target)],
-        capture_output=True, text=True)
+    try:
+        r = subprocess.run([sys.executable, "-c",
+            "import sys, py_compile; py_compile.compile(sys.argv[1], doraise=True); print('OK')",
+            str(target)],
+            capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        log("  SYNTAX CHECK FAILED: could not run Python")
+        return False
     if r.returncode != 0:
         log(f"  SYNTAX ERROR: {r.stderr[:300]}")
         return False
@@ -170,15 +174,16 @@ def deploy(bot_dir):
 
 
 def kill_existing_bot(bot_dir=None):
-    log("Killing ALL python/claude processes (except self)...")
+    log("Killing bot.py processes (except self)...")
     if sys.platform == "win32":
         my_pid = os.getpid()
         try:
+            # Only kill python processes whose command line contains bot.py
             subprocess.run(
                 ["powershell", "-Command",
-                 f"Get-Process python*,claude* -ErrorAction SilentlyContinue | "
-                 f"Where-Object {{$_.Id -ne {my_pid}}} | "
-                 f"Stop-Process -Force -ErrorAction SilentlyContinue"],
+                 f"Get-WmiObject Win32_Process -Filter \"Name LIKE 'python%'\" -ErrorAction SilentlyContinue | "
+                 f"Where-Object {{$_.ProcessId -ne {my_pid} -and $_.CommandLine -match 'bot\\.py'}} | "
+                 f"ForEach-Object {{Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}}"],
                 capture_output=True, timeout=10
             )
         except subprocess.TimeoutExpired:

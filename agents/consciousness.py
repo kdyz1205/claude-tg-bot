@@ -113,7 +113,7 @@ class SelfAwareness:
             import harness_learn
             scores = harness_learn.get_recent_scores(10)
             if scores:
-                avg = sum(s.get("score", 0) for s in scores) / len(scores)
+                avg = sum(s.get("score", 0) for s in scores) / len(scores) if scores else 0
                 snapshot["metrics"]["avg_score"] = round(avg, 3)
         except Exception:
             pass

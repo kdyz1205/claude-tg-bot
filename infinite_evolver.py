@@ -286,8 +286,8 @@ def run_claude_task(prompt, timeout=600):
 
         return result.returncode == 0, output
     except subprocess.TimeoutExpired:
-        log.warning("任务超时（可能仍在执行）")
-        return True, "[TIMEOUT - task may have completed]"
+        log.warning("任务超时 — 标记为失败")
+        return False, "[TIMEOUT - task did not complete in time]"
     except FileNotFoundError:
         log.error("claude.cmd not found!")
         return False, "claude.cmd not found"
@@ -489,7 +489,8 @@ def main():
                 log.info(f"✅ 任务完成: {task['name']}")
                 tg(f"✅ Phase{phase}-{task_index+1} 完成: {task['name']}")
 
-                state["completed_tasks"] = state.get("completed_tasks", []) + [task_id]
+                completed = state.get("completed_tasks", []) + [task_id]
+                state["completed_tasks"] = completed[-200:]  # keep only last 200
                 state["task_index"] = task_index + 1
                 state["consecutive_failures"] = 0
                 save_state(state)

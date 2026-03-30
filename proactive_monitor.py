@@ -124,9 +124,11 @@ class MarketMonitor:
             return
 
         ticker = data["data"][0]
-        last  = float(ticker["last"])    # current price
-        high24 = float(ticker["high24h"]) # 24h high
-        low24  = float(ticker["low24h"])  # 24h low
+        last  = float(ticker.get("last", 0))    # current price
+        high24 = float(ticker.get("high24h", 0)) # 24h high
+        low24  = float(ticker.get("low24h", 0))  # 24h low
+        if not last:
+            return
 
         base = symbol.split("-")[0]  # BTC, ETH, SOL
 
@@ -161,6 +163,8 @@ class MarketMonitor:
         if old_entries:
             # Use the most recent entry that is at least 1h old
             _, old_price = max(old_entries, key=lambda x: x[0])
+            if old_price <= 0:
+                return
             change = (last - old_price) / old_price
             if abs(change) >= PRICE_CHANGE_THRESHOLD:
                 direction = "涨" if change > 0 else "跌"

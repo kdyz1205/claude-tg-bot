@@ -216,7 +216,8 @@ async def _fetch_dexscreener_trending(client: httpx.AsyncClient) -> list[dict]:
             "https://api.dexscreener.com/token-boosts/top/v1",
             timeout=12.0,
         )
-        items = resp.json() if isinstance(resp.json(), list) else []
+        data = resp.json()
+        items = data if isinstance(data, list) else []
     except Exception as e:
         logger.debug("alpha_engine: DEXScreener boost list error: %s", e)
         return []
@@ -225,56 +226,59 @@ async def _fetch_dexscreener_trending(client: httpx.AsyncClient) -> list[dict]:
     seen_addr: set[str] = set()
 
     for item in items[:15]:
-        address = item.get("tokenAddress", "")
-        chain = item.get("chainId", "")
-        if not address or address in seen_addr:
-            continue
-        seen_addr.add(address)
-
-        boost_amount = float(item.get("amount", 0) or 0)
-        heat = min(100.0, math.log10(max(1.0, boost_amount)) / 4.0 * 100.0)
-
-        # Fetch pair data for liquidity / price change
         try:
-            pr = await client.get(
-                f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-                timeout=8.0,
-            )
-            pairs = pr.json().get("pairs") or []
-        except Exception:
-            pairs = []
+            address = item.get("tokenAddress", "")
+            chain = item.get("chainId", "")
+            if not address or address in seen_addr:
+                continue
+            seen_addr.add(address)
 
-        if not pairs:
+            boost_amount = float(item.get("amount", 0) or 0)
+            heat = min(100.0, math.log10(max(1.0, boost_amount)) / 4.0 * 100.0)
+
+            # Fetch pair data for liquidity / price change
+            try:
+                pr = await client.get(
+                    f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+                    timeout=8.0,
+                )
+                pairs = pr.json().get("pairs") or []
+            except Exception:
+                pairs = []
+
+            if not pairs:
+                continue
+
+            best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
+            liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
+            txns_h24 = (best.get("txns") or {}).get("h24", {})
+            buyer_count = int(txns_h24.get("buys", 0) or 0)
+            change_24h = float((best.get("priceChange") or {}).get("h24", 0) or 0)
+            token = best.get("baseToken", {})
+            name = token.get("name", item.get("description", address[:8]))
+            symbol = token.get("symbol", address[:6])
+
+            if _is_risky(name, symbol):
+                continue
+
+            price_usd = float(best.get("priceUsd", 0) or 0)
+            mcap = float((best.get("marketCap") or best.get("fdv") or 0) or 0)
+            results.append({
+                "name": name,
+                "symbol": symbol,
+                "source": "dexscreener",
+                "chain": chain,
+                "address": address,
+                "pair_url": best.get("url", ""),
+                "liquidity_usd": liq,
+                "market_cap_usd": mcap,
+                "price_usd": price_usd,
+                "holder_count": buyer_count,
+                "price_change_24h": change_24h,
+                "community_heat_raw": heat,
+            })
+        except (ValueError, TypeError, KeyError):
             continue
-
-        best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
-        liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
-        txns_h24 = (best.get("txns") or {}).get("h24", {})
-        buyer_count = int(txns_h24.get("buys", 0) or 0)
-        change_24h = float((best.get("priceChange") or {}).get("h24", 0) or 0)
-        token = best.get("baseToken", {})
-        name = token.get("name", item.get("description", address[:8]))
-        symbol = token.get("symbol", address[:6])
-
-        if _is_risky(name, symbol):
-            continue
-
-        price_usd = float(best.get("priceUsd", 0) or 0)
-        mcap = float((best.get("marketCap") or best.get("fdv") or 0) or 0)
-        results.append({
-            "name": name,
-            "symbol": symbol,
-            "source": "dexscreener",
-            "chain": chain,
-            "address": address,
-            "pair_url": best.get("url", ""),
-            "liquidity_usd": liq,
-            "market_cap_usd": mcap,
-            "price_usd": price_usd,
-            "holder_count": buyer_count,
-            "price_change_24h": change_24h,
-            "community_heat_raw": heat,
-        })
 
     return results
 
@@ -293,34 +297,38 @@ async def _fetch_pumpfun_trending(client: httpx.AsyncClient) -> list[dict]:
             timeout=12.0,
             headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
         )
-        items = resp.json() if isinstance(resp.json(), list) else []
+        data = resp.json()
+        items = data if isinstance(data, list) else []
     except Exception as e:
         logger.debug("alpha_engine: Pump.fun error: %s", e)
         return []
 
     results = []
     for item in items[:20]:
-        name = item.get("name", "")
-        symbol = item.get("symbol", "")
-        if _is_risky(name, symbol):
+        try:
+            name = item.get("name", "")
+            symbol = item.get("symbol", "")
+            if _is_risky(name, symbol):
+                continue
+            market_cap = float(item.get("market_cap", 0) or 0)
+            # Bonding curve: liquidity ≈ 10% of market cap (rough proxy)
+            liq = market_cap * 0.10
+            holder_count = int(item.get("holder_count", 0) or 0)
+            reply_count = int(item.get("reply_count", 0) or 0)
+            results.append({
+                "name": name,
+                "symbol": symbol,
+                "source": "pumpfun",
+                "chain": "solana",
+                "address": item.get("mint", ""),
+                "pair_url": "",
+                "liquidity_usd": liq,
+                "holder_count": holder_count or reply_count * 3,
+                "price_change_24h": 0.0,     # Pump.fun doesn't expose 24h %
+                "community_heat_raw": min(100.0, reply_count / 2.0),
+            })
+        except (ValueError, TypeError, KeyError):
             continue
-        market_cap = float(item.get("market_cap", 0) or 0)
-        # Bonding curve: liquidity ≈ 10% of market cap (rough proxy)
-        liq = market_cap * 0.10
-        holder_count = int(item.get("holder_count", 0) or 0)
-        reply_count = int(item.get("reply_count", 0) or 0)
-        results.append({
-            "name": name,
-            "symbol": symbol,
-            "source": "pumpfun",
-            "chain": "solana",
-            "address": item.get("mint", ""),
-            "pair_url": "",
-            "liquidity_usd": liq,
-            "holder_count": holder_count or reply_count * 3,
-            "price_change_24h": 0.0,     # Pump.fun doesn't expose 24h %
-            "community_heat_raw": min(100.0, reply_count / 2.0),
-        })
     return results
 
 
@@ -423,78 +431,82 @@ async def scan_onchain_filter(filter_set: dict = None, client: httpx.AsyncClient
             if not pairs:
                 continue
 
-            best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
-            liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
-            mcap = float((best.get("marketCap") or best.get("fdv") or 0) or 0)
+            try:
+                best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
+                liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
+                mcap = float((best.get("marketCap") or best.get("fdv") or 0) or 0)
 
-            # Filter: liquidity
-            if liq < filter_set.get("min_liquidity", 0):
-                continue
-            # Filter: market cap range
-            if mcap < filter_set.get("min_mcap", 0):
-                continue
-            if filter_set.get("max_mcap") and mcap > filter_set["max_mcap"]:
-                continue
-
-            # Filter: pair age
-            pair_created = best.get("pairCreatedAt", 0)
-            if pair_created:
-                age_hours = (time.time() * 1000 - pair_created) / 3600000
-                max_age = filter_set.get("max_age_hours", 99999)
-                if age_hours > max_age:
+                # Filter: liquidity
+                if liq < filter_set.get("min_liquidity", 0):
+                    continue
+                # Filter: market cap range
+                if mcap < filter_set.get("min_mcap", 0):
+                    continue
+                if filter_set.get("max_mcap") and mcap > filter_set["max_mcap"]:
                     continue
 
-            # Filter: short-term volume (5m, 1h from DexScreener)
-            vol_obj = best.get("volume") or {}
-            vol_5m = float(vol_obj.get("m5", 0) or 0)
-            vol_1h = float(vol_obj.get("h1", 0) or 0)
-            # Approximate 3m volume = 60% of 5m volume
-            vol_3m_approx = vol_5m * 0.6
+                # Filter: pair age
+                age_hours = None
+                pair_created = best.get("pairCreatedAt", 0)
+                if pair_created:
+                    age_hours = (time.time() * 1000 - pair_created) / 3600000
+                    max_age = filter_set.get("max_age_hours", 99999)
+                    if age_hours > max_age:
+                        continue
 
-            if vol_3m_approx < filter_set.get("min_vol_3m", 0):
+                # Filter: short-term volume (5m, 1h from DexScreener)
+                vol_obj = best.get("volume") or {}
+                vol_5m = float(vol_obj.get("m5", 0) or 0)
+                vol_1h = float(vol_obj.get("h1", 0) or 0)
+                # Approximate 3m volume = 60% of 5m volume
+                vol_3m_approx = vol_5m * 0.6
+
+                if vol_3m_approx < filter_set.get("min_vol_3m", 0):
+                    continue
+                if vol_5m < filter_set.get("min_vol_5m", 0):
+                    continue
+
+                # Get transaction counts
+                txns = best.get("txns") or {}
+                txns_5m = txns.get("m5", {})
+                txns_1h = txns.get("h1", {})
+                buys_5m = int(txns_5m.get("buys", 0) or 0)
+                sells_5m = int(txns_5m.get("sells", 0) or 0)
+                buys_1h = int(txns_1h.get("buys", 0) or 0)
+                sells_1h = int(txns_1h.get("sells", 0) or 0)
+
+                token = best.get("baseToken", {})
+                name = token.get("name", cand["address"][:8])
+                symbol = token.get("symbol", cand["address"][:6])
+
+                price_usd = float(best.get("priceUsd", 0) or 0)
+                change_5m = float((best.get("priceChange") or {}).get("m5", 0) or 0)
+                change_1h = float((best.get("priceChange") or {}).get("h1", 0) or 0)
+                change_24h = float((best.get("priceChange") or {}).get("h24", 0) or 0)
+
+                results.append({
+                    "name": name,
+                    "symbol": symbol,
+                    "chain": cand["chain"],
+                    "address": cand["address"],
+                    "pair_url": best.get("url", ""),
+                    "price_usd": price_usd,
+                    "liquidity_usd": liq,
+                    "market_cap_usd": mcap,
+                    "vol_5m": vol_5m,
+                    "vol_3m_approx": vol_3m_approx,
+                    "vol_1h": vol_1h,
+                    "buys_5m": buys_5m,
+                    "sells_5m": sells_5m,
+                    "buys_1h": buys_1h,
+                    "sells_1h": sells_1h,
+                    "change_5m": change_5m,
+                    "change_1h": change_1h,
+                    "change_24h": change_24h,
+                    "age_hours": age_hours if pair_created else None,
+                })
+            except (ValueError, TypeError, KeyError):
                 continue
-            if vol_5m < filter_set.get("min_vol_5m", 0):
-                continue
-
-            # Get transaction counts
-            txns = best.get("txns") or {}
-            txns_5m = txns.get("m5", {})
-            txns_1h = txns.get("h1", {})
-            buys_5m = int(txns_5m.get("buys", 0) or 0)
-            sells_5m = int(txns_5m.get("sells", 0) or 0)
-            buys_1h = int(txns_1h.get("buys", 0) or 0)
-            sells_1h = int(txns_1h.get("sells", 0) or 0)
-
-            token = best.get("baseToken", {})
-            name = token.get("name", cand["address"][:8])
-            symbol = token.get("symbol", cand["address"][:6])
-
-            price_usd = float(best.get("priceUsd", 0) or 0)
-            change_5m = float((best.get("priceChange") or {}).get("m5", 0) or 0)
-            change_1h = float((best.get("priceChange") or {}).get("h1", 0) or 0)
-            change_24h = float((best.get("priceChange") or {}).get("h24", 0) or 0)
-
-            results.append({
-                "name": name,
-                "symbol": symbol,
-                "chain": cand["chain"],
-                "address": cand["address"],
-                "pair_url": best.get("url", ""),
-                "price_usd": price_usd,
-                "liquidity_usd": liq,
-                "market_cap_usd": mcap,
-                "vol_5m": vol_5m,
-                "vol_3m_approx": vol_3m_approx,
-                "vol_1h": vol_1h,
-                "buys_5m": buys_5m,
-                "sells_5m": sells_5m,
-                "buys_1h": buys_1h,
-                "sells_1h": sells_1h,
-                "change_5m": change_5m,
-                "change_1h": change_1h,
-                "change_24h": change_24h,
-                "age_hours": age_hours if pair_created else None,
-            })
     except Exception as e:
         logger.error("onchain_filter scan error: %s", e)
     finally:
@@ -628,12 +640,12 @@ def record_push(tokens: list[dict]) -> None:
     now = time.time()
     for t in tokens:
         records.append({
-            "name": t["name"],
-            "symbol": t["symbol"],
-            "source": t["source"],
+            "name": t.get("name", "unknown"),
+            "symbol": t.get("symbol", "???"),
+            "source": t.get("source", "unknown"),
             "address": t.get("address", ""),
             "chain": t.get("chain", ""),
-            "score": t["score"],
+            "score": t.get("score", 0),
             "score_breakdown": t.get("score_breakdown", {}),
             "pushed_at": now,
             "entry_liq": t.get("liquidity_usd", 0),
@@ -844,7 +856,7 @@ def _auto_adjust_weights(cfg: dict, wins_by_factor: dict) -> None:
     if not factor_wr:
         return
 
-    avg_wr = sum(factor_wr.values()) / len(factor_wr)
+    avg_wr = sum(factor_wr.values()) / len(factor_wr) if factor_wr else 0
     new_w = dict(weights)
     for factor in weights:
         if factor in factor_wr:

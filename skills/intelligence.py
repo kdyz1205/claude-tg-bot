@@ -908,7 +908,7 @@ class IntelligenceSkill:
         recent_evals = self._evaluations[-50:]
         if recent_evals:
             scores = [e.get("overall", 0) for e in recent_evals]
-            avg_score = sum(scores) / len(scores)
+            avg_score = sum(scores) / len(scores) if scores else 0
             lines.append(f"Overall Intelligence Score: {avg_score:.1%}")
 
             # Trend: compare first half vs second half

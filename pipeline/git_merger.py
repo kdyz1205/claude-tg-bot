@@ -33,14 +33,19 @@ class GitMerger:
         self.remote = remote
 
     def _git(self, *args, check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git"] + list(args),
-            cwd=self.repo_dir,
-            capture_output=True,
-            text=True,
-            check=check,
-            timeout=60,
-        )
+        try:
+            return subprocess.run(
+                ["git"] + list(args),
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+                check=check,
+                timeout=60,
+            )
+        except FileNotFoundError:
+            raise RuntimeError("git executable not found")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"git {args[0] if args else ''} timed out")
 
     def fetch_all(self):
         """Fetch all remote branches."""

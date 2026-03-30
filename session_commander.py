@@ -151,12 +151,15 @@ def send_photo(path, caption=""):
 
 def list_windows():
     """List all open windows."""
-    r = subprocess.run(
-        ['powershell', '-Command',
-         'Get-Process | Where-Object {$_.MainWindowTitle -ne ""} '
-         '| Select-Object Name,MainWindowTitle | Format-Table -AutoSize'],
-        capture_output=True, text=True, timeout=15)
-    return r.stdout
+    try:
+        r = subprocess.run(
+            ['powershell', '-Command',
+             'Get-Process | Where-Object {$_.MainWindowTitle -ne ""} '
+             '| Select-Object Name,MainWindowTitle | Format-Table -AutoSize'],
+            capture_output=True, text=True, timeout=15)
+        return r.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
 
 
 def focus_window(keyword):
@@ -173,8 +176,11 @@ public class W{{[DllImport("user32.dll")]public static extern bool SetForeground
     [W]::ShowWindow($hwnd,9); [W]::SetForegroundWindow($hwnd)
     "FOCUSED: " + $p.MainWindowTitle
 }} else {{ "NOT_FOUND" }}"""
-    r = subprocess.run(['powershell', '-Command', script], capture_output=True, text=True, timeout=15)
-    return r.stdout.strip()
+    try:
+        r = subprocess.run(['powershell', '-Command', script], capture_output=True, text=True, timeout=15)
+        return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return "NOT_FOUND"
 
 
 def open_url(url):

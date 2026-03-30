@@ -290,9 +290,13 @@ def _load_lifecycle_data() -> dict:
 
 
 def _save_lifecycle_data(data: dict) -> None:
+    tmp = str(LIFECYCLE_FILE) + ".tmp"
     try:
-        with open(LIFECYCLE_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(LIFECYCLE_FILE))
     except Exception as e:
         logger.error("skill_lifecycle: save error: %s", e)
 

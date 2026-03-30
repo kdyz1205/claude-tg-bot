@@ -299,12 +299,13 @@ def record_cost(amount_usd: float, item: str = ""):
 
 def heartbeat():
     """Called periodically to confirm system is operational."""
-    _state["last_heartbeat"] = time.time()
+    with _lock:
+        _state["last_heartbeat"] = time.time()
 
-    # Calculate autonomy: % of tasks without human intervention
-    total = max(_state.get("total_tasks", 1), 1)
-    auto_tasks = _state.get("successful_tasks", 0)  # successful = autonomous
-    _state["autonomy_pct"] = (auto_tasks / total) * 100
+        # Calculate autonomy: % of tasks without human intervention
+        total = max(_state.get("total_tasks", 1), 1)
+        auto_tasks = _state.get("successful_tasks", 0)  # successful = autonomous
+        _state["autonomy_pct"] = (auto_tasks / total) * 100
 
     # Calculate runway (for subscription model: effectively infinite if active)
     boot_time = _state.get("boot_time")

@@ -202,6 +202,8 @@ def _rsi(closes: list, period: int = 14) -> Optional[float]:
         d = closes[i] - closes[i - 1]
         gains.append(max(d, 0))
         losses.append(max(-d, 0))
+    if period <= 0:
+        return 100.0
     ag = sum(gains[-period:]) / period
     al = sum(losses[-period:]) / period
     if al == 0:
@@ -233,7 +235,7 @@ def _bollinger(closes: list, period: int = 20, std_mult: float = 2.0) -> dict:
         return {"upper": None, "mid": None, "lower": None, "pct_b": None}
     window = closes[-period:]
     mid = sum(window) / period
-    variance = sum((x - mid) ** 2 for x in window) / period
+    variance = sum((x - mid) ** 2 for x in window) / period if period > 0 else 0
     std = variance ** 0.5
     upper = mid + std_mult * std
     lower = mid - std_mult * std
@@ -293,6 +295,8 @@ def _macd(closes: list) -> dict:
     macd_line = [a - b if a is not None and b is not None else None
                  for a, b in zip(ema12, ema26)]
     valid = [x for x in macd_line if x is not None]
+    if not valid:
+        return {"line": None, "signal": None, "hist": None}
     signal = _ema(valid, 9) if len(valid) >= 9 else [None]
     hist = (valid[-1] - signal[-1]) if valid and signal[-1] is not None else None
     return {"line": valid[-1] if valid else None, "signal": signal[-1], "hist": hist}
@@ -380,7 +384,8 @@ async def _strategy_smart_money(symbol: str, candles: list, cfg: dict) -> dict:
             total_range = highs[i] - lows[i]
             if total_range > 0:
                 body_ratio = body / total_range
-                avg_vol = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else volumes[-1]
+                vol_slice = volumes[-20:]
+                avg_vol = sum(vol_slice) / len(vol_slice) if vol_slice else volumes[-1]
                 if body_ratio > 0.7 and volumes[i] > avg_vol * 1.5:
                     score += 15
                     if closes[i] > opens[i]:
@@ -576,7 +581,7 @@ def _strategy_momentum(candles: list, cfg: dict) -> dict:
         ema5 = _ema(closes, 5)[-1]
         ema21 = _ema(closes, 21)[-1]
         ema55 = _ema(closes, 55)[-1]
-        if ema5 and ema21 and ema55:
+        if ema5 is not None and ema21 is not None and ema55 is not None:
             if ema5 > ema21 > ema55:
                 score += 15
                 direction_votes["long"] += 1
@@ -676,7 +681,7 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
         "entry_price": price,
         "stop_loss": round(sl, 4),
         "take_profit": round(tp, 4),
-        "risk_reward": round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0,
+        "risk_reward": round(tp_dist / sl_dist, 2) if sl_dist > 0 else None,
         "atr": round(atr_val, 4) if atr_val else None,
         "adx": adx_val,
         "strategies": {
@@ -706,17 +711,17 @@ async def scan_all_pro(cfg: dict = None) -> list:
 
 def format_pro_signal(sig: dict) -> str:
     """Format signal for Telegram."""
-    emoji = "\U0001f7e2" if sig["direction"] == "long" else "\U0001f534"
-    score = sig["combined_score"]
+    emoji = "\U0001f7e2" if sig.get("direction") == "long" else "\U0001f534"
+    score = sig.get("combined_score", 0)
     score_bar = "\u2588" * int(score // 10) + "\u2591" * (10 - int(score // 10))
     rr = sig.get("risk_reward", 0)
 
     lines = [
-        f"{emoji} **{sig['symbol']}** {sig['direction'].upper()}",
+        f"{emoji} **{sig.get('symbol', '?')}** {sig.get('direction', '?').upper()}",
         f"  \u7efc\u5408\u8bc4\u5206: {score:.0f}/100 [{score_bar}]",
-        f"  \u5165\u573a: ${sig['entry_price']:.4f}",
-        f"  \u6b62\u635f: ${sig['stop_loss']:.4f}  |  \u6b62\u76c8: ${sig['take_profit']:.4f}",
-        f"  \u98ce\u62a5\u6bd4: 1:{rr:.1f}  |  \u5171\u8bc6: {sig['consensus']}",
+        f"  \u5165\u573a: ${sig.get('entry_price', 0):.4f}",
+        f"  \u6b62\u635f: ${sig.get('stop_loss', 0):.4f}  |  \u6b62\u76c8: ${sig.get('take_profit', 0):.4f}",
+        f"  \u98ce\u62a5\u6bd4: 1:{rr:.1f}  |  \u5171\u8bc6: {sig.get('consensus', '?')}",
     ]
 
     if sig.get("adx"):
@@ -805,15 +810,15 @@ class ProStrategyEngine:
 def _record_signal(sig: dict) -> None:
     perf = _load_pro_perf()
     entry = {
-        "symbol": sig["symbol"],
-        "direction": sig["direction"],
-        "score": sig["combined_score"],
-        "entry_price": sig["entry_price"],
-        "sl": sig["stop_loss"],
-        "tp": sig["take_profit"],
+        "symbol": sig.get("symbol", "UNKNOWN"),
+        "direction": sig.get("direction", "neutral"),
+        "score": sig.get("combined_score", 0),
+        "entry_price": sig.get("entry_price", 0),
+        "sl": sig.get("stop_loss", 0),
+        "tp": sig.get("take_profit", 0),
         "rr": sig.get("risk_reward"),
-        "consensus": sig["consensus"],
-        "timestamp": sig["timestamp"],
+        "consensus": sig.get("consensus", "?"),
+        "timestamp": sig.get("timestamp", time.time()),
         "outcome": None,
     }
     perf["signals"].append(entry)

@@ -50,9 +50,12 @@ if ($found) {{
 }}
 """
 
-    result = subprocess.run(['powershell', '-Command', script],
-                          capture_output=True, text=True, encoding='utf-8', errors='replace',
-                          timeout=15)
+    try:
+        result = subprocess.run(['powershell', '-Command', script],
+                              capture_output=True, text=True, encoding='utf-8', errors='replace',
+                              timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
     output = result.stdout.strip()
     print(output)
     return output.startswith('FOCUSED:')
@@ -66,9 +69,12 @@ foreach ($p in $procs) {
     Write-Output "$($p.Id)|$($p.ProcessName)|$($p.MainWindowTitle)"
 }
 """
-    result = subprocess.run(['powershell', '-Command', script],
-                          capture_output=True, text=True, encoding='utf-8', errors='replace',
-                          timeout=15)
+    try:
+        result = subprocess.run(['powershell', '-Command', script],
+                              capture_output=True, text=True, encoding='utf-8', errors='replace',
+                              timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
     windows = []
     for line in result.stdout.strip().split('\n'):
         if '|' in line:
@@ -110,9 +116,12 @@ if ($found) {{
     Write-Output "NOT_FOUND. Chrome windows: $titles"
 }}
 """
-    result = subprocess.run(['powershell', '-Command', script],
-                          capture_output=True, text=True, encoding='utf-8', errors='replace',
-                          timeout=15)
+    try:
+        result = subprocess.run(['powershell', '-Command', script],
+                              capture_output=True, text=True, encoding='utf-8', errors='replace',
+                              timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
     output = result.stdout.strip()
     print(output)
     return output.startswith('FOCUSED:')
@@ -139,7 +148,10 @@ if __name__ == '__main__':
             success = focus_chrome_with_url('claude.ai')
         if not success:
             print("Claude Code not found in Chrome. Opening new window...")
-            subprocess.Popen(['start', 'chrome', '--new-window', 'https://claude.ai/code'], shell=True)
+            try:
+                subprocess.Popen(['start', 'chrome', '--new-window', 'https://claude.ai/code'], shell=True)
+            except (FileNotFoundError, OSError):
+                print("Failed to launch Chrome")
             time.sleep(3)
     else:
         find_and_focus(target)
