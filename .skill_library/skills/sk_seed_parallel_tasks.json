@@ -1,0 +1,49 @@
+{
+  "id": "sk_seed_parallel_tasks",
+  "title": "多任务并发队列",
+  "summary": "asyncio并发处理多条消息 + 任务队列管理",
+  "task_type": "code_create",
+  "function_signature": "enqueue_task(coro) / get_running_tasks()",
+  "input_schema": "异步协程",
+  "output_schema": "任务ID，后台执行",
+  "trigger_pattern": "并发 多任务 队列 asyncio concurrent task queue",
+  "keywords": [
+    "asyncio",
+    "并发",
+    "队列",
+    "task",
+    "cancel",
+    "并行",
+    "多任务"
+  ],
+  "generic_steps": [
+    "asyncio.create_task创建后台任务",
+    "dict跟踪运行中任务",
+    "/tasks显示状态",
+    "/cancel取消"
+  ],
+  "specific_steps": [
+    "消息handler立即返回不阻塞",
+    "任务完成后从dict移除"
+  ],
+  "template_code": "_tasks: dict[str, asyncio.Task] = {}\nasync def enqueue(coro, tid):\n    task = asyncio.create_task(coro)\n    _tasks[tid] = task\n    task.add_done_callback(lambda t: _tasks.pop(tid, None))",
+  "key_decisions": [
+    "dict存任务引用以便cancel",
+    "done_callback自动清理"
+  ],
+  "files_created": [],
+  "use_count": 0,
+  "last_used": null,
+  "avg_score_when_used": null,
+  "version": 1,
+  "history": [
+    {
+      "version": 1,
+      "date": "2026-03-29",
+      "change": "seeded from evolution task 4"
+    }
+  ],
+  "created_at": "2026-03-29T07:59:56.690198",
+  "updated_at": "2026-03-29T07:59:56.690198",
+  "code_snippet": "_tasks: dict[str, asyncio.Task] = {}\nasync def enqueue(coro, tid):\n    task = asyncio.create_task(coro)\n    _tasks[tid] = task\n    task.add_done_callback(lambda t: _tasks.pop(tid, None))"
+}

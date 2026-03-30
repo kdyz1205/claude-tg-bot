@@ -215,7 +215,7 @@ def start_bot(bot_dir):
     bot_log = bot_dir / "selftest_bot.log"
     bot_log_fh = None
     try:
-        bot_log_fh = open(str(bot_log), "w", encoding="utf-8", errors="replace")
+        bot_log_fh = open(str(bot_log), "w", encoding="utf-8", errors="replace")  # noqa: SIM115 — handle passed to subprocess, closed via proc._log_fh later
         proc = subprocess.Popen(
             [sys.executable, "run.py"],
             cwd=str(bot_dir),

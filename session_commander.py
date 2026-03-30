@@ -21,7 +21,10 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 _raw_uid = os.getenv('AUTHORIZED_USER_ID')
-USER_ID = int(_raw_uid) if _raw_uid else None
+try:
+    USER_ID = int(_raw_uid) if _raw_uid else None
+except (ValueError, TypeError):
+    USER_ID = None
 
 # --- Configuration ---
 CONFIG_PATH = Path(__file__).parent / "session_commander_config.json"

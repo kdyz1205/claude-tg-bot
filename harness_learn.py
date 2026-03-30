@@ -207,7 +207,7 @@ def detect_patterns(scores: list[dict]) -> list[str]:
 
     # Average completion rate
     completions = [s.get("scores", {}).get("completion", 0) for s in scores]
-    avg_completion = sum(completions) / len(completions)
+    avg_completion = sum(completions) / len(completions) if completions else 0
     if avg_completion < 0.5:
         insights.append(f"ALERT: Low completion rate ({avg_completion:.0%}). Agent may be struggling.")
     elif avg_completion > 0.8:
@@ -220,7 +220,7 @@ def detect_patterns(scores: list[dict]) -> list[str]:
 
     # Average overall score
     overall_scores = [s.get("overall", 0) for s in scores]
-    avg_overall = sum(overall_scores) / len(overall_scores)
+    avg_overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0
     insights.append(f"OVERALL: Average score {avg_overall:.2f}/1.00 over last {len(scores)} interactions.")
 
     return insights

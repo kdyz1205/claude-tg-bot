@@ -270,6 +270,7 @@ class SelfMonitor:
         self._bot_start_time: float = time.time()
         self._last_health: dict = {}
         self._last_alert_times: dict[str, float] = {}
+        self._repair_log_handler: logging.Handler | None = None
 
         # Service health tracking — tracks each backend independently
         self._service_health: dict[str, dict] = {}  # service -> {failures, last_success, last_failure, state}
@@ -285,6 +286,11 @@ class SelfMonitor:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop())
+        # Start code self-repair engine and install log handler
+        await code_repair.start()
+        _repair_handler = RepairLogHandler(code_repair)
+        logging.getLogger().addHandler(_repair_handler)
+        self._repair_log_handler = _repair_handler
         logger.info("SelfMonitor started (interval=%ds)", self._interval)
 
     async def stop(self) -> None:
@@ -297,6 +303,12 @@ class SelfMonitor:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        # Stop repair engine and remove log handler
+        await code_repair.stop()
+        handler = getattr(self, "_repair_log_handler", None)
+        if handler:
+            logging.getLogger().removeHandler(handler)
+            self._repair_log_handler = None
         logger.info("SelfMonitor stopped")
 
     async def _loop(self) -> None:
@@ -617,7 +629,10 @@ class SelfMonitor:
             recent = [e[1] for e in self._recent_errors if e[0] >= cutoff]
             if len(recent) >= 3:
                 counter = Counter(recent)
-                top_err, top_count = counter.most_common(1)[0]
+                most_common = counter.most_common(1)
+                if not most_common:
+                    return anomalies
+                top_err, top_count = most_common[0]
                 if top_count >= 3:
                     anomalies.append({
                         "type": "repeated_error",
@@ -746,6 +761,378 @@ class SelfMonitor:
 
 
 # ---------------------------------------------------------------------------
+# RepairLogHandler — captures tracebacks from Python logging
+# ---------------------------------------------------------------------------
+
+class RepairLogHandler(logging.Handler):
+    """Logging handler that feeds error tracebacks to CodeSelfRepair."""
+
+    def __init__(self, repair_engine: "CodeSelfRepair"):
+        super().__init__(level=logging.ERROR)
+        self._engine = repair_engine
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Only process records that have exception info
+        if not record.exc_info:
+            return
+        try:
+            import traceback as _tb
+            parts = [self.format(record)]
+            if record.exc_info[2] is not None:
+                parts.append("".join(_tb.format_exception(*record.exc_info)))
+            full_text = "\n".join(parts)
+            self._engine.feed_error(full_text)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# CodeSelfRepair — detect errors and auto-patch .py files via Claude CLI
+# ---------------------------------------------------------------------------
+
+class CodeSelfRepair:
+    """Monitors Python error logs and auto-repairs detected issues."""
+
+    REPAIR_LOG = os.path.join(BOT_DIR, ".repair_log.jsonl")
+    CLAUDE_CMD = os.path.join(
+        os.path.expanduser("~"), "AppData", "Roaming", "npm", "claude.cmd"
+    )
+
+    # (pattern, base_confidence)
+    _ERROR_DEFS: list[tuple[str, re.Pattern, float]] = [
+        ("SyntaxError",      re.compile(r"SyntaxError: (.+)"),                         0.90),
+        ("IndentationError", re.compile(r"IndentationError: (.+)"),                    0.88),
+        ("NameError",        re.compile(r"NameError: name '(.+?)' is not defined"),    0.65),
+        ("ImportError",      re.compile(r"(?:Import|ModuleNotFound)Error: (.+)"),      0.70),
+        ("AttributeError",   re.compile(r"AttributeError: (.+)"),                      0.60),
+    ]
+
+    _FILE_LINE_RE = re.compile(r'File "([^"]+\.py)", line (\d+)')
+
+    def __init__(self) -> None:
+        self._pending_errors: "asyncio.Queue[str]" = asyncio.Queue(maxsize=50)
+        self._repair_task: asyncio.Task | None = None
+        self._running = False
+        # Cooldown: don't re-repair the same file within 5 min
+        self._recently_repaired: dict[str, float] = {}
+        # Dedup: don't process identical error text twice
+        self._seen_errors: deque[str] = deque(maxlen=100)
+
+    # ── lifecycle ─────────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._repair_task = asyncio.create_task(self._repair_loop())
+        logger.info("CodeSelfRepair started")
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._repair_task and not self._repair_task.done():
+            self._repair_task.cancel()
+            try:
+                await self._repair_task
+            except asyncio.CancelledError:
+                pass
+        self._repair_task = None
+        logger.info("CodeSelfRepair stopped")
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def feed_error(self, error_text: str) -> None:
+        """Feed a traceback/error string for analysis (thread-safe)."""
+        # Quick dedup: hash first 500 chars
+        key = error_text[:500]
+        if key in self._seen_errors:
+            return
+        self._seen_errors.append(key)
+        try:
+            self._pending_errors.put_nowait(error_text)
+        except asyncio.QueueFull:
+            pass
+
+    def get_recent_repairs(self, n: int = 10) -> list[dict]:
+        """Return the n most recent repair records (newest first)."""
+        try:
+            if not os.path.exists(self.REPAIR_LOG):
+                return []
+            records: list[dict] = []
+            with open(self.REPAIR_LOG, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            records.append(json.loads(line))
+                        except Exception:
+                            pass
+            return records[-n:][::-1]
+        except Exception as exc:
+            logger.warning("CodeSelfRepair: failed to read repair log: %s", exc)
+            return []
+
+    # ── internal loop ─────────────────────────────────────────────────────
+
+    async def _repair_loop(self) -> None:
+        while self._running:
+            try:
+                error_text = await asyncio.wait_for(
+                    self._pending_errors.get(), timeout=5.0
+                )
+                await self._process_error(error_text)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("CodeSelfRepair loop error: %s", exc, exc_info=True)
+
+    async def _process_error(self, error_text: str) -> None:
+        """Parse traceback, locate file/line, generate and apply fix."""
+        matches = self._FILE_LINE_RE.findall(error_text)
+        if not matches:
+            return
+
+        # Use innermost (last) traceback entry
+        filepath, lineno_str = matches[-1]
+        lineno = int(lineno_str)
+
+        # Only repair files inside BOT_DIR
+        try:
+            filepath = os.path.normpath(filepath)
+            if not filepath.startswith(os.path.normpath(BOT_DIR)):
+                return
+        except Exception:
+            return
+
+        # Cooldown check
+        now = time.time()
+        if filepath in self._recently_repaired:
+            if now - self._recently_repaired[filepath] < 300:
+                return
+
+        # Detect error type
+        error_type = error_msg = ""
+        base_confidence = 0.5
+        for etype, pattern, conf in self._ERROR_DEFS:
+            m = pattern.search(error_text)
+            if m:
+                error_type = etype
+                error_msg = m.group(1)[:200]
+                base_confidence = conf
+                break
+        if not error_type:
+            return
+
+        # Read context (±10 lines)
+        context_lines, start_line = self._read_context(filepath, lineno)
+        if not context_lines:
+            return
+
+        logger.info(
+            "CodeSelfRepair: %s in %s:%d — attempting fix",
+            error_type, os.path.basename(filepath), lineno,
+        )
+
+        # Generate fix
+        fixed_code, confidence = await self._generate_fix(
+            filepath, lineno, error_type, error_msg, context_lines, start_line, base_confidence
+        )
+        if not fixed_code:
+            self._record_repair(
+                filepath=filepath, lineno=lineno, error_type=error_type,
+                error_msg=error_msg, confidence=0.0, diff="", success=False, backed_up=False,
+            )
+            return
+
+        # Apply fix
+        success, diff, backed_up = await self._apply_fix(
+            filepath, context_lines, start_line, fixed_code, confidence
+        )
+
+        self._record_repair(
+            filepath=filepath, lineno=lineno, error_type=error_type,
+            error_msg=error_msg, confidence=confidence, diff=diff,
+            success=success, backed_up=backed_up,
+        )
+
+        if success:
+            self._recently_repaired[filepath] = now
+            logger.info(
+                "CodeSelfRepair: repaired %s:%d (%s, confidence=%.2f)",
+                os.path.basename(filepath), lineno, error_type, confidence,
+            )
+        else:
+            logger.warning(
+                "CodeSelfRepair: repair FAILED for %s:%d (%s)",
+                os.path.basename(filepath), lineno, error_type,
+            )
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    def _read_context(self, filepath: str, lineno: int, radius: int = 10) -> tuple[list[str], int]:
+        """Read ±radius lines around lineno. Returns (lines, 1-indexed start)."""
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+        except Exception as exc:
+            logger.warning("CodeSelfRepair: cannot read %s: %s", filepath, exc)
+            return [], 0
+        start_idx = max(0, lineno - radius - 1)
+        end_idx = min(len(all_lines), lineno + radius)
+        return all_lines[start_idx:end_idx], start_idx + 1
+
+    async def _generate_fix(
+        self,
+        filepath: str,
+        lineno: int,
+        error_type: str,
+        error_msg: str,
+        context_lines: list[str],
+        start_line: int,
+        base_confidence: float,
+    ) -> tuple[str | None, float]:
+        """Call Claude CLI to generate a patch. Returns (fixed_code, confidence)."""
+        fname = os.path.basename(filepath)
+        numbered = "".join(
+            f"{start_line + i:4d}: {line}"
+            for i, line in enumerate(context_lines)
+        )
+        prompt = (
+            f"Fix this Python {error_type} in {fname}:\n"
+            f"Error: {error_type}: {error_msg}\n"
+            f"Error location: {fname} line {lineno}\n\n"
+            f"Code context (lines {start_line}-{start_line + len(context_lines) - 1}):\n"
+            f"```python\n{numbered}```\n\n"
+            f"Return ONLY the corrected Python code for those lines. "
+            f"No explanations, no markdown fences, no line numbers. "
+            f"Keep all unchanged lines exactly as-is."
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.CLAUDE_CMD,
+                "-p", prompt,
+                "--output-format", "text",
+                "--dangerously-skip-permissions",
+                "--model", "claude-haiku-4-5-20251001",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=BOT_DIR,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+            if proc.returncode != 0:
+                logger.warning(
+                    "CodeSelfRepair: Claude CLI rc=%d: %s",
+                    proc.returncode, stderr.decode(errors="replace")[:200],
+                )
+                return None, 0.0
+            fixed_code = stdout.decode("utf-8", errors="replace").strip()
+            if not fixed_code:
+                return None, 0.0
+            # Confidence adjustment: check if patch is valid Python in isolation
+            import ast as _ast
+            try:
+                _ast.parse(fixed_code)
+                confidence = base_confidence
+            except SyntaxError:
+                # Still might be valid when embedded in full file; lower confidence
+                confidence = base_confidence * 0.4
+            return fixed_code, confidence
+        except asyncio.TimeoutError:
+            logger.warning("CodeSelfRepair: Claude CLI timed out for %s", fname)
+            return None, 0.0
+        except Exception as exc:
+            logger.warning("CodeSelfRepair: _generate_fix error: %s", exc)
+            return None, 0.0
+
+    async def _apply_fix(
+        self,
+        filepath: str,
+        context_lines: list[str],
+        start_line: int,
+        fixed_code: str,
+        confidence: float,
+    ) -> tuple[bool, str, bool]:
+        """Write the fix to disk. Returns (success, diff, backed_up)."""
+        import difflib as _difflib
+        import ast as _ast
+        backed_up = False
+        diff = ""
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                original_lines = f.readlines()
+
+            # Backup on low confidence
+            if confidence < 0.7:
+                backup_path = filepath + f".bak.{int(time.time())}"
+                with open(backup_path, "w", encoding="utf-8") as f:
+                    f.writelines(original_lines)
+                backed_up = True
+                logger.info("CodeSelfRepair: backed up %s -> %s",
+                            os.path.basename(filepath), os.path.basename(backup_path))
+
+            # Build diff
+            fixed_lines = [
+                (ln if ln.endswith("\n") else ln + "\n")
+                for ln in fixed_code.splitlines()
+            ]
+            diff_lines = list(_difflib.unified_diff(
+                context_lines,
+                fixed_lines,
+                fromfile=f"{os.path.basename(filepath)} (original)",
+                tofile=f"{os.path.basename(filepath)} (fixed)",
+                lineterm="",
+            ))
+            diff = "\n".join(diff_lines[:80])
+
+            # Splice into full file
+            end_idx = start_line - 1 + len(context_lines)
+            new_lines = original_lines[:start_line - 1] + fixed_lines + original_lines[end_idx:]
+
+            # Validate entire file before writing
+            try:
+                _ast.parse("".join(new_lines))
+            except SyntaxError as se:
+                logger.warning(
+                    "CodeSelfRepair: repaired file still has SyntaxError at line %d: %s",
+                    se.lineno, se.msg,
+                )
+                return False, diff, backed_up
+
+            # Atomic write
+            tmp = filepath + ".repair.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+            os.replace(tmp, filepath)
+            return True, diff, backed_up
+
+        except Exception as exc:
+            logger.warning("CodeSelfRepair: _apply_fix error for %s: %s", filepath, exc)
+            return False, diff, backed_up
+
+    def _record_repair(
+        self, *, filepath: str, lineno: int, error_type: str, error_msg: str,
+        confidence: float, diff: str, success: bool, backed_up: bool,
+    ) -> None:
+        record = {
+            "ts": datetime.now().isoformat(),
+            "file": os.path.basename(filepath),
+            "line": lineno,
+            "error_type": error_type,
+            "error_msg": error_msg[:300],
+            "confidence": round(confidence, 3),
+            "diff": diff[:2000],
+            "success": success,
+            "backed_up": backed_up,
+        }
+        try:
+            with open(self.REPAIR_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("CodeSelfRepair: failed to write repair log: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
@@ -791,3 +1178,4 @@ def _format_duration(seconds: float) -> str:
 
 action_memory = ActionMemory()
 self_monitor = SelfMonitor()
+code_repair = CodeSelfRepair()

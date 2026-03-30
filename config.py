@@ -32,7 +32,7 @@ if AUTHORIZED_USER_ID is None:
     )
 
 # ─── AI Models ────────────────────────────────────────────────────────────────
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 CURRENT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "claude")
@@ -110,6 +110,9 @@ except ValueError:
 
 # ─── Proactive Agent ─────────────────────────────────────────────────────────
 PROACTIVE_AGENT_ENABLED = os.getenv("PROACTIVE_AGENT_ENABLED", "true").lower() == "true"
+
+# ─── Market Monitor ───────────────────────────────────────────────────────────
+MARKET_MONITOR_ENABLED = os.getenv("MARKET_MONITOR_ENABLED", "true").lower() == "true"
 
 # ─── Never-Die Fallback Chain ────────────────────────────────────────────────
 # The bot should NEVER stop responding. When one provider fails, switch to next.

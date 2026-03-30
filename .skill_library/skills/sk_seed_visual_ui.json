@@ -1,0 +1,48 @@
+{
+  "id": "sk_seed_visual_ui",
+  "title": "视觉UI定位点击",
+  "summary": "SOM截图标注 + fallback链点击UI元素",
+  "task_type": "code_create",
+  "function_signature": "ui_click_element(name_or_idx, fuzzy=True)",
+  "input_schema": "元素名称(模糊匹配) 或 SOM标注序号",
+  "output_schema": "click成功/失败",
+  "trigger_pattern": "点击元素 UI自动化 截图定位 som click",
+  "keywords": [
+    "som",
+    "ui_click",
+    "截图",
+    "点击",
+    "定位",
+    "元素",
+    "fallback"
+  ],
+  "generic_steps": [
+    "som_screenshot标注元素",
+    "fuzzy名称匹配",
+    "依次尝试browser_click→ui_click→som_click→smartclick"
+  ],
+  "specific_steps": [
+    "不区分大小写部分匹配",
+    "Windows UI Automation树"
+  ],
+  "template_code": "# fallback chain\nfor method in [browser_click, ui_click, som_click, smartclick]:\n    try:\n        if method(target): return True\n    except: continue\nreturn False",
+  "key_decisions": [
+    "fallback链保证可靠性",
+    "SOM标注用数字序号便于LLM引用"
+  ],
+  "files_created": [],
+  "use_count": 2,
+  "last_used": "2026-03-29T13:03:13.954836",
+  "avg_score_when_used": 0.72,
+  "version": 1,
+  "history": [
+    {
+      "version": 1,
+      "date": "2026-03-29",
+      "change": "seeded from evolution task 2"
+    }
+  ],
+  "created_at": "2026-03-29T07:59:56.687765",
+  "updated_at": "2026-03-29T07:59:56.687765",
+  "code_snippet": "# fallback chain\nfor method in [browser_click, ui_click, som_click, smartclick]:\n    try:\n        if method(target): return True\n    except: continue\nreturn False"
+}

@@ -994,6 +994,40 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "smart_ui_click",
+        "description": "Click a UI element using an automatic 4-step fallback chain: (0) browser_click via CSS selector if browser_selector provided, (1) ui_click_element via accessibility tree, (2) som_screenshot + som_click, (3) smartclick at fallback coordinates. Use this when you want maximum reliability without manually trying each method.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "element_name": {
+                    "type": "string",
+                    "description": "Name or text of the element to click. Case-insensitive, partial match supported.",
+                },
+                "browser_selector": {
+                    "type": "string",
+                    "description": "CSS selector or visible text for browser_click (step 0). Provide when the target is in a browser page. Example: '#submit-btn', 'Sign in', 'button[type=submit]'.",
+                },
+                "window_title": {
+                    "type": "string",
+                    "description": "Partial window title to target. Omit for the currently focused window.",
+                },
+                "element_type": {
+                    "type": "string",
+                    "description": "Control type hint: Button, Edit, MenuItem, etc. Improves SoM fallback matching.",
+                },
+                "fallback_x": {
+                    "type": "integer",
+                    "description": "X coordinate for last-resort smartclick if all other methods fail.",
+                },
+                "fallback_y": {
+                    "type": "integer",
+                    "description": "Y coordinate for last-resort smartclick if all other methods fail.",
+                },
+            },
+            "required": ["element_name"],
+        },
+    },
+    {
         "name": "suggest_tool",
         "description": "Given an action description, suggests the most precise tool to use. Considers whether you're in a browser or desktop app and recommends selector-based, accessibility tree, or SoM methods. Use this when unsure which tool is best for an interaction.",
         "input_schema": {
@@ -1005,6 +1039,61 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["action"],
+        },
+    },
+    # === Self-Fix & Session Control ===
+    {
+        "name": "self_fix",
+        "description": "Scan bot's own Python files for syntax errors & bugs, fix them automatically. Use when user asks to 'fix bugs', '修复bug', '自修复'. Runs py_compile on all .py files, finds errors, reads broken files, applies fixes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["syntax", "deep", "all"],
+                    "description": "syntax = py_compile only, deep = also check imports/runtime, all = full audit",
+                },
+            },
+        },
+    },
+    {
+        "name": "send_to_session",
+        "description": "Send a message/prompt to a Claude Code CLI session. Use when user says '发送到session', 'send to session', '给session发消息'. Can resume existing session or start new one.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The message/prompt to send to the session",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Session ID to resume (optional). If omitted, starts a new session.",
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Working directory for the session (defaults to bot project dir)",
+                },
+            },
+            "required": ["message"],
+        },
+    },
+    {
+        "name": "codex_task",
+        "description": "Run a task via Codex (claude.ai/code browser automation). Use when CLI credits are exhausted, or user says '用codex', 'codex充能', 'web执行'. Requires Chrome logged into claude.ai with CDP enabled.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The task prompt to send to Claude Code web",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default 600)",
+                },
+            },
+            "required": ["prompt"],
         },
     },
 ]
@@ -2676,6 +2765,47 @@ async def execute_tool(tool_name: str, tool_input: dict):
             )
         except Exception as e:
             result = f"UI type error: {e}"
+    elif tool_name == "smart_ui_click":
+        try:
+            import vision_engine
+            attempts = []
+            # Step 0: browser_click (highest precision for web targets)
+            browser_selector = tool_input.get("browser_selector")
+            if browser_selector:
+                try:
+                    br_result = await browser_agent.browser_click(browser_selector)
+                    if "error" not in br_result.lower() and "not found" not in br_result.lower():
+                        result = json.dumps({
+                            "success": True,
+                            "method": "browser_click",
+                            "message": br_result,
+                            "attempts": [f"browser_click: {br_result}"],
+                        }, ensure_ascii=False)
+                        attempts = None  # signal early exit
+                    else:
+                        attempts.append(f"browser_click: {br_result}")
+                except Exception as _be:
+                    attempts.append(f"browser_click: exception: {_be}")
+
+            if attempts is not None:
+                # Steps 1-3: accessibility tree → SoM → smartclick
+                _loop = asyncio.get_running_loop()
+                res = await _loop.run_in_executor(
+                    None, lambda: vision_engine.smart_ui_click(
+                        element_name=tool_input["element_name"],
+                        window_title=tool_input.get("window_title"),
+                        element_type=tool_input.get("element_type"),
+                        fallback_x=tool_input.get("fallback_x"),
+                        fallback_y=tool_input.get("fallback_y"),
+                    ),
+                )
+                # Prepend browser_click attempts if any
+                if attempts:
+                    res.setdefault("attempts", [])
+                    res["attempts"] = attempts + res["attempts"]
+                result = json.dumps(res, indent=2, ensure_ascii=False)
+        except Exception as e:
+            result = f"smart_ui_click error: {e}"
     elif tool_name == "suggest_tool":
         try:
             import vision_engine
@@ -2685,6 +2815,102 @@ async def execute_tool(tool_name: str, tool_input: dict):
             result = json.dumps(suggestion, indent=2, ensure_ascii=False)
         except Exception as e:
             result = f"Suggest tool error: {e}"
+    elif tool_name == "self_fix":
+        try:
+            scope = tool_input.get("scope", "syntax")
+            bot_dir = os.path.dirname(os.path.abspath(__file__))
+            errors = []
+            fixed = []
+
+            # Step 1: py_compile all .py files
+            py_files = sorted(Path(bot_dir).glob("*.py"))
+            for pf in py_files:
+                try:
+                    proc = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda f=pf: subprocess.run(
+                            [sys.executable, "-m", "py_compile", str(f)],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                    )
+                    if proc.returncode != 0:
+                        errors.append({"file": pf.name, "error": (proc.stderr or proc.stdout).strip()})
+                except Exception as e:
+                    errors.append({"file": pf.name, "error": str(e)})
+
+            if errors:
+                result = f"🔍 Found {len(errors)} syntax error(s):\n" + "\n".join(
+                    f"  ❌ {e['file']}: {e['error'][:200]}" for e in errors
+                )
+                result += "\n\n→ Read each file, fix the errors, then call self_fix again to verify."
+            else:
+                result = f"✅ All {len(py_files)} Python files compile clean. No syntax errors."
+
+            if scope in ("deep", "all"):
+                result += "\n\n📋 Deep scan: check import errors and runtime issues manually with `run_command`."
+        except Exception as e:
+            result = f"Self-fix error: {e}"
+
+    elif tool_name == "codex_task":
+        try:
+            from codex_charger import CodexCharger
+            prompt = tool_input["prompt"]
+            timeout = tool_input.get("timeout", 600)
+            charger = CodexCharger()
+            loop = asyncio.get_running_loop()
+            codex_result = await loop.run_in_executor(
+                None, lambda: charger.run_task_sync(prompt)
+            )
+            if codex_result["success"]:
+                result = f"✅ Codex完成 ({codex_result['duration']:.0f}s):\n{codex_result['output'][:3000]}"
+            else:
+                result = f"❌ Codex失败: {codex_result['error'][:500]}\n输出: {codex_result['output'][:1000]}"
+        except ImportError:
+            result = "❌ codex_charger模块不可用"
+        except Exception as e:
+            result = f"Codex error: {e}"
+
+    elif tool_name == "send_to_session":
+        try:
+            import shutil
+            message = tool_input["message"]
+            session_id = tool_input.get("session_id")
+            project_dir = tool_input.get("project_dir") or os.path.dirname(os.path.abspath(__file__))
+
+            # Find claude CLI
+            claude_cmd = None
+            for c in [shutil.which("claude.cmd"), shutil.which("claude"),
+                       str(Path.home() / "AppData/Roaming/npm/claude.cmd")]:
+                if c and Path(c).is_file():
+                    claude_cmd = c
+                    break
+            if not claude_cmd:
+                claude_cmd = "claude.cmd"
+
+            cmd = [claude_cmd, "-p", message,
+                   "--output-format", "text",
+                   "--dangerously-skip-permissions"]
+            if session_id:
+                cmd.extend(["--resume", session_id])
+
+            proc = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=300, cwd=project_dir,
+                    encoding="utf-8", errors="replace",
+                )
+            )
+            output = (proc.stdout or "").strip()
+            if proc.returncode == 0 and output:
+                result = f"✅ Session响应:\n{output[:3000]}"
+            elif proc.returncode == 0:
+                result = "✅ 已发送到session（无输出）"
+            else:
+                result = f"❌ Session错误 (code {proc.returncode}):\n{(proc.stderr or output)[:1000]}"
+        except subprocess.TimeoutExpired:
+            result = "⏳ Session超时（5分钟），任务可能仍在执行"
+        except Exception as e:
+            result = f"Session error: {e}"
+
     else:
         result = f"Unknown tool: {tool_name}"
 

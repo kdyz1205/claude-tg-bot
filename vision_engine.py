@@ -13,6 +13,7 @@ Tier 3: Windows Accessibility Tree — extract the UI automation tree for deskto
          apps (like DOM for the desktop). Click by automation ID, zero guessing.
 """
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -148,10 +149,41 @@ def _get_font(size: int = 14):
     return ImageFont.load_default()
 
 
+def _try_ocr_text(img_rgb: np.ndarray, elem: dict) -> str:
+    """Extract text from a SoM element's bounding box region.
+
+    Uses pytesseract if installed; silently returns "" otherwise.
+    Scales up small regions for better accuracy.
+    """
+    x, y, w, h = elem["x"], elem["y"], elem["w"], elem["h"]
+    pad = 3
+    arr_h, arr_w = img_rgb.shape[:2]
+    x1, y1 = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(arr_w, x + w + pad), min(arr_h, y + h + pad)
+    crop = img_rgb[y1:y2, x1:x2]
+    if crop.size == 0:
+        return ""
+    try:
+        import pytesseract
+        pil_crop = Image.fromarray(crop)
+        cw, ch = pil_crop.size
+        if cw < 80:
+            factor = max(2, 80 // cw)
+            pil_crop = pil_crop.resize(
+                (cw * factor, ch * factor), Image.NEAREST,
+            )
+        return pytesseract.image_to_string(
+            pil_crop, config="--psm 7 --oem 3",
+        ).strip()
+    except Exception:
+        return ""
+
+
 def annotate_screenshot_som(
     image: Image.Image | np.ndarray | BytesIO | str,
     elements: list[dict] | None = None,
     max_elements: int = 50,
+    annotate_text: bool = True,
 ) -> tuple[Image.Image, list[dict]]:
     """Annotate a screenshot with numbered Set-of-Mark bounding boxes.
 
@@ -159,9 +191,12 @@ def annotate_screenshot_som(
         image: PIL Image, numpy array, BytesIO buffer, or file path
         elements: Pre-detected elements. If None, auto-detects.
         max_elements: Maximum elements to annotate
+        annotate_text: If True, run OCR on each element and show extracted text
+                       next to its badge (requires pytesseract).
 
     Returns:
         (annotated_image, element_list) where element_list has id/x/y/w/h/cx/cy/kind
+        Elements also get an "ocr_text" key when annotate_text=True.
     """
     # Convert input to PIL Image and numpy array
     if isinstance(image, str):
@@ -186,28 +221,60 @@ def annotate_screenshot_som(
     for idx, elem in enumerate(elements):
         elem["id"] = idx + 1
 
+    # OCR pass: extract text from each element region (if pytesseract available)
+    img_rgb = np.array(pil_img)
+    if annotate_text:
+        for elem in elements:
+            if "ocr_text" not in elem:
+                elem["ocr_text"] = _try_ocr_text(img_rgb, elem)
+
     # Draw annotations on a copy
     annotated = pil_img.copy()
     draw = ImageDraw.Draw(annotated)
-    font = _get_font(11)
+    font = _get_font(13)
+    font_small = _get_font(10)
+
+    # Kind abbreviations for compact text labels
+    _KIND_ABBR = {"button": "btn", "edit": "edit", "text": "txt",
+                  "checkbox": "chk", "radio": "rad", "combo": "cmb",
+                  "list": "lst", "menu": "mnu", "element": "el"}
 
     for elem in elements:
         eid = elem["id"]
         color = _SOM_COLORS[(eid - 1) % len(_SOM_COLORS)]
         x, y, bw, bh = elem["x"], elem["y"], elem["w"], elem["h"]
 
-        # Draw bounding box (2px border)
-        draw.rectangle([x, y, x + bw, y + bh], outline=color, width=2)
+        # Draw bounding box (3px border, more visible)
+        draw.rectangle([x, y, x + bw, y + bh], outline=color, width=3)
 
-        # Draw numbered label (top-left corner, small filled badge)
-        label = str(eid)
-        lw = len(label) * 8 + 6
-        lh = 16
-        lx = max(0, x - 1)
-        ly = max(0, y - lh - 1)
+        # Sublabel: prefer OCR text (truncated), fall back to kind abbreviation
+        ocr_text = elem.get("ocr_text", "").strip()
+        if ocr_text:
+            sublabel = ocr_text[:20]  # Keep it readable
+        else:
+            kind_abbr = _KIND_ABBR.get(elem.get("kind", "element"), elem.get("kind", "el")[:3])
+            sublabel = kind_abbr
 
+        label = f"{eid}"
+
+        # Badge dimensions — wider to fit kind text
+        char_w = 8
+        lw = max(len(label) * char_w + 6, 22)
+        lh = 20
+        lx = max(0, x)
+        ly = max(0, y - lh - 2)
+        if ly < 0:
+            ly = y + 2  # place inside box if no room above
+
+        # Dark outline for contrast, then fill
+        draw.rectangle([lx - 1, ly - 1, lx + lw + 1, ly + lh + 1], fill=(0, 0, 0))
         draw.rectangle([lx, ly, lx + lw, ly + lh], fill=color)
-        draw.text((lx + 3, ly + 1), label, fill=(255, 255, 255), font=font)
+
+        # Number in bold white
+        draw.text((lx + 3, ly + 2), label, fill=(255, 255, 255), font=font)
+
+        # OCR text / kind in small text to the right of badge
+        draw.text((lx + lw + 3, ly + 4), sublabel, fill=color, font=font_small)
 
     return annotated, elements
 
@@ -266,6 +333,136 @@ def som_click(element_id: int, elements: list[dict], button: str = "left", click
         f"Clicked element #{element_id} ({target['kind']}) at ({cx}, {cy}), "
         f"size {target['w']}x{target['h']}"
     )
+
+
+def smart_ui_click(
+    element_name: str,
+    window_title: str | None = None,
+    element_type: str | None = None,
+    fallback_x: int | None = None,
+    fallback_y: int | None = None,
+) -> dict:
+    """Click a UI element using a fallback chain for maximum reliability.
+
+    Tries in order:
+      1. ui_click_element (Windows Accessibility Tree — most precise)
+      2. som_screenshot + find element by label text → som_click
+      3. smartclick at fallback coordinates (if provided)
+
+    Args:
+        element_name: The element's name/text to find
+        window_title: Window to search in (None = foreground)
+        element_type: Control type filter (Button, Edit, etc.)
+        fallback_x: X coordinate for smartclick fallback
+        fallback_y: Y coordinate for smartclick fallback
+
+    Returns:
+        dict with keys: success (bool), method (str), message (str), attempts (list)
+    """
+    attempts = []
+
+    # --- Step 1: Accessibility Tree click ---
+    try:
+        result1 = AccessibilityTree.click_element(
+            window_title=window_title,
+            element_name=element_name,
+            element_type=element_type,
+        )
+        if "not found" not in result1.lower() and "error" not in result1.lower():
+            return {"success": True, "method": "ui_click_element", "message": result1, "attempts": [result1]}
+        attempts.append(f"ui_click: {result1}")
+    except Exception as e:
+        attempts.append(f"ui_click: exception: {e}")
+
+    # --- Step 2: SoM screenshot + OCR text matching ---
+    try:
+        raw_buf, ann_buf, elements = som_screenshot()
+        set_som_elements(elements)
+
+        if elements:
+            # Load raw image for OCR text extraction on each element
+            raw_buf.seek(0)
+            img_rgb = np.array(Image.open(raw_buf).convert("RGB"))
+            name_lower = element_name.lower().strip()
+
+            best_elem = None
+            best_score = 0.0
+
+            for elem in elements:
+                # Use cached OCR text if already computed during annotation, else compute now
+                ocr_text = elem.get("ocr_text") or _try_ocr_text(img_rgb, elem)
+                elem["ocr_text"] = ocr_text
+                text_lower = ocr_text.lower().strip()
+
+                if text_lower:
+                    # Score by text similarity
+                    if name_lower == text_lower:
+                        score = 1.0
+                    elif name_lower in text_lower:
+                        score = 0.85
+                    elif text_lower in name_lower:
+                        score = 0.75
+                    else:
+                        # Word-level overlap
+                        name_words = set(name_lower.split())
+                        text_words = set(text_lower.split())
+                        overlap = len(name_words & text_words)
+                        score = overlap / max(len(name_words), 1) * 0.6
+                else:
+                    # No OCR text — fall back to kind hint if element_type given
+                    kind = elem.get("kind", "")
+                    if element_type and element_type.lower() in kind.lower():
+                        score = 0.2
+                    else:
+                        score = 0.0
+
+                if score > best_score:
+                    best_score = score
+                    best_elem = elem
+
+            if best_elem and best_score >= 0.2:
+                result2 = som_click(best_elem["id"], elements)
+                attempts.append(
+                    f"som_click (ocr_score={best_score:.0%}, text='{best_elem.get('ocr_text','')[:30]}'): {result2}",
+                )
+                return {"success": True, "method": "som_click_ocr", "message": result2, "attempts": attempts}
+            else:
+                attempts.append(
+                    f"som_click: no element matched '{element_name}' "
+                    f"(best_score={best_score:.0%}, {len(elements)} elements checked)",
+                )
+        else:
+            attempts.append("som_click: no elements detected on screen")
+    except Exception as e:
+        attempts.append(f"som_click: exception: {e}")
+
+    # --- Step 3: smartclick at fallback coordinates ---
+    if fallback_x is not None and fallback_y is not None:
+        try:
+            import pyautogui
+            import time as _time
+            from PIL import ImageGrab
+
+            before = ImageGrab.grab()
+            pyautogui.click(fallback_x, fallback_y)
+            _time.sleep(0.15)
+            after = ImageGrab.grab()
+
+            import numpy as _np
+            diff = _np.abs(_np.array(before).astype(int) - _np.array(after).astype(int))
+            changed = bool(diff.mean() > 0.5)
+            msg = f"smartclick at ({fallback_x},{fallback_y}), screen_changed={changed}"
+            attempts.append(f"smartclick: {msg}")
+            return {"success": True, "method": "smartclick", "message": msg, "attempts": attempts}
+        except Exception as e:
+            attempts.append(f"smartclick: exception: {e}")
+
+    return {
+        "success": False,
+        "method": "none",
+        "message": f"All click methods failed for '{element_name}'",
+        "attempts": attempts,
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -771,31 +968,71 @@ class AccessibilityTree:
 
             # Build search criteria
             criteria = {}
-            if element_name:
-                criteria["title"] = element_name
             if element_auto_id:
                 criteria["auto_id"] = element_auto_id
             if element_type:
                 criteria["control_type"] = element_type
 
-            if not criteria:
+            if not element_name and not criteria:
                 return "Error: Must specify element_name, element_auto_id, or element_type"
 
-            # Find and click
-            try:
-                child = target.child_window(**criteria)
-                child.click_input()
-                return f"Clicked: {criteria} in '{target.window_text()[:50]}'"
-            except Exception as e:
-                # Try partial name match
-                if element_name:
-                    try:
-                        child = target.child_window(title_re=f".*{re.escape(element_name)}.*")
-                        child.click_input()
-                        return f"Clicked (regex match): '{element_name}' in '{target.window_text()[:50]}'"
-                    except Exception:
-                        pass
-                return f"Element not found: {criteria}. Error: {str(e)[:200]}"
+            # --- Attempt 1: exact match by automation ID / type (most reliable) ---
+            if criteria:
+                try:
+                    child = target.child_window(**criteria)
+                    child.click_input()
+                    return f"Clicked: {criteria} in '{target.window_text()[:50]}'"
+                except Exception:
+                    pass
+
+            # --- Attempt 2: exact title + any other criteria ---
+            if element_name:
+                exact_criteria = dict(criteria)
+                exact_criteria["title"] = element_name
+                try:
+                    child = target.child_window(**exact_criteria)
+                    child.click_input()
+                    return f"Clicked (exact name): '{element_name}' in '{target.window_text()[:50]}'"
+                except Exception:
+                    pass
+
+                # --- Attempt 3: case-insensitive partial regex match ---
+                try:
+                    child = target.child_window(title_re=f"(?i).*{re.escape(element_name)}.*")
+                    child.click_input()
+                    return f"Clicked (fuzzy name): '{element_name}' in '{target.window_text()[:50]}'"
+                except Exception:
+                    pass
+
+                # --- Attempt 4: walk all children, fuzzy match via SequenceMatcher ---
+                name_lower = element_name.lower()
+                try:
+                    all_children = target.descendants()
+                    best = None
+                    best_score = 0.0
+                    for child in all_children:
+                        try:
+                            ctext = child.window_text().lower()
+                            if not ctext:
+                                continue
+                            # Exact substring → score 1.0
+                            if name_lower in ctext or ctext in name_lower:
+                                score = 1.0
+                            else:
+                                # Fuzzy match using SequenceMatcher (order-aware)
+                                score = difflib.SequenceMatcher(None, name_lower, ctext).ratio()
+                            if score > best_score:
+                                best_score = score
+                                best = child
+                        except Exception:
+                            continue
+                    if best and best_score > 0.4:
+                        best.click_input()
+                        return f"Clicked (best-match={best_score:.0%}): '{best.window_text()}' for query '{element_name}'"
+                except Exception:
+                    pass
+
+            return f"Element not found: name='{element_name}', id='{element_auto_id}', type='{element_type}'"
 
         except ImportError:
             return "pywinauto not installed. Run: pip install pywinauto"
@@ -1002,3 +1239,418 @@ def get_som_elements() -> list[dict]:
         if time.time() - _last_som_time > 30:
             return []
         return list(_last_som_elements)  # Return copy for thread safety
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MULTIMODAL TELEGRAM IMAGE ANALYSIS
+# p3_19: 多模态任务理解升级
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _extract_full_ocr(image_path: str) -> tuple[str, float]:
+    """Run full-image OCR and return (text, confidence 0-1).
+
+    Uses pytesseract if available; returns ("", 0.0) otherwise.
+    Confidence is the mean character confidence from tesseract data.
+    """
+    try:
+        import pytesseract
+        from PIL import Image as _PIL_Image
+        pil = _PIL_Image.open(image_path).convert("RGB")
+        # Scale up if small for better OCR accuracy
+        w, h = pil.size
+        if w < 800:
+            scale = 800 / w
+            pil = pil.resize((int(w * scale), int(h * scale)), _PIL_Image.LANCZOS)
+
+        data = pytesseract.image_to_data(
+            pil, output_type=pytesseract.Output.DICT, config="--oem 3 --psm 6",
+        )
+        words = [
+            (t, int(c))
+            for t, c in zip(data["text"], data["conf"])
+            if t.strip() and int(c) > 0
+        ]
+        if not words:
+            return "", 0.0
+        text = " ".join(w for w, _ in words)
+        conf = sum(c for _, c in words) / (len(words) * 100)
+        return text, min(conf, 1.0)
+    except Exception as e:
+        logger.debug(f"OCR failed: {e}")
+        return "", 0.0
+
+
+def _classify_image_type(img_bgr: np.ndarray, ocr_text: str) -> tuple[str, float]:
+    """Classify image into one of four categories.
+
+    Returns: (type_str, confidence 0-1)
+    type_str: "kline_chart" | "ui_screenshot" | "task_screenshot" | "general"
+    """
+    h, w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    scores: dict[str, float] = {
+        "kline_chart": 0.0,
+        "ui_screenshot": 0.0,
+        "task_screenshot": 0.0,
+        "general": 0.1,
+    }
+
+    # --- Kline chart heuristics ---
+    # 1. Detect many thin vertical bars (candlesticks) via column variance
+    col_variance = np.var(gray, axis=0)
+    high_var_cols = np.sum(col_variance > np.mean(col_variance) * 1.5)
+    bar_density = high_var_cols / max(w, 1)
+    if bar_density > 0.3:
+        scores["kline_chart"] += 0.3
+
+    # 2. Detect red/green pixel clusters (candlestick colors)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    red_mask = (
+        cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255])) |
+        cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
+    )
+    green_mask = cv2.inRange(hsv, np.array([40, 80, 80]), np.array([90, 255, 255]))
+    red_ratio = np.sum(red_mask > 0) / (h * w)
+    green_ratio = np.sum(green_mask > 0) / (h * w)
+    if 0.01 < red_ratio < 0.35 and 0.01 < green_ratio < 0.35:
+        scores["kline_chart"] += 0.35
+
+    # 3. Grid lines (horizontal/vertical lines) — common in charts
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=w // 4, maxLineGap=10)
+    if lines is not None:
+        h_lines = sum(1 for l in lines if abs(l[0][1] - l[0][3]) < 5)
+        v_lines = sum(1 for l in lines if abs(l[0][0] - l[0][2]) < 5)
+        if h_lines >= 2 and v_lines >= 2:
+            scores["kline_chart"] += 0.25
+
+    # 4. OCR keywords for chart context
+    ocr_lower = ocr_text.lower()
+    chart_keywords = ["btc", "eth", "usd", "usdt", "sol", "bnb", "open", "close",
+                      "high", "low", "volume", "ma", "rsi", "macd", "%", "k", "m"]
+    chart_hits = sum(1 for kw in chart_keywords if kw in ocr_lower)
+    scores["kline_chart"] += min(chart_hits * 0.05, 0.2)
+
+    # --- UI screenshot heuristics ---
+    # Detect many rectangular UI elements
+    elements = _detect_ui_elements_cv(img_bgr)
+    elem_density = len(elements) / 30  # normalize to ~30 elements = full score
+    scores["ui_screenshot"] += min(elem_density * 0.4, 0.4)
+
+    ui_keywords = ["button", "click", "menu", "settings", "ok", "cancel", "file",
+                   "edit", "view", "help", "window", "search"]
+    ui_hits = sum(1 for kw in ui_keywords if kw in ocr_lower)
+    scores["ui_screenshot"] += min(ui_hits * 0.08, 0.3)
+
+    # UI screenshots tend to have many distinct colors (icons, buttons)
+    if img_bgr.size > 0:
+        unique_colors = len(np.unique(img_bgr.reshape(-1, 3), axis=0))
+        if unique_colors > 5000:
+            scores["ui_screenshot"] += 0.15
+
+    # --- Task screenshot heuristics ---
+    # Dense text with limited color variation
+    word_count = len(ocr_text.split()) if ocr_text else 0
+    if word_count > 20:
+        scores["task_screenshot"] += min(word_count / 100, 0.5)
+    task_keywords = ["todo", "task", "step", "please", "需要", "请", "完成", "任务",
+                     "目标", "要求", "实现", "功能", "bug", "fix", "error", "implement"]
+    task_hits = sum(1 for kw in task_keywords if kw in ocr_lower)
+    scores["task_screenshot"] += min(task_hits * 0.1, 0.4)
+
+    # Low color diversity → text-heavy document
+    if img_bgr.size > 0:
+        unique_colors = len(np.unique(img_bgr[::4, ::4].reshape(-1, 3), axis=0))
+        if unique_colors < 1000:
+            scores["task_screenshot"] += 0.15
+
+    best_type = max(scores, key=lambda k: scores[k])
+    best_conf = scores[best_type]
+    total = sum(scores.values())
+    normalized_conf = best_conf / max(total, 1)
+
+    return best_type, min(normalized_conf, 1.0)
+
+
+def _analyze_kline_patterns(img_bgr: np.ndarray, ocr_text: str) -> dict:
+    """Analyze K-line chart: detect trend, patterns, support/resistance.
+
+    Returns dict with:
+        trend: "uptrend" | "downtrend" | "sideways"
+        trend_confidence: float
+        patterns: list of detected candlestick patterns
+        support_levels: list of approximate price levels (from OCR)
+        resistance_levels: list
+        price_numbers: list of numbers found via OCR
+        summary: human-readable analysis string
+    """
+    h, w = img_bgr.shape[:2]
+    result: dict[str, Any] = {
+        "trend": "unknown",
+        "trend_confidence": 0.0,
+        "patterns": [],
+        "support_levels": [],
+        "resistance_levels": [],
+        "price_numbers": [],
+        "summary": "",
+    }
+
+    # --- Extract price numbers from OCR ---
+    price_numbers = []
+    if ocr_text:
+        number_pattern = re.findall(r"\b\d{1,8}(?:[.,]\d{1,6})?\b", ocr_text)
+        for num_str in number_pattern:
+            try:
+                val = float(num_str.replace(",", ""))
+                if val > 0:
+                    price_numbers.append(val)
+            except ValueError:
+                pass
+    result["price_numbers"] = sorted(price_numbers)
+
+    # --- Detect overall trend via green/red candle distribution ---
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    red_mask = (
+        cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255])) |
+        cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
+    )
+    green_mask = cv2.inRange(hsv, np.array([40, 80, 80]), np.array([90, 255, 255]))
+
+    # Divide image into left and right halves for trend comparison
+    mid = w // 2
+    red_left = np.sum(red_mask[:, :mid] > 0)
+    red_right = np.sum(red_mask[:, mid:] > 0)
+    green_left = np.sum(green_mask[:, :mid] > 0)
+    green_right = np.sum(green_mask[:, mid:] > 0)
+
+    total_red = np.sum(red_mask > 0)
+    total_green = np.sum(green_mask > 0)
+    total_color = total_red + total_green
+
+    # Simple trend: more green recently = uptrend
+    if total_color > 100:
+        green_ratio_right = green_right / max(green_right + red_right, 1)
+        green_ratio_total = total_green / max(total_color, 1)
+
+        if green_ratio_right > 0.6 and green_ratio_total > 0.5:
+            result["trend"] = "uptrend"
+            result["trend_confidence"] = min(green_ratio_right, 0.95)
+        elif green_ratio_right < 0.4 and green_ratio_total < 0.5:
+            result["trend"] = "downtrend"
+            result["trend_confidence"] = min(1.0 - green_ratio_right, 0.95)
+        else:
+            result["trend"] = "sideways"
+            result["trend_confidence"] = 0.6
+    else:
+        # Fallback: analyze luminosity gradient (right brighter = uptrend for line charts)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        # Look at the main chart area (middle 60% height)
+        chart_h1, chart_h2 = int(h * 0.2), int(h * 0.8)
+        left_mean = float(np.mean(gray[chart_h1:chart_h2, :mid]))
+        right_mean = float(np.mean(gray[chart_h1:chart_h2, mid:]))
+        if abs(left_mean - right_mean) < 5:
+            result["trend"] = "sideways"
+            result["trend_confidence"] = 0.5
+        else:
+            result["trend"] = "unknown"
+            result["trend_confidence"] = 0.3
+
+    # --- Detect dominant moving average lines ---
+    # Look for smooth curves (low curvature edges) spanning most of the width
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 20, 60)
+    ma_lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50,
+                                minLineLength=w // 3, maxLineGap=30)
+    ma_count = len(ma_lines) if ma_lines is not None else 0
+    if ma_count >= 2:
+        result["patterns"].append(f"检测到{ma_count}条均线")
+
+    # --- Detect doji candles (open ≈ close, long wicks) ---
+    # Simplified: look for thin vertical color segments
+    col_means = []
+    step = max(1, w // 50)
+    for x in range(0, w, step):
+        col = img_bgr[:, x]
+        r_px = np.sum(red_mask[:, x] > 0)
+        g_px = np.sum(green_mask[:, x] > 0)
+        col_means.append((r_px, g_px))
+
+    doji_count = sum(1 for r, g in col_means if abs(r - g) < 3 and (r + g) > 2)
+    if doji_count > len(col_means) * 0.1:
+        result["patterns"].append("可能含十字星(Doji)形态")
+
+    # --- Support/resistance from price_numbers ---
+    if price_numbers and len(price_numbers) >= 2:
+        sorted_prices = sorted(price_numbers)
+        result["support_levels"] = sorted_prices[:2]
+        result["resistance_levels"] = sorted_prices[-2:]
+
+    # --- Build human-readable summary ---
+    trend_emoji = {"uptrend": "📈", "downtrend": "📉", "sideways": "➡️", "unknown": "❓"}
+    trend_cn = {"uptrend": "上升趋势", "downtrend": "下降趋势", "sideways": "横盘整理", "unknown": "趋势不明"}
+    t = result["trend"]
+    conf_pct = int(result["trend_confidence"] * 100)
+
+    lines = [
+        f"{trend_emoji.get(t, '❓')} 趋势: {trend_cn.get(t, t)} (置信度 {conf_pct}%)",
+    ]
+    if result["patterns"]:
+        lines.append(f"形态: {', '.join(result['patterns'])}")
+    if result["price_numbers"]:
+        lines.append(f"识别价格区间: {min(result['price_numbers']):.4g} ~ {max(result['price_numbers']):.4g}")
+    if result["support_levels"]:
+        lines.append(f"支撑位参考: {result['support_levels']}")
+    if result["resistance_levels"]:
+        lines.append(f"阻力位参考: {result['resistance_levels']}")
+
+    result["summary"] = "\n".join(lines)
+    return result
+
+
+def analyze_telegram_image(image_path: str, caption: str = "") -> dict:
+    """Main multimodal analysis pipeline for Telegram images.
+
+    Args:
+        image_path: Path to saved image file
+        caption: User caption/text accompanying the image
+
+    Returns dict:
+        type: image type classification
+        type_confidence: float (0-1)
+        ocr_text: extracted text
+        ocr_confidence: float (0-1)
+        analysis: type-specific analysis dict
+        ui_elements: list of SoM elements (for UI screenshots)
+        suggested_actions: list of action strings
+        needs_confirmation: bool (True when overall confidence < 0.7)
+        claude_context: formatted string to prepend to Claude's prompt
+    """
+    result: dict[str, Any] = {
+        "type": "general",
+        "type_confidence": 0.0,
+        "ocr_text": "",
+        "ocr_confidence": 0.0,
+        "analysis": {},
+        "ui_elements": [],
+        "suggested_actions": [],
+        "needs_confirmation": True,
+        "claude_context": "",
+    }
+
+    try:
+        # Load image
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is None:
+            result["claude_context"] = "⚠️ 图片读取失败"
+            return result
+
+        # Step 1: OCR full image
+        ocr_text, ocr_conf = _extract_full_ocr(image_path)
+        result["ocr_text"] = ocr_text
+        result["ocr_confidence"] = ocr_conf
+
+        # Step 2: Classify image type
+        combined_text = (ocr_text + " " + caption).strip()
+        img_type, type_conf = _classify_image_type(img_bgr, combined_text)
+        result["type"] = img_type
+        result["type_confidence"] = type_conf
+
+        # Step 3: Type-specific deep analysis
+        if img_type == "kline_chart":
+            analysis = _analyze_kline_patterns(img_bgr, combined_text)
+            result["analysis"] = analysis
+            result["suggested_actions"] = [
+                "根据趋势分析生成交易建议",
+                "识别关键支撑位和阻力位",
+                "结合成交量给出买卖信号",
+            ]
+
+        elif img_type == "ui_screenshot":
+            # SoM annotation for UI elements
+            try:
+                pil_img, elements = annotate_screenshot_som(image_path)
+                set_som_elements(elements)
+                result["ui_elements"] = elements
+                result["analysis"] = {
+                    "element_count": len(elements),
+                    "elements_preview": [
+                        {
+                            "id": e["id"],
+                            "kind": e["kind"],
+                            "ocr_text": e.get("ocr_text", "")[:30],
+                            "cx": e["cx"], "cy": e["cy"],
+                        }
+                        for e in elements[:15]
+                    ],
+                }
+                result["suggested_actions"] = [
+                    f"点击元素#{e['id']} ({e.get('ocr_text','') or e['kind']})"
+                    for e in elements[:5]
+                    if e.get("ocr_text") or e["kind"] in ("button", "input")
+                ]
+            except Exception as e:
+                logger.warning(f"UI SoM analysis failed: {e}")
+                result["analysis"] = {"error": str(e)}
+
+        elif img_type == "task_screenshot":
+            result["analysis"] = {
+                "extracted_text": ocr_text,
+                "word_count": len(ocr_text.split()),
+            }
+            # Parse task keywords
+            task_lines = [l.strip() for l in ocr_text.splitlines() if l.strip()]
+            result["suggested_actions"] = task_lines[:5] if task_lines else []
+
+        # Step 4: Confidence check
+        overall_conf = (type_conf + ocr_conf) / 2
+        result["needs_confirmation"] = overall_conf < 0.7
+
+        # Step 5: Build claude_context string
+        ctx_parts = [
+            f"【图片分析结果】",
+            f"图片类型: {_TYPE_NAMES.get(img_type, img_type)} (置信度 {int(type_conf * 100)}%)",
+        ]
+
+        if ocr_text:
+            ocr_preview = ocr_text[:300] + ("..." if len(ocr_text) > 300 else "")
+            ctx_parts.append(f"OCR识别文字 (置信度 {int(ocr_conf * 100)}%):\n{ocr_preview}")
+
+        if img_type == "kline_chart" and result["analysis"].get("summary"):
+            ctx_parts.append(f"\n{result['analysis']['summary']}")
+            ctx_parts.append("\n请根据以上K线分析给出具体交易建议（入场点、止损、止盈）")
+
+        elif img_type == "ui_screenshot":
+            elems = result["ui_elements"]
+            if elems:
+                ctx_parts.append(f"检测到 {len(elems)} 个UI元素，已缓存至SoM引擎")
+                ctx_parts.append("可使用 som_click #N 点击对应编号元素")
+
+        elif img_type == "task_screenshot":
+            ctx_parts.append("图中包含任务/指令文字，请解析并执行")
+
+        if caption:
+            ctx_parts.append(f"用户说明: {caption}")
+
+        if result["needs_confirmation"]:
+            ctx_parts.append(
+                f"\n⚠️ 识别置信度较低({int(overall_conf * 100)}% < 70%)，"
+                "请向用户确认理解是否正确后再执行操作"
+            )
+
+        result["claude_context"] = "\n".join(ctx_parts)
+
+    except Exception as e:
+        logger.error(f"analyze_telegram_image error: {e}", exc_info=True)
+        result["claude_context"] = f"图片分析出错: {e}"
+
+    return result
+
+
+_TYPE_NAMES = {
+    "kline_chart": "K线/交易图表",
+    "ui_screenshot": "UI截图",
+    "task_screenshot": "任务/文字截图",
+    "general": "普通图片",
+}

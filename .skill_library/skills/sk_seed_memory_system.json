@@ -1,0 +1,51 @@
+{
+  "id": "sk_seed_memory_system",
+  "title": "结构化JSON记忆系统",
+  "summary": "分类记忆存储 + 自动摘要 + 按重要性排序清理",
+  "task_type": "code_create",
+  "function_signature": "save_memory(content, category, importance) / recall_memory(query)",
+  "input_schema": "内容字符串 + 分类 + 重要性0-1",
+  "output_schema": "记忆ID 或 匹配记忆列表",
+  "trigger_pattern": "记忆 memory 记住 习惯 偏好 学习",
+  "keywords": [
+    "记忆",
+    "memory",
+    "存储",
+    "recall",
+    "摘要",
+    "action_memory",
+    "分类"
+  ],
+  "generic_steps": [
+    "分类存储(JSON)",
+    "关键词/语义检索",
+    "重要性评分",
+    "超限自动清理低分条目"
+  ],
+  "specific_steps": [
+    "/memory命令查看编辑",
+    "对话结束自动摘要"
+  ],
+  "template_code": "# action_memory.json structure\n{'entries': [{'id': ..., 'content': ..., 'category': ..., 'importance': 0-1, 'ts': ...}]}",
+  "key_decisions": [
+    "JSON比MD更易结构化查询",
+    "重要性分数支持自动清理"
+  ],
+  "files_created": [
+    "action_memory.json"
+  ],
+  "use_count": 0,
+  "last_used": null,
+  "avg_score_when_used": null,
+  "version": 1,
+  "history": [
+    {
+      "version": 1,
+      "date": "2026-03-29",
+      "change": "seeded from evolution task 5"
+    }
+  ],
+  "created_at": "2026-03-29T07:59:56.690849",
+  "updated_at": "2026-03-29T07:59:56.690849",
+  "code_snippet": "# action_memory.json structure\n{'entries': [{'id': ..., 'content': ..., 'category': ..., 'importance': 0-1, 'ts': ...}]}"
+}

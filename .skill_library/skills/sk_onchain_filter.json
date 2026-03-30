@@ -1,0 +1,30 @@
+{
+  "id": "sk_onchain_filter",
+  "title": "Onchain量能筛选器",
+  "summary": "DEXScreener链上筛选：流动性+市值+短时量能过滤，条件达成自动推送，去重防刷",
+  "task_type": "code_create",
+  "function_signature": "scan_onchain_filter(filter_set) -> list[dict]",
+  "input_schema": "filter_set: {min_liquidity, min_mcap, max_mcap, max_age_hours, min_vol_3m, min_vol_5m}",
+  "output_schema": "list of tokens passing all filters, sorted by 5m volume desc",
+  "trigger_pattern": "onchain filter 链上筛选 量能 volume filter dexscreener scan 3分钟 5分钟",
+  "keywords": [
+    "onchain", "filter", "量能", "volume", "dexscreener",
+    "liquidity", "mcap", "市值", "筛选", "3m", "5m"
+  ],
+  "generic_steps": [
+    "从DexScreener获取token-boosts和token-profiles",
+    "逐个获取pair数据 (流动性/市值/volume/txns)",
+    "按filter_set过滤: liquidity, mcap范围, age, 3m/5m量能",
+    "去重: _onchain_alerted.json记录已推送地址(24h过期)",
+    "只推送新token，避免重复告警",
+    "按5分钟成交量排序，取top10"
+  ],
+  "template_code": "oc_tokens = await scan_onchain_filter(ONCHAIN_FILTER_SET_1)\nnew_tokens = onchain_filter_new_only(oc_tokens)\nreport = format_onchain_filter_report(new_tokens)",
+  "files_modified": ["alpha_engine.py"],
+  "files_created": ["_onchain_alerted.json"],
+  "config_location": "alpha_engine.py ONCHAIN_FILTER_SET_1",
+  "created_at": "2026-03-30T06:30:00",
+  "source": "user_request",
+  "score": 95,
+  "usage_count": 1
+}

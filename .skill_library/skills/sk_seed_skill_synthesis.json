@@ -1,0 +1,53 @@
+{
+  "id": "sk_seed_skill_synthesis",
+  "title": "技能自动合成",
+  "summary": "成功任务后自动提取可复用技能到JSON+MD格式",
+  "task_type": "code_create",
+  "function_signature": "maybe_extract_skill(user_message, response, score)",
+  "input_schema": "用户消息 + bot回复 + 质量分数dict",
+  "output_schema": "skill_id(str) 或 None",
+  "trigger_pattern": "自动学习 自动保存技能 skill extraction 技能合成",
+  "keywords": [
+    "skill",
+    "技能",
+    "自动学习",
+    "结晶",
+    "提取",
+    "合成",
+    "复用"
+  ],
+  "generic_steps": [
+    "检测是否值得提取(分数/完成信号/代码内容)",
+    "调用haiku提炼函数签名",
+    "保存JSON+MD",
+    "更新index"
+  ],
+  "specific_steps": [
+    "heuristic阈值0.45",
+    "MD写入skills/目录"
+  ],
+  "template_code": "if _should_extract_skill(msg, resp, score):\n    data = await _run_claude_raw(extract_prompt, model='haiku')\n    skill = parse_and_save(data)\n    synthesize_to_md(skill)",
+  "key_decisions": [
+    "用haiku节省token",
+    "阈值0.45平衡质量与覆盖率",
+    "MD格式兼容superpowers技能系统"
+  ],
+  "files_created": [
+    ".skill_library/skills/*.json",
+    "skills/*/SKILL.md"
+  ],
+  "use_count": 0,
+  "last_used": null,
+  "avg_score_when_used": null,
+  "version": 1,
+  "history": [
+    {
+      "version": 1,
+      "date": "2026-03-29",
+      "change": "seeded from evolution task 1"
+    }
+  ],
+  "created_at": "2026-03-29T07:59:56.684783",
+  "updated_at": "2026-03-29T07:59:56.684783",
+  "code_snippet": "if _should_extract_skill(msg, resp, score):\n    data = await _run_claude_raw(extract_prompt, model='haiku')\n    skill = parse_and_save(data)\n    synthesize_to_md(skill)"
+}

@@ -1,8 +1,9 @@
 """
-Evolve Watcher v2.0 - CLI-based session revival (no GUI clicking)
+Evolve Watcher v3.0 - CLI-based session revival with evolution task queue
 
-Uses `claude.cmd --resume <session_id>` to send revival prompts directly,
-instead of unreliable pyautogui pixel detection and sidebar clicking.
+Uses `claude.cmd --resume <session_id>` to send revival prompts directly.
+Now supports structured evolution task queue: automatically advances to next
+task after detecting task completion (session goes idle).
 
 Target session: "Build Telegram bot for re..."
   sessionId: e5ee4984-e0cd-4f93-b7d3-a8507bae99ac
@@ -26,6 +27,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE, "_watcher_state.json")
 LOG_FILE = os.path.join(BASE, "_watcher.log")
 LOCK_FILE = os.path.join(BASE, "_watcher.lock")
+QUEUE_FILE = os.path.join(BASE, "_evolution_queue.json")
 
 # Target session configuration
 TARGET_SESSION_ID = "e5ee4984-e0cd-4f93-b7d3-a8507bae99ac"
@@ -38,11 +40,93 @@ _handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%
 _logger.addHandler(_handler)
 _logger.setLevel(logging.INFO)
 
+_SAFETY_RULES = """⚠️ 安全规则（必须遵守）：
+- 绝对不要杀死任何 python 进程（bot.py、run.py、smart_evolver.py）
+- 绝对不要关闭 Claude Code / claude.cmd
+- 绝对不要修改网络设置、防火墙、hosts文件
+- 绝对不要删除 .env、.bot.pid、.bot.lock 等关键文件
+- 绝对不要运行 taskkill、Stop-Process、shutdown、netsh
+- 修改代码前先用 python -m py_compile 验证语法
+
+"""
+
 REVIVAL_PROMPTS = [
-    "Continue evolving. Do not stop. Keep fixing bugs and adding capabilities until you surpass OpenClaw.",
-    "CONTEXT LIMIT - resume evolution: scan code, fix bugs, add smart vision + adaptive control. Do not stop.",
-    "Keep going. You are not done. Fix more bugs, add more capabilities. Surpass OpenClaw.",
+    _SAFETY_RULES + "Continue evolving. Do not stop. Keep fixing bugs and adding capabilities.",
+    _SAFETY_RULES + "CONTEXT LIMIT - resume evolution: scan code, fix bugs, add smart vision + adaptive control. Do not stop.",
+    _SAFETY_RULES + "Keep going. You are not done. Fix more bugs, add more capabilities.",
 ]
+
+# ─── Evolution Task Queue ────────────────────────────────────────────────────
+
+def load_queue():
+    if os.path.exists(QUEUE_FILE):
+        try:
+            with open(QUEUE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError, FileNotFoundError, OSError):
+            pass
+    return None
+
+
+def save_queue(q):
+    tmp = QUEUE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(q, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, QUEUE_FILE)
+    except OSError as e:
+        log(f"Failed to save queue: {e}")
+
+
+def get_current_task(q):
+    """Return the current pending task, or None if all done."""
+    idx = q.get("current_task_index", 0)
+    tasks = q.get("tasks", [])
+    if idx < len(tasks):
+        return tasks[idx]
+    return None
+
+
+def advance_queue(q, completed_task_name):
+    """Mark current task done, move to next."""
+    idx = q.get("current_task_index", 0)
+    tasks = q.get("tasks", [])
+    if idx < len(tasks):
+        tasks[idx]["status"] = "completed"
+        tasks[idx]["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        q.setdefault("completed_tasks", []).append(tasks[idx]["name"])
+    q["current_task_index"] = idx + 1
+
+    # If all done, loop back
+    if q["current_task_index"] >= len(tasks):
+        q["loop_count"] = q.get("loop_count", 0) + 1
+        q["current_task_index"] = 0
+        for t in tasks:
+            t["status"] = "pending"
+        log(f"All tasks completed! Starting loop #{q['loop_count']}")
+        notify_tg(f"🎉 所有7个进化任务完成！开始第{q['loop_count']}轮循环进化")
+
+    save_queue(q)
+    next_task = get_current_task(q)
+    return next_task
+
+
+def get_task_prompt(q, context_limit=False):
+    """Get the prompt for the current task. Falls back to revival prompt if no queue."""
+    task = get_current_task(q)
+    if task is None:
+        return REVIVAL_PROMPTS[0]
+    if context_limit:
+        return (
+            _SAFETY_RULES +
+            f"CONTEXT LIMIT DETECTED - 继续进化任务队列。\n\n"
+            f"当前任务：{task['name']} (任务{task['id']}/7)\n\n"
+            f"{task['prompt']}\n\n"
+            f"注意：这是续命指令，请继续完成上面的任务，完成后说 ✅任务{task['id']}完成。"
+        )
+    return _SAFETY_RULES + task["prompt"]
 
 
 def log(msg):
@@ -223,18 +307,29 @@ def detect_session_status():
     return 'idle'
 
 
-def send_revival_cli(state):
-    """Send a revival prompt via CLI --resume instead of GUI clicking."""
+def send_revival_cli(state, context_limit=False):
+    """Send a revival prompt via CLI --resume instead of GUI clicking.
+    Uses the evolution task queue to always advance to the next task.
+    """
     session_id = _find_target_session()
     claude_cmd = _find_claude_cmd()
 
-    msg = REVIVAL_PROMPTS[state["revival_idx"] % len(REVIVAL_PROMPTS)]
-    state["revival_idx"] += 1
+    # Use task queue if available
+    q = load_queue()
+    if q:
+        msg = get_task_prompt(q, context_limit=context_limit)
+        task = get_current_task(q)
+        task_info = f"任务{task['id']}/7: {task['name']}" if task else "循环进化"
+    else:
+        msg = REVIVAL_PROMPTS[state.get("revival_idx", 0) % len(REVIVAL_PROMPTS)]
+        task_info = "generic revival"
+
+    state["revival_idx"] = state.get("revival_idx", 0) + 1
     state["total_revivals"] += 1
     state["last_revival_time"] = time.time()
 
-    log(f"Sending revival #{state['total_revivals']} via CLI --resume {session_id[:12]}...")
-    log(f"Prompt: {msg[:60]}...")
+    log(f"Sending revival #{state['total_revivals']} [{task_info}] via CLI --resume {session_id[:12]}...")
+    log(f"Prompt: {msg[:80]}...")
 
     try:
         result = subprocess.run(
@@ -252,16 +347,30 @@ def send_revival_cli(state):
 
         if result.returncode == 0:
             log(f"Revival sent successfully (exit code 0)")
+            response_text = ""
             try:
                 output = result.stdout.strip()
                 if output:
                     data = json.loads(output)
-                    result_text = str(data.get("result", ""))[:200]
-                    log(f"Claude response: {result_text}")
+                    response_text = str(data.get("result", ""))
+                    log(f"Claude response: {response_text[:200]}")
             except (json.JSONDecodeError, Exception):
                 if result.stdout:
-                    log(f"Raw output: {result.stdout[:200]}")
+                    response_text = result.stdout
+                    log(f"Raw output: {response_text[:200]}")
             state["consecutive_failures"] = 0
+
+            # Detect task completion in Claude's response → advance queue
+            if q and response_text:
+                task = get_current_task(q)
+                completion_markers = ["✅", "任务完成", "task complete", "completed"]
+                if task and any(m in response_text.lower() for m in completion_markers):
+                    log(f"Task completion detected! Advancing from task {task['id']}: {task['name']}")
+                    next_task = advance_queue(q, task["name"])
+                    if next_task:
+                        notify_tg(f"✅ 任务{task['id']} [{task['name']}] 完成！\n下一个: 任务{next_task['id']} [{next_task['name']}]")
+                        log(f"Next task: {next_task['id']}: {next_task['name']}")
+                    state["_force_next_task"] = True  # immediately send next task
         else:
             log(f"Revival command failed (exit code {result.returncode})")
             if result.stderr:
@@ -285,7 +394,7 @@ def _acquire_singleton_lock():
     Returns the lock file handle (must stay open) or exits if another instance is running."""
     try:
         # Open lock file — keep handle open for entire process lifetime
-        fh = open(LOCK_FILE, "w", encoding="utf-8")
+        fh = open(LOCK_FILE, "w", encoding="utf-8")  # noqa: SIM115 — intentionally not using `with`; handle must outlive this function
         if sys.platform == "win32":
             import msvcrt
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
@@ -305,7 +414,8 @@ def run_loop(interval=180):
     lock_fh = _acquire_singleton_lock()  # Exit if another instance running
     log(f"Watcher v2.0 (CLI-based) started. Check interval: {interval}s (PID {os.getpid()})")
     log(f"Target session: {TARGET_SESSION_ID}")
-    notify_tg(f"Evolve Watcher v2.0 started (CLI mode), checking every {interval}s")
+    # Suppress startup spam — only log locally, don't notify user every boot
+    # notify_tg(f"Evolve Watcher v2.0 started (CLI mode), checking every {interval}s")
     state = load_state()
 
     try:
@@ -313,6 +423,19 @@ def run_loop(interval=180):
             try:
                 status = detect_session_status()
                 log(f"Status: {status} | idle_streak: {state['idle_streak']} | revivals: {state['total_revivals']}")
+
+                # Force-send next task immediately after task completion detected
+                if state.pop("_force_next_task", False):
+                    log("Force-sending next evolution task after completion...")
+                    time.sleep(10)  # brief pause before next task
+                    state = send_revival_cli(state, context_limit=False)
+                    q = load_queue()
+                    if q:
+                        task = get_current_task(q)
+                        if task:
+                            notify_tg(f"🚀 开始任务{task['id']}/7: {task['name']}")
+                    save_state(state)
+                    continue
 
                 if status == 'running':
                     state["idle_streak"] = 0
@@ -350,7 +473,9 @@ def run_loop(interval=180):
                             state["consecutive_failures"] = 0  # reset to try again later
                         else:
                             state["idle_streak"] = 0
-                            state = send_revival_cli(state)
+                            # context_limit heuristic: many revivals in short time
+                            is_ctx = state.get("revivals_this_hour", 0) >= 2
+                            state = send_revival_cli(state, context_limit=is_ctx)
                             # Track revivals in the last hour for backoff
                             state["revivals_this_hour"] = recent_revivals + 1
                             state["last_hour_reset"] = state.get("last_hour_reset", time.time())
@@ -375,5 +500,37 @@ def run_loop(interval=180):
 
 
 if __name__ == "__main__":
-    interval = int(sys.argv[1]) if len(sys.argv) > 1 else 180
-    run_loop(interval)
+    if len(sys.argv) > 1 and sys.argv[1] == "queue":
+        import io, sys as _sys
+        _sys.stdout = io.TextIOWrapper(_sys.stdout.buffer, encoding='utf-8', errors='replace')
+        q = load_queue()
+        if q:
+            task = get_current_task(q)
+            print(f"Loop #{q.get('loop_count', 0)} | Current task index: {q['current_task_index']}")
+            if task:
+                print(f"  Current: [{task['id']}] {task['name']} ({task['status']})")
+            else:
+                print("  All tasks done!")
+            print(f"  Completed: {q.get('completed_tasks', [])}")
+        else:
+            print("No queue file found.")
+    elif len(sys.argv) > 1 and sys.argv[1] == "advance":
+        q = load_queue()
+        if q:
+            t = get_current_task(q)
+            name = t["name"] if t else "unknown"
+            next_t = advance_queue(q, name)
+            print(f"Advanced past '{name}' → next: {next_t['name'] if next_t else 'all done'}")
+    elif len(sys.argv) > 1 and sys.argv[1] == "reset":
+        q = load_queue()
+        if q:
+            q["current_task_index"] = 0
+            for t in q["tasks"]:
+                t["status"] = "pending"
+                t.pop("completed_at", None)
+            q["completed_tasks"] = []
+            save_queue(q)
+            print("Queue reset to task 1")
+    else:
+        interval = int(sys.argv[1]) if len(sys.argv) > 1 else 180
+        run_loop(interval)

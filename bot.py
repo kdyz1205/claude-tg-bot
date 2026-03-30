@@ -25,8 +25,88 @@ import bridge
 from safety import handle_confirmation_callback
 import psutil  # for health/system checks
 import datetime
-from self_monitor import self_monitor, action_memory
+from self_monitor import self_monitor, action_memory, code_repair
 from proactive_agent import proactive_agent
+try:
+    from self_repair import (
+        proactive_repair, format_repair_status,
+        code_evolution_engine, format_evostatus,
+        analyze_code_quality, format_code_health,
+        code_quality_scheduler, generate_quality_patches,
+    )
+    _self_repair_available = True
+except ImportError:
+    proactive_repair = None
+    format_repair_status = None
+    code_evolution_engine = None
+    format_evostatus = None
+    analyze_code_quality = None
+    format_code_health = None
+    code_quality_scheduler = None
+    generate_quality_patches = None
+    _self_repair_available = False
+from proactive_monitor import market_monitor
+import memory_engine
+import profit_tracker as _profit_tracker
+
+try:
+    from onchain_tracker import whale_tracker as _whale_tracker
+    from onchain_tracker import smart_tracker as _smart_tracker
+    _whale_available = True
+    _smart_tracker_available = True
+except ImportError:
+    _whale_tracker = None
+    _smart_tracker = None
+    _whale_available = False
+    _smart_tracker_available = False
+
+try:
+    from arbitrage_engine import arb_engine as _arb_engine
+    from arbitrage_engine import format_arb_top5 as _format_arb_top5
+    from arbitrage_engine import format_arb_top10 as _format_arb_top10
+    from arbitrage_engine import format_arb_today as _format_arb_today
+    _arb_available = True
+except ImportError:
+    _arb_engine = None
+    _format_arb_top5 = None
+    _format_arb_top10 = None
+    _format_arb_today = None
+    _arb_available = False
+
+try:
+    import strategy_optimizer as _strategy_optimizer
+    _optimizer_available = True
+except ImportError:
+    _strategy_optimizer = None
+    _optimizer_available = False
+
+try:
+    from alpha_engine import alpha_engine as _alpha_engine, scan_alpha as _scan_alpha
+    from alpha_engine import format_alpha_report as _format_alpha_report
+    from alpha_engine import format_alpha_stats as _format_alpha_stats
+    from alpha_engine import record_push as _alpha_record_push
+    _alpha_available = True
+except ImportError:
+    _alpha_engine = None
+    _scan_alpha = None
+    _format_alpha_report = None
+    _format_alpha_stats = None
+    _alpha_record_push = None
+    _alpha_available = False
+
+try:
+    import dashboard as _dashboard
+    _dashboard_available = True
+except ImportError:
+    _dashboard = None
+    _dashboard_available = False
+
+try:
+    import codex_charger as _codex
+    _codex_available = True
+except ImportError:
+    _codex = None
+    _codex_available = False
 
 try:
     import session_learner as _sl
@@ -198,6 +278,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/signal - 信号\n"
             "/risk - 风险指标\n"
             "/kill - 终止卡住的任务\n"
+            "/tasks - 查看任务队列\n"
+            "/cancel - 取消排队任务\n"
             "/q - 快捷操作面板\n"
             "/help - 帮助"
         )
@@ -255,6 +337,87 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Kill command error: {e}", exc_info=True)
         try:
             await update.message.reply_text(f"❌ Kill 错误: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tasks — show running and queued tasks."""
+    try:
+        chat_id = update.effective_chat.id
+        status = claude_agent.get_task_status()
+        lines = ["📋 **任务状态**\n"]
+
+        conc = status.get("concurrent", {})
+        in_use = conc.get("in_use", 0)
+        max_slots = conc.get("max", 3)
+        lines.append(f"⚡ **并发槽**: {in_use}/{max_slots} 占用\n")
+
+        running = status.get("running", {})
+        if running:
+            lines.append("🔄 **执行中:**")
+            for cid, info in running.items():
+                elapsed = int(time.time() - info.get("start_time", time.time()))
+                preview = info.get("text", "")[:60]
+                tid = info.get("task_id", "?")
+                if cid == chat_id:
+                    lines.append(f"  #`{tid}` ({elapsed}s): {preview}")
+                else:
+                    lines.append(f"  #`{tid}` [其他会话] ({elapsed}s)")
+        else:
+            lines.append("🔄 执行中: 无")
+
+        queued = status.get("queued", {})
+        workers = status.get("workers", {})
+        my_queue = queued.get(chat_id, [])
+        has_worker = workers.get(chat_id, False)
+        if my_queue:
+            worker_tag = " 🔧worker" if has_worker else " ⚠️no-worker"
+            lines.append(f"\n⏳ **排队中 ({len(my_queue)}){worker_tag}:**")
+            for i, m in enumerate(my_queue, 1):
+                tid = m.get("task_id", "?")
+                preview = m.get("text", "")[:60]
+                age = int(time.time() - m.get("time", time.time()))
+                lines.append(f"  {i}. #`{tid}` ({age}s前): {preview}")
+            lines.append("\n/cancel 取消全部 · /cancel <id> 取消指定")
+        else:
+            lines.append("\n⏳ 排队中: 无")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Tasks command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 错误: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cancel [task_id] — cancel queued tasks."""
+    try:
+        chat_id = update.effective_chat.id
+        args = context.args or []
+        if args:
+            try:
+                task_id = int(args[0].lstrip("#"))
+            except ValueError:
+                await update.message.reply_text("用法: /cancel 或 /cancel <任务ID>")
+                return
+            removed = claude_agent.cancel_queued_task(chat_id, task_id)
+            if removed:
+                await update.message.reply_text(f"✅ 已取消任务 #{task_id}")
+            else:
+                await update.message.reply_text(f"❌ 未找到排队任务 #{task_id}")
+        else:
+            removed = claude_agent.cancel_queued_task(chat_id, None)
+            if removed:
+                await update.message.reply_text(f"✅ 已取消 {removed} 个排队任务")
+            else:
+                await update.message.reply_text("队列为空，无需取消")
+    except Exception as e:
+        logger.error(f"Cancel command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 错误: {str(e)[:200]}")
         except Exception:
             pass
 
@@ -776,7 +939,7 @@ async def bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Panel category definitions: (callback_prefix, label, commands)
 PANEL_CATEGORIES = [
     ("panel_ai",      "🤖 AI Controls",  [("ask", "提问"), ("model", "模型"), ("reset", "重置"), ("status", "状态")]),
-    ("panel_trading", "📊 Trading",       [("trade", "交易"), ("signal", "信号"), ("portfolio", "持仓"), ("risk", "风险"), ("funding", "资金"), ("okx_top30", "OKX Top30"), ("token_analyze", "Token分析"), ("ma_ribbon_bt", "MA Ribbon回测"), ("ma_ribbon_scr", "MA扫描"), ("okx_backtest", "OKX回测"), ("session_ctrl", "会话控制")]),
+    ("panel_trading", "📊 Trading",       [("trade", "交易"), ("signal", "信号"), ("volfilter", "量能筛选"), ("report", "收益报告"), ("portfolio", "持仓"), ("risk", "风险"), ("funding", "资金"), ("okx_top30", "OKX Top30"), ("token_analyze", "Token分析"), ("ma_ribbon_bt", "MA Ribbon回测"), ("ma_ribbon_scr", "MA扫描"), ("okx_backtest", "OKX回测"), ("session_ctrl", "会话控制")]),
     ("panel_pc",      "🖥️ PC Control",   [("screenshot", "截图"), ("click", "点击"), ("type", "输入"), ("window", "窗口")]),
     ("panel_web",     "🌐 Web",           [("browse", "浏览"), ("search", "搜索"), ("scrape", "抓取")]),
     ("panel_system",  "🔧 System",        [("health", "健康"), ("memory", "内存"), ("evolve", "进化"), ("scan", "扫描")]),
@@ -955,6 +1118,10 @@ async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await _send_confluence(context, chat_id)
         elif cmd == "signal":
             await _send_signals(context, chat_id)
+        elif cmd == "volfilter":
+            await _send_vol_filter(context, chat_id)
+        elif cmd == "report":
+            await _send_profit_report(context, chat_id)
         elif cmd == "portfolio":
             await _send_portfolio(context, chat_id)
         elif cmd == "risk":
@@ -1171,24 +1338,20 @@ async def _send_health(context, chat_id):
 
 
 async def _send_memory_info(context, chat_id):
-    """Show memory / conversation state."""
-    lines = ["🧠 Memory Info\n"]
+    """Show structured JSON memory overview."""
     try:
-        proc = psutil.Process(os.getpid())
-        rss = proc.memory_info().rss // (1024 * 1024)
-        lines.append(f"Bot process RSS: {rss} MB")
-    except Exception:
-        pass
-    lines.append(f"Active sessions: {len(claude_agent._claude_sessions)}")
-    lines.append(f"Pending queues: {sum(len(v) for v in claude_agent._pending_messages.values())}")
-    # Check memory file
-    mem_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_memory.md")
-    if os.path.exists(mem_file):
-        size = os.path.getsize(mem_file)
-        lines.append(f"Memory file: {size} bytes")
-    else:
-        lines.append("Memory file: not found")
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
+        text = memory_engine.format_display()
+        # Also append process stats
+        try:
+            proc = psutil.Process(os.getpid())
+            rss = proc.memory_info().rss // (1024 * 1024)
+            text += f"\n\n💻 Process RAM: {rss} MB"
+        except Exception:
+            pass
+        text += f"\nSessions: {len(claude_agent._claude_sessions)} active"
+        await context.bot.send_message(chat_id=chat_id, text=text[:4096], parse_mode="Markdown")
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"🧠 Memory error: {e}")
 
 
 async def _send_scan(context, chat_id):
@@ -1261,6 +1424,36 @@ async def _send_signals(context, chat_id):
     except Exception as e:
         lines.append(f"Error: {e}")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+
+async def _send_vol_filter(context, chat_id):
+    """Run onchain volume filter: score>=60, 3m vol>8888, 5m vol>16666."""
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="🔍 量能筛选中... (扫描30币)")
+        from onchain_filter import scan_filtered, format_filtered
+        results = await scan_filtered()
+        text = format_filtered(results)
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"筛选失败: {e}")
+
+
+async def _send_profit_report(context, chat_id):
+    """Generate and send profit tracker report + chart."""
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="📊 生成收益报告中...")
+        text, chart_path = await _profit_tracker.profit_tracker.get_report_and_chart()
+        if len(text) <= 4096:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        else:
+            for i in range(0, len(text), 4000):
+                await context.bot.send_message(chat_id=chat_id, text=text[i:i+4000])
+        if chart_path and os.path.exists(chart_path):
+            with open(chart_path, "rb") as f:
+                await context.bot.send_photo(chat_id=chat_id, photo=f, caption="📈 胜率趋势 & 累计收益")
+    except Exception as e:
+        logger.error(f"Profit report error: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ 报告错误: {str(e)[:300]}")
 
 
 async def _send_portfolio(context, chat_id):
@@ -1484,6 +1677,23 @@ async def _send_session_control(context, chat_id):
 
 # ─── Standalone command handlers for new commands ────────────────────────────
 
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send current performance stats. Dashboard at http://localhost:8080"""
+    try:
+        if _dashboard_available:
+            text = _dashboard.get_stats_text()
+            text += "\n\n🌐 Web dashboard: http://localhost:8080"
+        else:
+            text = "❌ Dashboard module not available. Run: pip install flask"
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Dashboard command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Dashboard error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detailed health check command."""
     try:
@@ -1492,6 +1702,20 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Health command error: {e}", exc_info=True)
         try:
             await update.message.reply_text(f"❌ Health error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def vital_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show vital signs — the 5 invariants of 'being alive'."""
+    try:
+        import vital_signs
+        text = vital_signs.get_status_text()
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"Vital command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Vital signs error: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -1520,6 +1744,260 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def signal_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show 24h signal accuracy statistics."""
+    try:
+        from signal_engine import format_signal_stats
+        text = format_signal_stats()
+        try:
+            await update.message.reply_text(text, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"signal_stats command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 统计错误: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def alpha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Immediately scan for current top Alpha opportunities."""
+    try:
+        if not _alpha_available or _scan_alpha is None:
+            await update.message.reply_text("❌ Alpha引擎模块不可用。")
+            return
+
+        # /alpha stats — show performance stats
+        args = context.args or []
+        if args and args[0].lower() in ("stats", "统计", "stat"):
+            try:
+                await update.message.reply_text(_format_alpha_stats(), parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(_format_alpha_stats())
+            return
+
+        # Live scan
+        await update.message.reply_text("🔍 正在扫描 CoinGecko / DEXScreener / Pump.fun ...", parse_mode="Markdown")
+        tokens = await _scan_alpha()
+
+        # Cache result into engine's last_scan
+        if _alpha_engine is not None:
+            _alpha_engine._last_scan = tokens
+            import time as _t
+            _alpha_engine._last_scan_time = _t.time()
+
+        report = _format_alpha_report(tokens, header="🚀 **Alpha 信号 — 立即扫描**")
+        try:
+            await update.message.reply_text(report[:4000], parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(report[:4000])
+
+        if tokens and _alpha_record_push is not None:
+            _alpha_record_push(tokens)
+
+    except Exception as e:
+        logger.error(f"Alpha command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Alpha扫描失败: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def onchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Onchain filter — scan DEXScreener with strict volume/liquidity/mcap criteria."""
+    try:
+        from alpha_engine import scan_onchain_filter, format_onchain_filter_report
+        await update.message.reply_text("🔗 Onchain Filter 扫描中...(Liq/MCap/量能筛选)")
+        tokens = await scan_onchain_filter()
+        report = format_onchain_filter_report(tokens)
+        try:
+            await update.message.reply_text(report[:4000])
+        except Exception:
+            await update.message.reply_text(report[:4000])
+    except Exception as e:
+        logger.error(f"Onchain filter error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Onchain扫描失败: {str(e)[:300]}")
+
+
+async def arb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show today's arbitrage summary + live top-5 spreads."""
+    try:
+        if not _arb_available or _arb_engine is None:
+            await update.message.reply_text("❌ 套利引擎模块不可用。")
+            return
+
+        if not _arb_engine.running:
+            await update.message.reply_text(
+                "⚠️ 套利引擎未运行。\n"
+                "重启 bot 后将自动启动 OKX/Bybit/Binance 行情流。"
+            )
+            return
+
+        # Today's history summary
+        summary = _arb_engine.get_today_summary()
+        today_text = _format_arb_today(summary)
+
+        # Live signals — TOP 5
+        top5 = _arb_engine.get_top_spreads(5)
+        live_text = _format_arb_top5(top5)
+
+        # Connection status
+        counts = _arb_engine.exchange_count()
+        status_parts = [f"{ex}({n})" for ex, n in counts.items()]
+        status_line = "已连接: " + " / ".join(status_parts) if status_parts else "连接中..."
+
+        full = f"{today_text}\n\n─────────────────\n{live_text}\n\n📶 {status_line}"
+        await update.message.reply_text(full[:4000], parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Arb command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 套利数据获取失败: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+async def whales_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show 24h on-chain smart money activity."""
+    try:
+        if not _whale_available or _whale_tracker is None:
+            await update.message.reply_text("⚠️ 链上追踪器未启动")
+            return
+        report = _whale_tracker.format_24h_report()
+        addr_list = _whale_tracker.format_address_list()
+        await update.message.reply_text(f"{report}\n\n{addr_list}"[:4000])
+    except Exception as e:
+        logger.error(f"Whales command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 链上数据错误: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a custom whale address to monitor. Usage: /track <address> [label]"""
+    try:
+        if not _whale_available or _whale_tracker is None:
+            await update.message.reply_text("⚠️ 链上追踪器未启动")
+            return
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "用法: /track <地址> [标签]\n"
+                "例: /track 0x28C6...1d60 MyWhale\n"
+                "例: /track 9WzDX...AWM SolWhale"
+            )
+            return
+        address = args[0].strip()
+        label = " ".join(args[1:]) if len(args) > 1 else ""
+        added = _whale_tracker.add_address(address, label)
+        if added:
+            net = _whale_tracker._addresses[address]["network"].upper()
+            lbl = _whale_tracker._addresses[address]["label"]
+            await update.message.reply_text(
+                f"✅ 已添加监控地址\n"
+                f"  网络: {net}\n"
+                f"  标签: {lbl}\n"
+                f"  地址: {address[:16]}..."
+            )
+        else:
+            await update.message.reply_text(f"ℹ️ 地址已在监控列表中: {address[:16]}...")
+    except Exception as e:
+        logger.error(f"Track command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 添加地址失败: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+async def wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show smart money wallet list and recent buy activity. /wallets"""
+    try:
+        if not _smart_tracker_available or _smart_tracker is None:
+            await update.message.reply_text("⚠️ 聪明钱追踪器未启动")
+            return
+        wallet_list = _smart_tracker.format_wallet_list()
+        activity = _smart_tracker.format_recent_activity(24)
+        await update.message.reply_text(f"{wallet_list}\n\n{activity}"[:4000])
+    except Exception as e:
+        logger.error(f"Wallets command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 错误: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+async def addwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a smart money wallet to track. Usage: /addwallet <address> [label]"""
+    try:
+        if not _smart_tracker_available or _smart_tracker is None:
+            await update.message.reply_text("⚠️ 聪明钱追踪器未启动")
+            return
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "用法: /addwallet <地址> [标签]\n"
+                "例: /addwallet 0x1234...abcd MyWhale\n"
+                "例: /addwallet 9WzDX...AWM SolTrader"
+            )
+            return
+        address = args[0].strip()
+        label = " ".join(args[1:]) if len(args) > 1 else ""
+        added = _smart_tracker.add_wallet(address, label)
+        if added:
+            wallets = _smart_tracker.get_wallets()
+            meta = wallets[address]
+            await update.message.reply_text(
+                f"✅ 已添加聪明钱地址\n"
+                f"标签: {meta['label']}\n"
+                f"网络: {meta['network'].upper()}\n"
+                f"地址: {address[:8]}...{address[-4:]}\n"
+                f"当前跟踪: {len(wallets)}个"
+            )
+        else:
+            await update.message.reply_text(
+                f"ℹ️ 该地址已在跟踪列表中: {address[:8]}...{address[-4:]}"
+            )
+    except Exception as e:
+        logger.error(f"Addwallet command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 添加失败: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate and send signal performance report."""
+    try:
+        await _send_profit_report(context, update.effective_chat.id)
+    except Exception as e:
+        logger.error(f"Report command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Report error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show signal win-rate trend, current param version, and optimization rounds."""
+    try:
+        if not _optimizer_available:
+            await update.message.reply_text("❌ strategy_optimizer 模块不可用")
+            return
+        from strategy_optimizer import format_performance_report
+        text = format_performance_report()
+        try:
+            await update.message.reply_text(text[:4000], parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(text[:4000])
+    except Exception as e:
+        logger.error(f"Performance command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 性能报告错误: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
 async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show risk metrics."""
     try:
@@ -1528,6 +2006,319 @@ async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Risk command error: {e}", exc_info=True)
         try:
             await update.message.reply_text(f"❌ Risk error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def codex_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Codex自充能 — 显示状态或手动触发Codex进化任务。"""
+    try:
+        if not _codex_available:
+            await update.message.reply_text("❌ codex_charger 模块不可用")
+            return
+
+        args = context.args or []
+        sub = args[0].lower() if args else "status"
+
+        if sub == "status":
+            status = _codex.get_status()
+            await update.message.reply_text(
+                f"🔋 **Codex自充能状态**\n\n{status}\n\n"
+                f"命令:\n"
+                f"`/codex` — 查看状态\n"
+                f"`/codex test` — 测试Codex连接\n"
+                f"`/codex cli` — 强制切换到CLI模式\n"
+                f"`/codex web` — 强制切换到Codex模式",
+                parse_mode="Markdown",
+            )
+
+        elif sub == "test":
+            await update.message.reply_text("🌐 正在测试 Codex (claude.ai/code) 连接...")
+            charger = _codex.CodexCharger()
+            result = await asyncio.wait_for(
+                charger.run_task("Say exactly: ✅任务完成 — this is a connection test"),
+                timeout=120,
+            )
+            if result["success"]:
+                await update.message.reply_text(
+                    f"✅ Codex连接成功！\n"
+                    f"耗时: {result['duration']:.1f}s\n"
+                    f"响应预览: {result['output'][:200]}"
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Codex连接失败\n错误: {result['error'][:300]}"
+                )
+
+        elif sub == "cli":
+            _codex.mark_cli_recovered()
+            await update.message.reply_text("💻 已切换到 CLI 模式")
+
+        elif sub == "web":
+            _codex.mark_cli_exhausted()
+            await update.message.reply_text("🌐 已切换到 Codex (Web) 模式")
+
+        else:
+            await update.message.reply_text(f"❓ 未知子命令: {sub}\n使用 `/codex` 查看帮助")
+
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱ Codex测试超时 (120s)")
+    except Exception as e:
+        logger.error(f"Codex command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Codex命令错误: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually trigger strategy optimization.
+    /optimize          — Phase 1 win-rate tuning
+    /optimize ga       — P3_24 Genetic Algorithm optimization
+    /optimize history  — show Phase 1 optimization history
+    """
+    try:
+        if not _optimizer_available:
+            await update.message.reply_text("❌ strategy_optimizer 模块不可用")
+            return
+
+        args = context.args or []
+        sub = args[0].lower() if args else "run"
+
+        if sub == "history":
+            summary = _strategy_optimizer.get_optimization_summary()
+            await update.message.reply_text(summary, parse_mode="Markdown")
+            return
+
+        if sub == "ga":
+            # P3_24: Genetic Algorithm parameter optimization
+            await update.message.reply_text(
+                "🧬 **P3_24 遗传算法优化启动**\n"
+                f"种群大小: {_strategy_optimizer.GA24_POPULATION_SIZE}  "
+                f"进化代数: {_strategy_optimizer.GA24_GENERATIONS}\n"
+                "请稍候，正在优化中...",
+                parse_mode="Markdown",
+            )
+            result = await _strategy_optimizer.genetic_optimizer.optimize_now(trigger="manual")
+            msg = _strategy_optimizer.format_ga24_result(result)
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        # Default: Phase 1 win-rate optimization
+        await update.message.reply_text("⚙️ 正在分析信号数据并优化参数...")
+        result = await _strategy_optimizer.strategy_optimizer.optimize_now(trigger="manual")
+        await update.message.reply_text(result["message"], parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Optimize command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 优化失败: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def selfcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check critical files exist and have valid Python syntax."""
+    try:
+        import ast
+        base = os.path.dirname(os.path.abspath(__file__))
+        critical_files = [
+            "bot.py", "run.py", "claude_agent.py", "config.py",
+            "tools.py", "skill_library.py", "self_monitor.py",
+            "proactive_agent.py", "harness_learn.py", "auto_research.py",
+        ]
+        lines = ["🔍 **Self-Check Report**\n"]
+        all_ok = True
+        for fname in critical_files:
+            fpath = os.path.join(base, fname)
+            if not os.path.exists(fpath):
+                lines.append(f"❌ `{fname}` — NOT FOUND")
+                all_ok = False
+                continue
+            size = os.path.getsize(fpath)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+                ast.parse(src)
+                lines.append(f"✅ `{fname}` ({size//1024}KB)")
+            except SyntaxError as se:
+                lines.append(f"⚠️ `{fname}` — SYNTAX ERROR line {se.lineno}: {se.msg}")
+                all_ok = False
+            except Exception as e2:
+                lines.append(f"⚠️ `{fname}` — READ ERROR: {e2}")
+                all_ok = False
+
+        # Check error log
+        error_log = os.path.join(base, "_error_log.txt")
+        if os.path.exists(error_log):
+            size = os.path.getsize(error_log)
+            with open(error_log, "r", encoding="utf-8", errors="replace") as f:
+                last_lines = f.readlines()[-3:]
+            last = "".join(last_lines).strip()[:200]
+            lines.append(f"\n📋 `_error_log.txt` ({size//1024}KB)\nLast entry: `{last}`")
+        else:
+            lines.append("\n📋 `_error_log.txt` — no crashes recorded ✅")
+
+        lines.append(f"\n{'✅ All checks passed' if all_ok else '⚠️ Issues found — see above'}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Selfcheck error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ selfcheck error: {e}")
+        except Exception:
+            pass
+
+
+async def repairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recent auto-repair history from CodeSelfRepair."""
+    try:
+        n = 10
+        if context.args:
+            try:
+                n = max(1, min(50, int(context.args[0])))
+            except ValueError:
+                pass
+        records = code_repair.get_recent_repairs(n)
+        if not records:
+            await update.message.reply_text("🔧 No auto-repairs recorded yet.")
+            return
+        lines = [f"🔧 **Auto-Repair History** (last {len(records)})\n"]
+        for r in records:
+            ts = r.get("ts", "?")[:19].replace("T", " ")
+            ok = "✅" if r.get("success") else "❌"
+            bak = " 💾bak" if r.get("backed_up") else ""
+            conf = r.get("confidence", 0)
+            etype = r.get("error_type", "?")
+            fname = r.get("file", "?")
+            line = r.get("line", "?")
+            emsg = r.get("error_msg", "")[:60]
+            lines.append(
+                f"{ok} `{ts}` **{etype}**{bak}\n"
+                f"   📄 `{fname}:{line}` conf={conf:.0%}\n"
+                f"   _{emsg}_"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"repairs_command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ repairs error: {e}")
+        except Exception:
+            pass
+
+
+async def repair_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show code health status and repair history (/repair_status)."""
+    try:
+        if not _self_repair_available:
+            await update.message.reply_text("⚠️ self_repair module not available.")
+            return
+        # Optionally trigger an immediate scan
+        run_scan = context.args and context.args[0].lower() in ("scan", "now")
+        if run_scan:
+            await update.message.reply_text("🔍 正在扫描代码健康状态...")
+            await proactive_repair.run_scan_now()
+        report = format_repair_status(n_recent=10)
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"repair_status_command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ repair_status error: {e}")
+        except Exception:
+            pass
+
+
+async def evostatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show this week's self-evolution stats (/evostatus). Pass 'run' to trigger immediately."""
+    try:
+        if not _self_repair_available:
+            await update.message.reply_text("⚠️ self_repair module not available.")
+            return
+        run_now = context.args and context.args[0].lower() in ("run", "now", "go")
+        if run_now:
+            await update.message.reply_text("🧬 正在运行自进化周期...")
+            result = await code_evolution_engine.run_now()
+            status = result.get("status", "unknown")
+            target = result.get("target", "N/A")
+            applied = result.get("applied", False)
+            rolled = result.get("rolled_back", False)
+            await update.message.reply_text(
+                f"进化结果: `{status}`\n"
+                f"目标: `{target}`\n"
+                f"已应用: {'✅' if applied else '❌'}\n"
+                f"已回滚: {'⏮️' if rolled else '—'}",
+                parse_mode="Markdown",
+            )
+        report = format_evostatus()
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"evostatus_command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ evostatus error: {e}")
+        except Exception:
+            pass
+
+
+async def code_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show code quality scores and pending patches. Pass 'scan' to re-run analysis."""
+    try:
+        if not _self_repair_available:
+            await update.message.reply_text("⚠️ self_repair module not available.")
+            return
+        run_scan = context.args and context.args[0].lower() in ("scan", "run", "now")
+        if run_scan:
+            await update.message.reply_text("🔬 正在运行代码质量分析...")
+            report = analyze_code_quality()
+            low_count = len(report.get("low_quality_files", []))
+            avg = report.get("avg_score", 0)
+            await update.message.reply_text(
+                f"✅ 扫描完成: {report.get('file_count', 0)}个文件, 平均分{avg}/100, "
+                f"低质量文件{low_count}个",
+            )
+        health = format_code_health()
+        await update.message.reply_text(health, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"code_health_command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ code_health error: {e}")
+        except Exception:
+            pass
+
+
+async def selfrepair_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Full syntax scan + auto-repair of all .py files (/selfrepair)."""
+    try:
+        if not _self_repair_available:
+            await update.message.reply_text("⚠️ self_repair module not available.")
+            return
+        await update.message.reply_text("🔍 正在全量扫描所有 Python 文件的语法错误...")
+        results = await proactive_repair.run_scan_now()
+        syntax_errs = results.get("syntax_errors", [])
+        import_errs = results.get("import_errors", [])
+        fixed = results.get("fixed", [])
+        installed = results.get("installed", [])
+        lines = ["🔧 *全量自检修复结果*\n"]
+        if not syntax_errs and not import_errs:
+            lines.append("✅ 所有文件语法正常，无错误")
+        else:
+            if syntax_errs:
+                lines.append(f"⚠️ *语法错误* ({len(syntax_errs)} 个):")
+                for e in syntax_errs[:5]:
+                    lines.append(f"  • `{e['file']}` 行{e.get('line',0)}: {e['error_msg'][:60]}")
+            if import_errs:
+                lines.append(f"\n⚠️ *导入错误* ({len(import_errs)} 个):")
+                for e in import_errs[:5]:
+                    lines.append(f"  • `{e['file']}`: {e['error_msg'][:60]}")
+        if fixed:
+            lines.append(f"\n🔧 *已自动修复* ({len(fixed)} 个): {', '.join(f'`{f}`' for f in fixed)}")
+        if installed:
+            lines.append(f"\n📦 *已安装依赖*: {', '.join(f'`{p}`' for p in installed)}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        report = format_repair_status(n_recent=5)
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"selfrepair_command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ selfrepair error: {e}")
         except Exception:
             pass
 
@@ -2019,6 +2810,44 @@ async def proactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Control the market monitor. Usage: /market [on|off|status]"""
+    try:
+        action = (context.args[0].lower() if context.args else "status")
+
+        if action == "on":
+            if not market_monitor._running:
+                async def _send(text):
+                    try:
+                        await update.message.get_bot().send_message(
+                            chat_id=update.effective_chat.id, text=text[:4000]
+                        )
+                    except Exception:
+                        pass
+                market_monitor._send = _send
+                await market_monitor.start()
+            await update.message.reply_text(
+                "Market Monitor started.\n"
+                "Watching: BTC/ETH/SOL\n"
+                "Alerts: 24h breakout + 1h change >3%\n"
+                f"Interval: every {market_monitor.status().split('interval:')[1].strip() if 'interval:' in market_monitor.status() else '300s'}"
+            )
+        elif action == "off":
+            if market_monitor._running:
+                await market_monitor.stop()
+            await update.message.reply_text("Market Monitor stopped.")
+        elif action == "status":
+            await update.message.reply_text(market_monitor.status())
+        else:
+            await update.message.reply_text("Usage: /market [on|off|status]")
+    except Exception as e:
+        logger.error(f"Market command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Market error: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
 # ─── Autonomy & Consciousness Commands ────────────────────────────────────────
 
 async def autonomy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2131,6 +2960,154 @@ async def evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Evolution error: {str(e)[:300]}")
         except Exception:
             pass
+
+
+async def strategy_evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """GA strategy parameter evolution. Usage: /strategy_evolve"""
+    try:
+        from strategy_optimizer import strategy_optimizer, format_ga_result
+        chat_id = update.effective_chat.id
+
+        await update.message.reply_text(
+            "🧬 开始策略遗传算法优化...\n"
+            "评估 MA Ribbon / RSI / MACD 参数种群（10组×3策略）\n"
+            "预计需要 30-60 秒，请稍候..."
+        )
+
+        result = await strategy_optimizer.evolve_now()
+        msg    = format_ga_result(result)
+        await context.bot.send_message(
+            chat_id=chat_id, text=msg[:4000], parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Strategy evolve command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 策略进化失败: {str(e)[:300]}")
+        except Exception:
+            pass
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View or edit bot memory. Usage: /memory [show|shortcuts|patterns|summary <text>|set <key> <value>]"""
+    chat_id = update.effective_chat.id
+    args = context.args or []
+    subcmd = args[0].lower() if args else "show"
+
+    try:
+        if subcmd == "show" or subcmd == "":
+            text = memory_engine.format_display()
+            await update.message.reply_text(text[:4096], parse_mode="Markdown")
+
+        elif subcmd == "shortcuts":
+            shortcuts = memory_engine.get_shortcuts()
+            if not shortcuts:
+                await update.message.reply_text("No shortcuts learned yet.")
+                return
+            lines = ["⚡ **Shortcuts** (by frequency)\n"]
+            for s in shortcuts[:20]:
+                lines.append(f"[{s.get('frequency',0)}x] {s['trigger'][:80]}")
+            await update.message.reply_text("\n".join(lines)[:4096], parse_mode="Markdown")
+
+        elif subcmd == "patterns":
+            patterns = memory_engine.get_patterns(20)
+            if not patterns:
+                await update.message.reply_text("No patterns recorded yet.")
+                return
+            lines = ["📊 **Patterns** (success/total)\n"]
+            for p in patterns:
+                tot = p["success_count"] + p.get("fail_count", 0)
+                score = f"{p.get('score',0):.2f}"
+                lines.append(f"{p['success_count']}/{tot} [{score}] {p['text'][:70]}")
+            await update.message.reply_text("\n".join(lines)[:4096], parse_mode="Markdown")
+
+        elif subcmd == "summary" and len(args) >= 2:
+            text = " ".join(args[1:])
+            memory_engine.add_summary(text, source="manual")
+            await update.message.reply_text("✅ Summary saved.")
+
+        elif subcmd == "set" and len(args) >= 3:
+            key = args[1]
+            value = " ".join(args[2:])
+            memory_engine.update_profile(key, value)
+            await update.message.reply_text(f"✅ Profile updated: {key} = {value}")
+
+        elif subcmd == "stats":
+            mem = memory_engine.get_memory()
+            from memory_engine import _total_entries
+            total = _total_entries(mem)
+            await update.message.reply_text(
+                f"🧠 Memory Stats\n"
+                f"Total entries: {total}/500\n"
+                f"Shortcuts: {len(mem['shortcuts'])}\n"
+                f"Patterns: {len(mem['patterns'])}\n"
+                f"Summaries: {len(mem['summaries'])}\n"
+                f"Updated: {mem.get('last_updated','?')[:16]}"
+            )
+
+        else:
+            await update.message.reply_text(
+                "Usage: /memory [show|shortcuts|patterns|summary <text>|set <key> <value>|stats]"
+            )
+    except Exception as e:
+        logger.error(f"memory_command error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Memory error: {e}")
+
+
+async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View synthesized skill library. Usage: /skills [list|stats|top]"""
+    try:
+        import skill_library
+        args = context.args or []
+        subcmd = args[0].lower() if args else "list"
+
+        if subcmd == "seed":
+            seeded = skill_library.seed_evolution_skills()
+            await update.message.reply_text(f"✅ 已种入 {seeded} 个技能 (跳过已存在的)")
+            return
+        elif subcmd == "synth":
+            n = skill_library.synthesize_all_to_md()
+            await update.message.reply_text(f"✅ 合成了 {n} 个MD技能文件")
+            return
+        elif subcmd == "stats":
+            index = skill_library._load_index()
+            entries = index.get("entries", [])
+            total = len(entries)
+            used = sum(1 for e in entries if e.get("use_count", 0) > 0)
+            auto = len(skill_library.list_synthesized_skills())
+            msg = (f"📚 技能库统计\n"
+                   f"总技能数: {total}\n"
+                   f"已使用: {used}\n"
+                   f"自动合成MD: {auto}\n"
+                   f"最大容量: {skill_library.MAX_SKILLS}")
+        elif subcmd == "top":
+            index = skill_library._load_index()
+            entries = sorted(index.get("entries", []),
+                             key=lambda e: e.get("use_count", 0), reverse=True)[:5]
+            if not entries:
+                msg = "📚 暂无技能记录"
+            else:
+                lines = ["📚 最常用技能 Top 5:"]
+                for e in entries:
+                    lines.append(f"• {e.get('title', e['id'])} (用了{e.get('use_count',0)}次)")
+                msg = "\n".join(lines)
+        else:  # list
+            index = skill_library._load_index()
+            entries = index.get("entries", [])
+            if not entries:
+                msg = "📚 技能库为空，完成几个任务后会自动提取技能"
+            else:
+                lines = [f"📚 技能库 ({len(entries)}个):"]
+                for e in entries[:15]:
+                    score_str = f" ★{e['avg_score']:.1f}" if e.get("avg_score") else ""
+                    lines.append(f"• {e.get('title', e['id'])}{score_str}")
+                if len(entries) > 15:
+                    lines.append(f"...还有{len(entries)-15}个")
+                msg = "\n".join(lines)
+
+        await update.message.reply_text(msg)
+    except Exception as e:
+        logger.error(f"skills_command error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Skills error: {e}")
 
 
 async def multi_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2365,7 +3342,8 @@ async def handle_quick_action_callback(update, context):
         elif action in ("qa_scroll_up", "qa_scroll_down"):
             import pyautogui
             from screenshots import capture_screenshot
-            pyautogui.scroll(5 if action == "qa_scroll_up" else -5)
+            _loop = asyncio.get_running_loop()
+            await _loop.run_in_executor(None, lambda: pyautogui.scroll(5 if action == "qa_scroll_up" else -5))
             await asyncio.sleep(0.3)
             _loop = asyncio.get_running_loop()
             buffer = await _loop.run_in_executor(None, capture_screenshot)
@@ -2449,6 +3427,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duration_ms = (time.time() - _msg_start) * 1000
         self_monitor.record_response_time(duration_ms)
         action_memory.record_action("handle_message", {"text": text[:100]}, success=True, duration_ms=duration_ms)
+        if _dashboard_available:
+            try:
+                _dashboard.record_message(text, True, duration_ms)
+            except Exception:
+                pass
+
+        # Memory engine: auto-learn successful patterns
+        try:
+            memory_engine.learn_pattern(text, success=True, duration_ms=duration_ms)
+        except Exception:
+            pass
 
         # Intelligence + Reflexion + RAG: learn from success
         if _intel_available:
@@ -2476,15 +3465,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         # Consciousness: periodic performance snapshot (every 50 messages)
-        if _autonomy_available:
-            global _message_counter
-            _message_counter += 1
-            if _message_counter % 50 == 0:
-                try:
-                    awareness = get_self_awareness()
-                    awareness.record_performance_snapshot()
-                except Exception:
-                    pass
+        global _message_counter
+        _message_counter += 1
+        if _autonomy_available and _message_counter % 50 == 0:
+            try:
+                awareness = get_self_awareness()
+                awareness.record_performance_snapshot()
+            except Exception:
+                pass
+        # Memory: auto-summary every 30 messages
+        if _message_counter % 30 == 0:
+            try:
+                patterns = memory_engine.get_patterns(5)
+                if patterns:
+                    top = ", ".join(p["text"][:40] for p in patterns[:3])
+                    memory_engine.add_summary(
+                        f"Session summary (msg #{_message_counter}): top commands: {top}",
+                        source="auto"
+                    )
+            except Exception:
+                pass
 
         # Session learning: periodic background scan
         if _session_learner_available and config.SESSION_LEARNING_ENABLED:
@@ -2507,8 +3507,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         try:
             action_memory.record_action("handle_message", {"text": text[:100]}, success=False, error=str(e), duration_ms=duration_ms)
+            memory_engine.learn_pattern(text, success=False, duration_ms=duration_ms)
         except Exception:
             pass
+        if _dashboard_available:
+            try:
+                _dashboard.record_message(text, False, duration_ms)
+            except Exception:
+                pass
 
         # Intelligence + Reflexion: analyze failure for learning
         if _intel_available:
@@ -2606,13 +3612,33 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Failed to read image as base64: {e}")
 
-        msg = f"用户发送了一张图片，已保存到: {save_path}"
-        if caption:
-            msg += f"\n用户说: {caption}"
-        else:
-            msg += "\n(无附加说明)"
+        # --- Multimodal analysis pipeline (p3_19) ---
+        vision_ctx = ""
+        needs_confirm = False
+        try:
+            from vision_engine import analyze_telegram_image
+            _loop_ve = asyncio.get_running_loop()
+            ve_result = await _loop_ve.run_in_executor(
+                None, analyze_telegram_image, save_path, caption
+            )
+            vision_ctx = ve_result.get("claude_context", "")
+            needs_confirm = ve_result.get("needs_confirmation", False)
+        except Exception as _ve_err:
+            logger.warning(f"Vision analysis skipped: {_ve_err}")
 
-        await update.message.reply_text(f"📸 图片已保存: {save_path}")
+        if vision_ctx:
+            msg = f"{vision_ctx}\n\n图片已保存到: {save_path}"
+        else:
+            msg = f"用户发送了一张图片，已保存到: {save_path}"
+            if caption:
+                msg += f"\n用户说: {caption}"
+            else:
+                msg += "\n(无附加说明)"
+
+        status_emoji = "⚠️" if needs_confirm else "📸"
+        status_line = f"{status_emoji} 图片已分析: {save_path}"
+        await update.message.reply_text(status_line)
+
         actually_processed = await claude_agent.process_message(msg, chat_id, context, image_data=image_data)
         if actually_processed:
             self_monitor.record_message_success()
@@ -2830,14 +3856,20 @@ async def handle_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE
 _PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.pid")
 
 def _is_python_process(pid):
-    """Check if PID is alive and is a Python process."""
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
+    """Check if PID is alive and is a Python process.
+    On Windows, avoids os.kill(pid, 0) which sends CTRL_C_EVENT and can kill processes.
+    """
     if sys.platform == "win32":
         try:
             import subprocess as _sp
+            # First check if PID exists at all (fast, no PowerShell)
+            result = _sp.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if str(pid) not in result.stdout:
+                return False
+            # Then verify it's a python process
             _cmd_out = _sp.run(
                 ["powershell", "-NoProfile", "-Command",
                  f"(Get-Process -Id {pid} -ErrorAction SilentlyContinue).ProcessName"],
@@ -2846,7 +3878,12 @@ def _is_python_process(pid):
             return "python" in (_cmd_out.stdout or "").strip().lower()
         except Exception:
             return False
-    return True
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
 
 def _acquire_pid_lock():
     """Check for existing bot instance and kill it before starting.
@@ -2973,6 +4010,23 @@ def main():
     _startup_health_check()
     _acquire_pid_lock()
 
+    # Seed skill library with evolution knowledge on first run
+    try:
+        import skill_library
+        seeded = skill_library.seed_evolution_skills()
+        if seeded:
+            logger.info(f"Skill library seeded with {seeded} evolution skills")
+    except Exception as _se:
+        logger.warning(f"Skill seed failed: {_se}")
+
+    # Start web dashboard on port 8080
+    if _dashboard_available:
+        try:
+            _dashboard.start_dashboard(port=8080)
+            print("Dashboard started at http://localhost:8080")
+        except Exception as _de:
+            logger.warning(f"Dashboard start failed: {_de}")
+
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
 
     # Global error handler
@@ -2989,6 +4043,8 @@ def main():
     app.add_handler(CommandHandler("status", status_command, filters=auth_filter))
     app.add_handler(CommandHandler("bridge", bridge_command, filters=auth_filter))
     app.add_handler(CommandHandler("kill", kill_command, filters=auth_filter))
+    app.add_handler(CommandHandler("tasks", tasks_command, filters=auth_filter))
+    app.add_handler(CommandHandler("cancel", cancel_command, filters=auth_filter))
     app.add_handler(CommandHandler("quota", quota_command, filters=auth_filter))
     app.add_handler(CommandHandler("sessions", sessions_command, filters=auth_filter))
     app.add_handler(CommandHandler("learn", learn_command, filters=auth_filter))
@@ -3001,11 +4057,22 @@ def main():
     app.add_handler(CommandHandler("quick", quick_action, filters=auth_filter))
     app.add_handler(CommandHandler("panel", panel_command, filters=auth_filter))
     app.add_handler(CommandHandler("health", health_command, filters=auth_filter))
+    app.add_handler(CommandHandler("vital", vital_command, filters=auth_filter))
     app.add_handler(CommandHandler("portfolio", portfolio_command, filters=auth_filter))
     app.add_handler(CommandHandler("signal", signal_command, filters=auth_filter))
+    app.add_handler(CommandHandler("signal_stats", signal_stats_command, filters=auth_filter))
+    app.add_handler(CommandHandler("alpha", alpha_command, filters=auth_filter))
+    app.add_handler(CommandHandler("onchain", onchain_command, filters=auth_filter))
+    app.add_handler(CommandHandler("arb", arb_command, filters=auth_filter))
+    app.add_handler(CommandHandler("whales", whales_command, filters=auth_filter))
+    app.add_handler(CommandHandler("track", track_command, filters=auth_filter))
+    app.add_handler(CommandHandler("wallets", wallets_command, filters=auth_filter))
+    app.add_handler(CommandHandler("addwallet", addwallet_command, filters=auth_filter))
+    app.add_handler(CommandHandler("report", report_command, filters=auth_filter))
     app.add_handler(CommandHandler("risk", risk_command, filters=auth_filter))
     app.add_handler(CommandHandler("monitor", monitor_command, filters=auth_filter))
     app.add_handler(CommandHandler("proactive", proactive_command, filters=auth_filter))
+    app.add_handler(CommandHandler("market", market_command, filters=auth_filter))
     # Trading skill commands
     app.add_handler(CommandHandler("token_analyze", token_analyze_command, filters=auth_filter))
     app.add_handler(CommandHandler("okx_backtest", okx_backtest_command, filters=auth_filter))
@@ -3017,6 +4084,19 @@ def main():
     app.add_handler(CommandHandler("consciousness", consciousness_command, filters=auth_filter))
     app.add_handler(CommandHandler("ms", multi_session_command, filters=auth_filter))
     app.add_handler(CommandHandler("evolve", evolve_command, filters=auth_filter))
+    app.add_handler(CommandHandler("strategy_evolve", strategy_evolve_command, filters=auth_filter))
+    app.add_handler(CommandHandler("skills", skills_command, filters=auth_filter))
+    app.add_handler(CommandHandler("selfcheck", selfcheck_command, filters=auth_filter))
+    app.add_handler(CommandHandler("repairs", repairs_command, filters=auth_filter))
+    app.add_handler(CommandHandler("repair_status", repair_status_command, filters=auth_filter))
+    app.add_handler(CommandHandler("performance", performance_command, filters=auth_filter))
+    app.add_handler(CommandHandler("evostatus", evostatus_command, filters=auth_filter))
+    app.add_handler(CommandHandler("code_health", code_health_command, filters=auth_filter))
+    app.add_handler(CommandHandler("selfrepair", selfrepair_command, filters=auth_filter))
+    app.add_handler(CommandHandler("memory", memory_command, filters=auth_filter))
+    app.add_handler(CommandHandler("dashboard", dashboard_command, filters=auth_filter))
+    app.add_handler(CommandHandler("codex", codex_command, filters=auth_filter))
+    app.add_handler(CommandHandler("optimize", optimize_command, filters=auth_filter))
 
     # Callbacks — panel first, then session control, then quick actions, then safety confirmations
     app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
@@ -3087,6 +4167,47 @@ def main():
 
     # Register commands in Telegram menu + start background loops
     async def post_init(application):
+        # Register commands FIRST (before any background tasks that might fail)
+        try:
+            await application.bot.set_my_commands([
+                ("panel", "Command panel"),
+                ("start", "Start/help"),
+                ("clear", "Clear conversation"),
+                ("screenshot", "Screenshot"),
+                ("status", "Status + health"),
+                ("health", "Detailed health check"),
+                ("vital", "Vital signs (alive status)"),
+                ("model", "Switch model"),
+                ("bridge", "Switch mode"),
+                ("score", "Agent score"),
+                ("portfolio", "Portfolio"),
+                ("signal", "Signals"),
+                ("onchain", "Onchain filter scan"),
+                ("arb", "Cross-exchange arbitrage"),
+                ("risk", "Risk metrics"),
+                ("train", "Training"),
+                ("learn", "Session learning"),
+                ("sessions", "Claude sessions"),
+                ("kill", "Kill task"),
+                ("ping", "Ping"),
+                ("q", "Quick panel"),
+                ("quota", "Quota usage"),
+                ("monitor", "System monitor"),
+                ("proactive", "Proactive agent"),
+                ("market", "Market monitor"),
+            ])
+            logger.info("Bot commands registered with Telegram")
+        except Exception as e:
+            logger.error(f"Failed to set bot commands: {e}")
+
+        # Boot Vital Signs lifecycle tracking
+        try:
+            import vital_signs
+            vital_signs.boot()
+            logger.info(f"VitalSigns booted: lifecycle={vital_signs.get_vital_signs()['lifecycle']}")
+        except Exception as e:
+            logger.warning(f"VitalSigns failed to boot: {e}")
+
         # Start auto-research background loop (non-essential, don't crash bot on failure)
         try:
             import auto_research
@@ -3153,6 +4274,225 @@ def main():
                 logger.info("ProactiveAgent background loops started")
         except Exception as e:
             logger.warning(f"ProactiveAgent failed to start: {e}")
+
+        # Start Market Monitor background loop
+        try:
+            if config.MARKET_MONITOR_ENABLED:
+                async def _market_send(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4000],
+                        )
+                    except Exception:
+                        pass
+
+                market_monitor._send = _market_send
+                await market_monitor.start()
+                logger.info("MarketMonitor background loop started")
+        except Exception as e:
+            logger.warning(f"MarketMonitor failed to start: {e}")
+
+        # Start ProactiveSelfRepair background scanner
+        try:
+            if _self_repair_available:
+                async def _repair_notify(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4000],
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+                proactive_repair.set_notify_fn(_repair_notify)
+                await proactive_repair.start()
+                logger.info("ProactiveSelfRepair background scanner started")
+                # Start code evolution engine alongside repair scanner
+                if code_evolution_engine is not None:
+                    code_evolution_engine.set_notify_fn(_repair_notify)
+                    await code_evolution_engine.start()
+                    logger.info("CodeEvolutionEngine started")
+                if code_quality_scheduler is not None:
+                    code_quality_scheduler.set_notify_fn(_repair_notify)
+                    await code_quality_scheduler.start()
+                    logger.info("CodeQualityScheduler started (daily UTC 02:00)")
+        except Exception as e:
+            logger.warning(f"ProactiveSelfRepair failed to start: {e}")
+
+        # Start Arbitrage Engine background WebSocket streams + REST scanner
+        try:
+            if _arb_available and _arb_engine is not None:
+                async def _arb_send(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4000],
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+                _arb_engine._send = _arb_send
+                await _arb_engine.start()
+                logger.info("ArbEngine started (OKX/Bybit/Binance WS + REST scanner)")
+        except Exception as e:
+            logger.warning(f"ArbEngine failed to start: {e}")
+
+        # Start OnchainTracker (whale monitor)
+        try:
+            if _whale_available and _whale_tracker is not None:
+                async def _whale_send(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4000],
+                        )
+                    except Exception:
+                        pass
+                _whale_tracker._send = _whale_send
+                await _whale_tracker.start()
+                logger.info("OnchainTracker started")
+        except Exception as e:
+            logger.warning(f"OnchainTracker failed to start: {e}")
+
+        # Start SmartMoneyTracker (smart money buy signals every 2 min)
+        try:
+            if _smart_tracker_available and _smart_tracker is not None:
+                async def _smart_send(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4000],
+                        )
+                    except Exception:
+                        pass
+                _smart_tracker._send = _smart_send
+                await _smart_tracker.start()
+                logger.info("SmartMoneyTracker started")
+        except Exception as e:
+            logger.warning(f"SmartMoneyTracker failed to start: {e}")
+
+        # Start Profit Tracker background loop
+        try:
+            async def _profit_send(text):
+                if config.AUTHORIZED_USER_ID is None:
+                    return
+                try:
+                    await application.bot.send_message(
+                        chat_id=config.AUTHORIZED_USER_ID,
+                        text=text[:4000],
+                    )
+                except Exception:
+                    pass
+
+            async def _profit_send_photo(path):
+                if config.AUTHORIZED_USER_ID is None:
+                    return
+                try:
+                    with open(path, "rb") as f:
+                        await application.bot.send_photo(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            photo=f,
+                            caption="📈 胜率趋势 & 累计收益 (每日报告)",
+                        )
+                except Exception:
+                    pass
+
+            _profit_tracker.profit_tracker._send = _profit_send
+            _profit_tracker.profit_tracker._send_photo = _profit_send_photo
+            await _profit_tracker.profit_tracker.start()
+            logger.info("ProfitTracker background loop started")
+        except Exception as e:
+            logger.warning(f"ProfitTracker failed to start: {e}")
+
+        # ─── Strategy Optimizer: weekly auto-optimization ─────────────────────
+        try:
+            if _optimizer_available:
+                async def _optimizer_notify(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4000],
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+
+                _strategy_optimizer.strategy_optimizer._notify = _optimizer_notify
+                await _strategy_optimizer.strategy_optimizer.start()
+                logger.info("StrategyOptimizer background loop started")
+
+                # P3_20: PerformanceOptimizer (Bayesian opt + A/B test + daily push)
+                try:
+                    _strategy_optimizer.performance_optimizer._notify = _optimizer_notify
+                    await _strategy_optimizer.performance_optimizer.start()
+                    logger.info("PerformanceOptimizer (P3_20) started")
+                except Exception as e_p3:
+                    logger.warning(f"PerformanceOptimizer (P3_20) failed to start: {e_p3}")
+
+                # P3_24: GeneticOptimizer (GA parameter optimization)
+                try:
+                    _strategy_optimizer.genetic_optimizer._notify = _optimizer_notify
+                    await _strategy_optimizer.genetic_optimizer.start()
+                    logger.info("GeneticOptimizer (P3_24) started")
+                except Exception as e_p3_24:
+                    logger.warning(f"GeneticOptimizer (P3_24) failed to start: {e_p3_24}")
+        except Exception as e:
+            logger.warning(f"StrategyOptimizer failed to start: {e}")
+
+        # ─── Alpha Engine: 30-min social alpha signal scanner ────────────────
+        try:
+            if _alpha_available and _alpha_engine is not None:
+                async def _alpha_send(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4000],
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+
+                _alpha_engine._send = _alpha_send
+                await _alpha_engine.start()
+                logger.info("AlphaEngine started (CoinGecko/DEXScreener/PumpFun 30-min)")
+        except Exception as e:
+            logger.warning(f"AlphaEngine failed to start: {e}")
+
+        # ─── Pro Strategy Engine: multi-strategy fusion scanner ─────────────
+        try:
+            from pro_strategy import pro_engine as _pro_engine
+
+            async def _pro_send(text):
+                if config.AUTHORIZED_USER_ID is None:
+                    return
+                try:
+                    await application.bot.send_message(
+                        chat_id=config.AUTHORIZED_USER_ID,
+                        text=text[:4000],
+                    )
+                except Exception:
+                    pass
+
+            _pro_engine._send = _pro_send
+            await _pro_engine.start()
+            logger.info("ProStrategyEngine started (3-strategy fusion, 15min scan)")
+        except Exception as e:
+            logger.warning(f"ProStrategyEngine failed to start: {e}")
 
         # ─── Autonomy Engine: auto-start if there are pending goals ──────────
         try:
@@ -3228,29 +4568,47 @@ def main():
         except Exception as e:
             logger.warning(f"Heartbeat failed to start: {e}")
 
-        await application.bot.set_my_commands([
-            ("panel", "Command panel"),
-            ("start", "Start/help"),
-            ("clear", "Clear conversation"),
-            ("screenshot", "Screenshot"),
-            ("status", "Status + health"),
-            ("health", "Detailed health check"),
-            ("model", "Switch model"),
-            ("bridge", "Switch mode"),
-            ("score", "Agent score"),
-            ("portfolio", "Portfolio"),
-            ("signal", "Signals"),
-            ("risk", "Risk metrics"),
-            ("train", "Training"),
-            ("learn", "Session learning"),
-            ("sessions", "Claude sessions"),
-            ("kill", "Kill task"),
-            ("ping", "Ping"),
-            ("q", "Quick panel"),
-            ("quota", "Quota usage"),
-            ("monitor", "System monitor"),
-            ("proactive", "Proactive agent"),
-        ])
+        # ─── MetaLearner: daily pattern analysis + weekly evolution report ───
+        try:
+            import meta_learner as _meta_learner
+
+            async def _meta_send(text):
+                if config.AUTHORIZED_USER_ID is None:
+                    return
+                try:
+                    await application.bot.send_message(
+                        chat_id=config.AUTHORIZED_USER_ID,
+                        text=text[:4000],
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+
+            _meta_learner.meta_learner._send = _meta_send
+            await _meta_learner.meta_learner.start()
+            logger.info("MetaLearner background loop started (daily analysis + weekly report)")
+        except Exception as e:
+            logger.warning(f"MetaLearner failed to start: {e}")
+
+        # ─── Evolve Watcher: background subprocess that keeps evolution queue running ──
+        try:
+            import subprocess, sys
+            _evolver_script = os.path.join(os.path.dirname(__file__), "evolve_watcher.py")
+            if os.path.exists(_evolver_script):
+                _evolver_proc = subprocess.Popen(
+                    [sys.executable, _evolver_script],
+                    cwd=os.path.dirname(__file__),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                application.bot_data["_evolver_pid"] = _evolver_proc.pid
+                logger.info(f"EvolveWatcher started as subprocess (PID {_evolver_proc.pid})")
+            else:
+                logger.info("EvolveWatcher: evolve_watcher.py not found, skipped")
+        except Exception as e:
+            logger.warning(f"EvolveWatcher failed to start: {e}")
+
     app.post_init = post_init
 
     async def post_shutdown(application):
@@ -3270,6 +4628,45 @@ def main():
         try:
             if proactive_agent:
                 await proactive_agent.stop()
+        except Exception:
+            pass
+        # Stop ProactiveSelfRepair scanner + CodeEvolutionEngine
+        try:
+            if _self_repair_available and proactive_repair:
+                await proactive_repair.stop()
+            if _self_repair_available and code_evolution_engine:
+                await code_evolution_engine.stop()
+            if _self_repair_available and code_quality_scheduler:
+                await code_quality_scheduler.stop()
+        except Exception:
+            pass
+        # Stop arbitrage engine
+        try:
+            if _arb_available and _arb_engine is not None and _arb_engine.running:
+                await _arb_engine.stop()
+        except Exception:
+            pass
+        # Stop OnchainTracker
+        try:
+            if _whale_available and _whale_tracker is not None and _whale_tracker.running:
+                await _whale_tracker.stop()
+        except Exception:
+            pass
+        # Stop SmartMoneyTracker
+        try:
+            if _smart_tracker_available and _smart_tracker is not None and _smart_tracker.running:
+                await _smart_tracker.stop()
+        except Exception:
+            pass
+        # Stop EvolveWatcher subprocess
+        try:
+            _evolver_pid = application.bot_data.get("_evolver_pid")
+            if _evolver_pid:
+                import signal
+                os.kill(_evolver_pid, signal.SIGTERM)
+                logger.info(f"EvolveWatcher subprocess (PID {_evolver_pid}) terminated")
+        except (ProcessLookupError, OSError):
+            pass
         except Exception:
             pass
         logger.info("Post-shutdown cleanup complete")

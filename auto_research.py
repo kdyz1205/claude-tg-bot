@@ -210,7 +210,10 @@ def _pick_knowledge_experiment() -> dict | None:
     if not type_counts:
         return None
 
-    top_type = type_counts.most_common(1)[0][0]
+    most_common = type_counts.most_common(1)
+    if not most_common:
+        return None
+    top_type = most_common[0][0]
     if top_type == "general":
         return None
 

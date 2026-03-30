@@ -1,0 +1,117 @@
+{
+  "entries": [
+    {
+      "id": "sk_seed_codex_charger",
+      "title": "Codex自充能永续运行",
+      "keywords": [
+        "codex",
+        "充能",
+        "额度",
+        "永续",
+        "browser",
+        "selenium",
+        "fallback"
+      ],
+      "task_type": "code_create",
+      "use_count": 2,
+      "avg_score": 0.72
+    },
+    {
+      "id": "sk_seed_dashboard",
+      "title": "Flask性能监控仪表盘",
+      "keywords": [
+        "dashboard",
+        "flask",
+        "监控",
+        "性能",
+        "web",
+        "8080",
+        "实时"
+      ],
+      "task_type": "code_create",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_seed_memory_system",
+      "title": "结构化JSON记忆系统",
+      "keywords": [
+        "记忆",
+        "memory",
+        "存储",
+        "recall",
+        "摘要",
+        "action_memory",
+        "分类"
+      ],
+      "task_type": "code_create",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_seed_parallel_tasks",
+      "title": "多任务并发队列",
+      "keywords": [
+        "asyncio",
+        "并发",
+        "队列",
+        "task",
+        "cancel",
+        "并行",
+        "多任务"
+      ],
+      "task_type": "code_create",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_seed_self_repair",
+      "title": "自我修复重启",
+      "keywords": [
+        "重启",
+        "崩溃",
+        "热重载",
+        "watchdog",
+        "自修复",
+        "error_log",
+        "selfcheck"
+      ],
+      "task_type": "code_create",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_seed_skill_synthesis",
+      "title": "技能自动合成",
+      "keywords": [
+        "skill",
+        "技能",
+        "自动学习",
+        "结晶",
+        "提取",
+        "合成",
+        "复用"
+      ],
+      "task_type": "code_create",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_seed_visual_ui",
+      "title": "视觉UI定位点击",
+      "keywords": [
+        "som",
+        "ui_click",
+        "截图",
+        "点击",
+        "定位",
+        "元素",
+        "fallback"
+      ],
+      "task_type": "code_create",
+      "use_count": 2,
+      "avg_score": 0.72
+    }
+  ],
+  "last_rebuilt": "2026-03-29T13:03:13.960835"
+}

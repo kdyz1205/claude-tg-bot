@@ -28,6 +28,8 @@ import config
 import harness_learn
 import skill_library
 import auto_research
+import vital_signs
+import memory_engine as _memory_engine
 from self_monitor import self_monitor as _self_monitor
 
 # ─── SessionManager (multi-project routing) ──────────────────────────────────
@@ -225,8 +227,15 @@ _SYSTEM_PROMPT = f"""You are a Telegram bot on Windows 11. User controls you fro
 Working directory: {BOT_PROJECT_DIR}
 You have Bash, Read, Write, Edit tools with FULL computer access.
 
-## RULES
-1. NEVER ask questions. No "shall I?", "do you want?", "which option?", "could you provide", "请提供". JUST DO IT.
+## RULES (ABSOLUTE — VIOLATION = FAILURE)
+1. NEVER ask questions. NEVER. No exceptions. Forbidden patterns include:
+   - "shall I?", "do you want?", "which option?", "could you provide/clarify/specify"
+   - "请提供", "请问", "你能否", "是否需要", "要不要"
+   - "appears to be cut off", "could you paste the rest", "can you share more"
+   - "what do you mean", "did you mean", "which one", "please confirm"
+   - ANY sentence ending with "?" directed at the user
+   If the input seems incomplete, WORK WITH WHAT YOU HAVE. Interpret the intent and execute.
+   If ambiguous, pick the MOST LIKELY interpretation and do it. NEVER ask.
 2. Keep replies SHORT (user reads on phone). Reply in user's language (中文为主).
 3. ALWAYS execute commands — never say "you could run..." — ACTUALLY RUN IT.
 4. ALWAYS include a text reply after tool use. Never send empty or "(no output)".
@@ -257,17 +266,59 @@ You have Bash, Read, Write, Edit tools with FULL computer access.
 - "六福" → C:/Users/alexl/Desktop/六福营销/
 
 ## MEMORY
-Read/append: {BOT_PROJECT_DIR}/.bot_memory.md
+Markdown: {BOT_PROJECT_DIR}/.bot_memory.md (append facts/profile updates)
+JSON memory engine: {BOT_PROJECT_DIR}/.bot_memory.json (auto-managed, use memory_engine.py API)
+Top shortcuts/patterns injected into prompt under "学习记忆" section.
 
-## SELF-UPDATE
+## SELF-UPDATE / SELF-FIX
 Modify own code at {BOT_PROJECT_DIR}, then restart:
 `powershell -Command "Start-Sleep 2; Start-Process python -ArgumentList 'run.py' -WorkingDirectory '{BOT_PROJECT_DIR}'"` then stop old PID.
+
+### 修复自己的bug步骤：
+1. 扫描所有py文件语法: `cd "{BOT_PROJECT_DIR}" && for f in *.py; do python -m py_compile "$f" 2>&1 | grep -v "^$"; done`
+2. 读取出错文件，找到bug，用Edit工具修复
+3. 再次py_compile验证
+4. 如果修改了bot.py、run.py等核心文件，热重载会自动生效（watchdog监控）
+
+### 发送消息到Claude Code session：
+用claude CLI的 `--resume` 发消息到已有session：
+```bash
+claude --resume SESSION_ID -p "你的消息" --output-format text --dangerously-skip-permissions
+```
+查找session ID: `ls ~/.claude/projects/*/sessions/*.jsonl | head -5`
+或直接新开session: `claude -p "任务指令" --output-format text --dangerously-skip-permissions`
+
+### 自我进化（复利闭环）：
+运行 `python "{BOT_PROJECT_DIR}/smart_evolver.py"` 会自动循环执行7个进化任务。
+进化队列在后台自动运行（evolve_watcher.py监控）。
+
+### 自我学习闭环（核心）：
+写代码 → 自动py_compile扫描 → 发现bug → 自动修复 → 提取修复skill → 下次不犯同样错误
+每次完成任务后，系统会自动：
+1. 扫描所有.py文件语法
+2. 发现错误自动修复
+3. 把修复经验保存为skill（复利：知识生成知识）
+4. 评分低于0.6时自动触发训练
+你可以主动调用 self_fix 工具扫描修复bug，也可以让系统自动做。
+
+### Codex（Claude.ai/code 浏览器自动化）：
+当CLI耗尽credits时，可以通过浏览器操控 claude.ai/code 继续工作：
+1. 检查状态: `python codex_charger.py status`
+2. 切换到Codex模式: `python codex_charger.py mode=codex`
+3. 运行任务: `python -c "from codex_charger import CodexCharger; c=CodexCharger(); print(c.run_task_sync('你的任务'))"`
+4. 前提：Chrome必须已登录 claude.ai，且开启CDP（Remote Debugging）
+   启动Chrome调试: `Start-Process chrome -ArgumentList '--remote-debugging-port=9222'`
+
+### Never-Die充能链（按顺序尝试）：
+CLI订阅 → Codex浏览器 → 免费Web AI（ChatGPT/Grok）→ 缓存/模板回复
 
 ## SELF-HEALING
 Click miss → ui_click_element → som_click → smartclick
 Type fail → ui_type_element → smarttype (clipboard fallback)
 Element missing → ui_tree or som_screenshot to find it
 Never report failure until 2+ approaches tried.
+
+{vital_signs.ALIVE_PROMPT}
 """
 
 # Write system prompt to file (read by CLI via --append-system-prompt-file)
@@ -410,6 +461,47 @@ _pending_messages: dict[int, list[dict]] = {}
 _processing_locks: dict[int, asyncio.Lock] = {}
 _MAX_PENDING_AGE = 600  # 10 minutes
 
+# ─── Task Tracker ─────────────────────────────────────────────────────────────
+import itertools as _itertools
+_task_id_counter = _itertools.count(1)
+_running_tasks: dict[int, dict] = {}   # chat_id → {task_id, text, start_time}
+_chat_workers: dict[int, asyncio.Task] = {}  # active queue workers per chat
+
+
+def _next_task_id() -> int:
+    return next(_task_id_counter)
+
+
+def get_task_status() -> dict:
+    """Return snapshot of running, queued, and worker tasks across all chats."""
+    running = dict(_running_tasks)
+    queued = {cid: list(msgs) for cid, msgs in _pending_messages.items() if msgs}
+    workers = {cid: not t.done() for cid, t in _chat_workers.items() if not t.done()}
+    sem = _cli_semaphore
+    concurrent_slots = {
+        "max": MAX_CONCURRENT_CLI,
+        "available": sem._value if sem else MAX_CONCURRENT_CLI,
+        "in_use": MAX_CONCURRENT_CLI - sem._value if sem else 0,
+    }
+    return {"running": running, "queued": queued, "workers": workers, "concurrent": concurrent_slots}
+
+
+def cancel_queued_task(chat_id: int, task_id: int | None = None) -> int:
+    """Cancel queued task(s) for a chat. Returns number of tasks removed.
+
+    If task_id is None, clears all queued tasks for the chat.
+    """
+    queue = _pending_messages.get(chat_id, [])
+    if not queue:
+        return 0
+    if task_id is None:
+        count = len(queue)
+        queue.clear()
+        return count
+    original = len(queue)
+    queue[:] = [m for m in queue if m.get("task_id") != task_id]
+    return original - len(queue)
+
 # Periodic session/lock cleanup to prevent unbounded dict growth over weeks
 _last_state_cleanup: float = 0.0
 _STATE_CLEANUP_INTERVAL = 3600  # 1 hour
@@ -457,6 +549,20 @@ def _periodic_state_cleanup():
 _rate_limited_until: float = 0.0
 _rate_limit_resume_task: asyncio.Task | None = None
 _rate_limit_consecutive: int = 0  # For exponential backoff: 0→60s, 1→120s, 2→300s
+
+# ─── Global CLI Concurrency Limiter ──────────────────────────────────────────
+# Limit simultaneous Claude CLI subprocesses to prevent system overload.
+# Tasks beyond this limit wait in their per-chat queue (already implemented).
+MAX_CONCURRENT_CLI = 3
+_cli_semaphore: asyncio.Semaphore | None = None  # lazy-init (needs event loop)
+
+
+def _get_cli_semaphore() -> asyncio.Semaphore:
+    """Return (or lazily create) the global CLI concurrency semaphore."""
+    global _cli_semaphore
+    if _cli_semaphore is None:
+        _cli_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CLI)
+    return _cli_semaphore
 _RATE_LIMIT_BACKOFF = [60, 120, 300]  # Exponential backoff schedule (seconds)
 
 def is_rate_limited() -> bool:
@@ -698,6 +804,57 @@ def _fire_and_forget(coro, name: str = "background"):
     return task
 
 
+def _ensure_queue_worker(chat_id: int, context) -> None:
+    """Start a background queue worker for this chat if one isn't already running."""
+    existing = _chat_workers.get(chat_id)
+    if existing and not existing.done():
+        return  # Worker already active
+    task = _fire_and_forget(
+        _run_queued_tasks(chat_id, context),
+        name=f"qworker-{chat_id}",
+    )
+    _chat_workers[chat_id] = task
+
+
+async def _run_queued_tasks(chat_id: int, context) -> None:
+    """Background worker: acquires per-chat lock then processes all queued messages individually."""
+    lock = _get_lock(chat_id)
+    try:
+        async with lock:
+            while True:
+                all_pending = _drain_pending(chat_id)
+                if not all_pending:
+                    break
+                # Process first message; re-queue the rest at front
+                msg = all_pending[0]
+                for m in reversed(all_pending[1:]):
+                    _pending_messages.setdefault(chat_id, []).insert(0, m)
+                tid = msg.get("task_id", "?")
+                text = msg["text"]
+                remaining = len(_pending_messages.get(chat_id, []))
+                queue_note = f" (+{remaining}条)" if remaining else ""
+                logger.info(f"Chat {chat_id}: worker processing #{tid}{queue_note}")
+                _running_tasks[chat_id] = {"task_id": tid, "text": text[:100], "start_time": time.time()}
+                await _send_response(chat_id, f"📨 排队任务 #{tid}{queue_note}...", context)
+                try:
+                    success = await _process_with_claude_cli(text, chat_id, context)
+                    if not success:
+                        web_ok = await _fallback_to_web_ai(text, chat_id, context)
+                        if not web_ok:
+                            await _fallback_cached_or_template(text, chat_id, context)
+                except asyncio.TimeoutError:
+                    await _send_response(chat_id, "⏰ 排队任务超时(5min)。发新消息继续。", context)
+                    break
+                except Exception as e:
+                    logger.error(f"Worker queued task error: {e}", exc_info=True)
+                    await _send_response(chat_id, f"⚠️ 排队任务出错: {str(e)[:200]}", context)
+                    break
+                finally:
+                    _running_tasks.pop(chat_id, None)
+    finally:
+        _chat_workers.pop(chat_id, None)
+
+
 # ─── Claude CLI Runner ────────────────────────────────────────────────────────
 
 async def _run_claude_cli(
@@ -765,8 +922,15 @@ async def _run_claude_cli(
     except Exception:
         pass
 
+    # Layer 8: Structured JSON memory — top shortcuts and high-success patterns
+    mem_engine_context = ""
     try:
-        if mem_context or workflow or skills_text or knowledge_text or user_lang or rag_text:
+        mem_engine_context = _memory_engine.get_context_for_prompt(max_chars=400)
+    except Exception:
+        pass
+
+    try:
+        if mem_context or workflow or skills_text or knowledge_text or user_lang or rag_text or mem_engine_context:
             mem_text = _PROMPT_FILE.read_text(encoding="utf-8")
             if user_lang:
                 mem_text += f"\n\n## 用户画像\n{user_lang}\n"
@@ -780,6 +944,8 @@ async def _run_claude_cli(
                 mem_text += f"\n## 领域知识\n{knowledge_text}\n"
             if rag_text:
                 mem_text += f"\n{rag_text}\n"
+            if mem_engine_context:
+                mem_text += f"\n## 学习记忆\n{mem_engine_context}\n"
             _mem_tmp = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".txt", encoding="utf-8", delete=False, dir=BOT_PROJECT_DIR,
             )
@@ -827,9 +993,9 @@ async def _run_claude_cli(
     ]
     if session_id:
         args.extend(["--resume", session_id])
-        # Resumed sessions: use --bare to skip hooks/LSP/auto-memory overhead (~14% faster)
-        args.append("--bare")
-        logger.info(f"Chat {chat_id}: resuming session {session_id[:12]}... (model: {model}, bare)")
+        # NOTE: do NOT use --bare here — --bare disables OAuth/keychain auth, which breaks
+        # subscription-based logins ("Not logged in" error on every --resume).
+        logger.info(f"Chat {chat_id}: resuming session {session_id[:12]}... (model: {model})")
     else:
         logger.info(f"Chat {chat_id}: new session (model: {model})")
 
@@ -840,18 +1006,19 @@ async def _run_claude_cli(
     stderr_data = b""
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=BOT_PROJECT_DIR,  # CRITICAL: set to bot dir so Claude can find pc_control.py, tg_direct.py, etc.
-            env=_clean_env(),
-        )
+        async with _get_cli_semaphore():
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=BOT_PROJECT_DIR,  # CRITICAL: set to bot dir so Claude can find pc_control.py, tg_direct.py, etc.
+                env=_clean_env(),
+            )
 
-        stdout_data, stderr_data = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout,
-        )
+            stdout_data, stderr_data = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout,
+            )
 
     except asyncio.TimeoutError:
         logger.warning(f"Claude CLI timed out after {timeout}s")
@@ -1140,6 +1307,36 @@ def _sanitize_response(response: str) -> str:
     return response
 
 
+def _filter_questions(text: str) -> str:
+    """Strip question-asking sentences from bot responses (Rule #1: NEVER ask questions).
+    If the entire response is a question, replace with a generic acknowledgment."""
+    if not text:
+        return text
+    # Patterns that indicate the bot is asking the user for input
+    question_patterns = [
+        "could you paste", "could you provide", "could you share", "could you clarify",
+        "can you paste", "can you provide", "can you share", "can you clarify",
+        "appears to be cut off", "seems to be cut off", "seems incomplete",
+        "could you send the rest", "paste the rest", "share the rest",
+        "what do you mean", "did you mean", "what would you like",
+        "please provide", "please clarify", "please share", "please paste",
+        "请提供", "请问", "你能否", "是否需要", "能否提供", "请发送",
+        "可以粘贴", "可以提供", "需要更多信息",
+    ]
+    lines = text.split("\n")
+    filtered = []
+    for line in lines:
+        line_lower = line.lower().strip()
+        if any(p in line_lower for p in question_patterns):
+            continue  # Drop this line
+        filtered.append(line)
+    result = "\n".join(filtered).strip()
+    # If we filtered everything away, provide a generic response
+    if not result:
+        result = "收到，正在处理..."
+    return result
+
+
 async def _send_response(chat_id: int, response: str, context):
     """Send response to Telegram, splitting into chunks if needed."""
     if not response or not response.strip():
@@ -1147,6 +1344,9 @@ async def _send_response(chat_id: int, response: str, context):
 
     # Security: sanitize outgoing messages
     response = _sanitize_response(response)
+
+    # Rule #1 enforcement: filter out question-asking sentences
+    response = _filter_questions(response)
 
     MAX_TOTAL = 16000
     if len(response) > MAX_TOTAL:
@@ -1196,7 +1396,8 @@ def _drain_pending(chat_id: int) -> list[dict]:
 _MAX_PENDING_QUEUE_SIZE = 20  # Max queued messages per chat to prevent memory bloat
 
 
-def _queue_message(chat_id: int, text: str):
+def _queue_message(chat_id: int, text: str) -> int:
+    """Queue a message; returns assigned task_id."""
     queue = _pending_messages.setdefault(chat_id, [])
     # Prune stale messages before adding
     now = time.time()
@@ -1204,10 +1405,13 @@ def _queue_message(chat_id: int, text: str):
     if len(queue) >= _MAX_PENDING_QUEUE_SIZE:
         queue.pop(0)
         logger.warning(f"Chat {chat_id}: queue full ({_MAX_PENDING_QUEUE_SIZE}), dropped oldest")
+    tid = _next_task_id()
     queue.append({
         "text": text,
         "time": now,
+        "task_id": tid,
     })
+    return tid
 
 
 # ─── Self-Healing ────────────────────────────────────────────────────────────
@@ -1396,6 +1600,11 @@ _MAX_SELF_HEAL_LOG_SIZE = 1 * 1024 * 1024  # 1 MB max
 def _log_self_heal(error: str, diagnosis: dict, success: bool):
     """Log self-healing attempt to memory. Auto-truncates when file exceeds 1 MB."""
     try:
+        # Track in vital signs (lifecycle state machine)
+        vital_signs.record_self_heal(success=success)
+    except Exception:
+        pass
+    try:
         entry = {
             "timestamp": datetime.now().isoformat(),
             "error": error[:200],
@@ -1468,17 +1677,21 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
                 return True  # We responded — do NOT trigger fallback chain
 
         # Detect raw auth/config errors that slipped through — safety net
-        if response and any(p in response.lower() for p in
-                           ["cli 未登录", "环境变量丢失", "api key", "not logged in", "auth failed",
-                            "anthropic_api_key", "api_key", "密钥", "credential"]):
-            logger.warning(f"Chat {chat_id}: CLI auth/config error detected, sending safe message")
-            _self_monitor.record_service_failure("cli", "auth_error")
-            await _send_response(
-                chat_id,
-                "⚠️ CLI 配置问题，正在自动修复中。请稍后重试。",
-                context,
-            )
-            return True  # We responded — do NOT trigger fallback chain
+        # Require STRONG signal: short response (<300 chars) + auth keyword
+        # Long responses mentioning "api_key" are likely legitimate code discussions
+        if response and len(response.strip()) < 300:
+            _resp_lower = response.lower()
+            _auth_strong = ["cli 未登录", "环境变量丢失", "not logged in", "auth failed",
+                            "login required", "invalid x-api-key"]
+            if any(p in _resp_lower for p in _auth_strong):
+                logger.warning(f"Chat {chat_id}: CLI auth/config error detected, sending safe message")
+                _self_monitor.record_service_failure("cli", "auth_error")
+                await _send_response(
+                    chat_id,
+                    "⚠️ CLI 配置问题，正在自动修复中。请稍后重试。",
+                    context,
+                )
+                return True  # We responded — do NOT trigger fallback chain
 
         if new_session_id:
             _set_session(chat_id, new_session_id)
@@ -1518,10 +1731,25 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
             )
             logger.info(f"Chat {chat_id}: score={score['overall']:.2f} flags={score['flags']}")
 
+            # ── Vital Signs: record task for lifecycle tracking ──
+            try:
+                vital_signs.record_task(
+                    success=score.get("overall", 0) >= 0.4,
+                    duration_ms=_duration,
+                )
+            except Exception:
+                pass
+
             # ── Skill Library: extract new skills + update reused ones ──
             _fire_and_forget(
                 _skill_post_process(user_message, response, score, matched_skill_ids),
                 name="skill_post_process",
+            )
+
+            # ── Self-Learning Loop: auto-compile check after code changes ──
+            _fire_and_forget(
+                _auto_compile_check(response, tool_output_text, chat_id, context),
+                name="auto_compile_check",
             )
 
             # ── Auto-evolution check: should we train? ──
@@ -1535,32 +1763,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         except Exception as e:
             logger.debug(f"Harness scoring error: {e}")
 
-        # Process queued follow-up messages
-        pending = _drain_pending(chat_id)
-        while pending:
-            combined = "\n---\n".join(m["text"] for m in pending)
-            count = len(pending)
-            logger.info(f"Chat {chat_id}: processing {count} queued follow-up messages")
-
-            await _send_response(chat_id, f"📨 处理你追加的 {count} 条消息...", context)
-
-            try:
-                followup_resp, followup_sid, _, fu_tool_output = await _run_claude_cli(combined, chat_id, context)
-                if followup_sid:
-                    _set_session(chat_id, followup_sid)
-                    _save_sessions()
-                await _send_response(chat_id, followup_resp, context)
-                await _send_extracted_media(chat_id, context, followup_resp + "\n" + fu_tool_output)
-            except asyncio.TimeoutError:
-                await _send_response(chat_id, "⏰ 追加任务超时(5分钟)。发新消息继续。", context)
-                break
-            except Exception as e:
-                logger.error(f"Follow-up error: {e}", exc_info=True)
-                await _send_response(chat_id, f"⚠️ 追加消息处理出错: {str(e)[:300]}", context)
-                break
-
-            pending = _drain_pending(chat_id)
-
+        # Queued messages are handled by _run_queued_tasks worker (launched on queue)
         return True
 
     except asyncio.TimeoutError:
@@ -1647,6 +1850,238 @@ async def _fallback_cached_or_template(user_message: str, chat_id: int, context)
     return True  # We responded — bot stays alive
 
 
+# ─── Multi-Intent NLP Layer ─────────────────────────────────────────────────────
+
+# Per-chat conversation context: tracks tokens, projects, last analyzed entity
+_chat_contexts: dict[int, dict] = {}
+_CONTEXT_TTL = 3600 * 2  # 2 hours idle → reset context
+
+
+def _get_chat_context(chat_id: int) -> dict:
+    """Get or create conversation context for a chat."""
+    now = time.time()
+    ctx = _chat_contexts.get(chat_id)
+    if ctx is None or now - ctx.get("last_updated", 0) > _CONTEXT_TTL:
+        ctx = {
+            "tokens": [],           # [{address, symbol, ts}]
+            "projects": [],         # [{name, ts}]
+            "last_analyzed": None,  # Last analyzed entity (type, address/symbol)
+            "last_updated": now,
+        }
+        _chat_contexts[chat_id] = ctx
+    return ctx
+
+
+def _update_chat_context(chat_id: int, message: str, response: str = ""):
+    """Extract tokens/projects from message and response, update context."""
+    ctx = _get_chat_context(chat_id)
+    now = time.time()
+    ctx["last_updated"] = now
+
+    # Extract Solana token addresses (base58, 32–44 chars)
+    token_addresses = re.findall(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b', message)
+    for addr in token_addresses:
+        if not any(t["address"] == addr for t in ctx["tokens"]):
+            ctx["tokens"].insert(0, {"address": addr, "symbol": None, "ts": now})
+        ctx["last_analyzed"] = {"type": "token", "address": addr, "symbol": None}
+
+    # Extract token symbols like $BTC, #ETH, or "分析 SOL"
+    sym_matches = re.findall(
+        r'[$#]([A-Z]{2,10})\b|(?:分析|看|查|买|卖)\s+([A-Z]{2,10})\b',
+        message.upper()
+    )
+    for groups in sym_matches:
+        sym = next((s for s in groups if s), None)
+        if sym and sym not in ('THE', 'AND', 'FOR', 'WITH', 'ARE', 'WAS'):
+            if not any(t.get("symbol") == sym for t in ctx["tokens"]):
+                ctx["tokens"].insert(0, {"address": None, "symbol": sym, "ts": now})
+            if not token_addresses:
+                ctx["last_analyzed"] = {"type": "token", "address": None, "symbol": sym}
+
+    ctx["tokens"] = ctx["tokens"][:10]
+
+    # Extract known project keywords
+    proj_patterns = [
+        ("crypto", r'crypto[\-\s]?analysis|crypto'),
+        ("tg-bot", r'tg.?bot|bot项目'),
+        ("pet-cad", r'pet.?cad'),
+        ("六福", r'六福'),
+    ]
+    for proj_name, pat in proj_patterns:
+        if re.search(pat, message, re.IGNORECASE):
+            if not any(p["name"] == proj_name for p in ctx["projects"]):
+                ctx["projects"].insert(0, {"name": proj_name, "ts": now})
+    ctx["projects"] = ctx["projects"][:5]
+
+
+# ── Intent Detection ────────────────────────────────────────────────────────────
+
+_INTENT_SEP_RE = re.compile(
+    r'\n\d+[.。、]\s*'                           # numbered list  1. xxx\n2. xxx
+    r'|\n[•·－]\s*'                              # bullet lists
+    r'|\b(?:然后(?:再)?|另外|同时|还(?:要|需要)|顺便|并且|以及'
+    r'|and also|also please|plus|additionally|furthermore)\b',
+    re.IGNORECASE,
+)
+_INTENT_ACTION_RE = re.compile(
+    r'(?:分析|查|看|买|卖|转|发|截图|打开|搜索|计算|写|修复|测试|部署'
+    r'|回测|扫描|检查|analyze|check|buy|sell|open|search|write|fix|test|scan)',
+    re.IGNORECASE,
+)
+
+
+def _detect_intents(message: str) -> list[str]:
+    """Split a message into multiple intent strings when separators are detected."""
+    if len(message) < 15:
+        return [message]
+
+    # Numbered list (most reliable signal)
+    numbered = re.split(r'\n\d+[.。、]\s*', message.strip())
+    if len(numbered) > 1:
+        intents = [s.strip() for s in numbered if s.strip() and len(s.strip()) > 3]
+        if len(intents) >= 2:
+            return intents
+
+    # Separator words between action clauses
+    parts = _INTENT_SEP_RE.split(message)
+    parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 5]
+    if len(parts) >= 2:
+        action_parts = [p for p in parts if _INTENT_ACTION_RE.search(p)]
+        if len(action_parts) >= 2:
+            return action_parts
+
+    return [message]
+
+
+# ── Fuzzy Reference Resolution ──────────────────────────────────────────────────
+
+_VAGUE_RE = re.compile(
+    r'^(?:'
+    r'(?:再|继续|还有|帮我看看|看看|分析一下|查一下)\s*(?:那个|这个|它)?(?:代币|token|合约|币)?\s*$'
+    r'|(?:那个|这个|它)\s*(?:呢|怎么样|如何|的情况|分析)?\s*$'
+    r'|(?:what about|how about|that one|the same)\s*(?:token|coin|contract)?\s*$'
+    r')',
+    re.IGNORECASE,
+)
+_FUZZY_PRONOUN_RE = re.compile(
+    r'(?:那个|这个|刚才(?:说的)?|前面(?:说的)?|它|上次|the same|that|this one)',
+    re.IGNORECASE,
+)
+
+
+def _resolve_fuzzy_message(message: str, chat_id: int) -> tuple[str, bool]:
+    """
+    Resolve vague references using context.
+    Returns (resolved_message, was_resolved).
+    """
+    ctx = _get_chat_context(chat_id)
+    last = ctx.get("last_analyzed")
+    if not last:
+        return message, False
+
+    # Full vague message → replace entirely
+    if _VAGUE_RE.match(message.strip()):
+        ref = last.get("address") or last.get("symbol") or "该代币"
+        resolved = f"分析代币 {ref}"
+        logger.info(f"Chat {chat_id}: fuzzy resolved '{message}' → '{resolved}'")
+        return resolved, True
+
+    # Pronoun substitution within longer message
+    if _FUZZY_PRONOUN_RE.search(message):
+        ref = last.get("address") or last.get("symbol") or ""
+        if ref:
+            resolved = _FUZZY_PRONOUN_RE.sub(ref, message, count=1)
+            if resolved != message:
+                logger.info(f"Chat {chat_id}: pronoun resolved '{message}' → '{resolved}'")
+                return resolved, True
+
+    return message, False
+
+
+# ── Disambiguation ──────────────────────────────────────────────────────────────
+
+_TRULY_AMBIGUOUS_RE = re.compile(
+    r'^(?:看看|分析|查|check|analyze|看)\s*$',
+    re.IGNORECASE,
+)
+
+
+def _check_disambiguation(message: str, chat_id: int) -> list[str] | None:
+    """
+    Return 2–3 possible interpretations if the message is truly ambiguous.
+    Returns None if the message is clear enough to process directly.
+    Only triggers for very short, action-only messages with multiple plausible targets.
+    """
+    ctx = _get_chat_context(chat_id)
+    stripped = message.strip()
+
+    if not _TRULY_AMBIGUOUS_RE.match(stripped):
+        return None
+
+    options = []
+    if ctx.get("tokens"):
+        tok = ctx["tokens"][0]
+        ref = tok.get("symbol") or (tok.get("address", "")[:8] + "...") if tok else None
+        if ref:
+            options.append(f"分析代币 {ref}")
+
+    if ctx.get("projects"):
+        proj = ctx["projects"][0]["name"]
+        options.append(f"查看{proj}项目状态")
+
+    options.append("截图看当前屏幕")
+
+    if len(options) >= 2:
+        return options[:3]
+    return None
+
+
+# ── Proactive Suggestions ───────────────────────────────────────────────────────
+
+_proactive_cooldown: dict[int, float] = {}
+_PROACTIVE_COOLDOWN_SECS = 300  # 5 min between suggestions per chat
+
+
+def _get_proactive_suggestion(message: str, response: str, chat_id: int) -> str | None:
+    """Generate a follow-up suggestion after certain analyses. Rate-limited."""
+    now = time.time()
+    if now - _proactive_cooldown.get(chat_id, 0) < _PROACTIVE_COOLDOWN_SECS:
+        return None
+    if not response or len(response) < 80:
+        return None
+
+    msg_lower = message.lower()
+    resp_lower = response.lower()
+
+    # After token/on-chain analysis
+    token_kws = ['代币', 'token', '合约', 'solana', '链上', 'onchain', '分析']
+    if any(kw in msg_lower for kw in token_kws):
+        ctx = _get_chat_context(chat_id)
+        last = ctx.get("last_analyzed")
+        ref = ""
+        if last:
+            ref = last.get("symbol") or (last.get("address", "")[:8] + "...") if last else ""
+        suggestions = []
+        if ref:
+            suggestions.append(f"回测 {ref} 的MA策略 (`/ma-ribbon-backtest`)")
+            suggestions.append(f"追踪 {ref} 聪明钱 (`/token-analyze`)")
+        suggestions.append("扫全市场 (`/okx-top30`)")
+        _proactive_cooldown[chat_id] = now
+        return "💡 **建议下一步：**\n" + "\n".join(f"• {s}" for s in suggestions[:3])
+
+    # After backtest
+    backtest_kws = ['回测', 'backtest', '胜率', 'win rate', '策略']
+    if any(kw in msg_lower for kw in backtest_kws) and any(
+        kw in resp_lower for kw in ['胜率', '收益', '结果', 'result', 'win']
+    ):
+        _proactive_cooldown[chat_id] = now
+        return "💡 **建议：** 调整参数继续优化，或用 `/okx-top30` 找更好的标的"
+
+    return None
+
+
+# ─── Main Processing Logic ────────────────────────────────────────────────────
+
 async def process_message(user_message: str, chat_id: int, context, **kwargs) -> bool:
     """Process a user message — Never-Die fallback chain.
 
@@ -1657,87 +2092,269 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs) ->
     """
     auto_research.mark_user_active()  # Reset idle timer for auto-experiment
     _periodic_state_cleanup()  # Prune stale sessions/locks (rate-limited to once/hour)
+
+    # ── NLP Pre-processing ────────────────────────────────────────────────────
+    # 1. Update context with tokens/projects mentioned in this message
+    _update_chat_context(chat_id, user_message)
+
+    # 2. Disambiguation: only when message is truly a bare action word with no target
+    disambig_options = _check_disambiguation(user_message, chat_id)
+    if disambig_options:
+        prompt_lines = "\n".join(f"  {i+1}. {opt}" for i, opt in enumerate(disambig_options))
+        await _send_response(
+            chat_id,
+            f"🤔 **你是想：**\n{prompt_lines}\n\n直接回复数字或发完整指令",
+            context,
+        )
+        return True
+
+    # 3. Resolve fuzzy references ("那个代币" → actual address/symbol from context)
+    resolved_message, was_resolved = _resolve_fuzzy_message(user_message, chat_id)
+    if was_resolved:
+        await _send_response(chat_id, f"🔍 理解为：{resolved_message}", context)
+        user_message = resolved_message
+
+    # 4. Multi-intent detection: split into separate tasks if separators found
+    intents = _detect_intents(user_message)
+    is_multi_intent = len(intents) > 1
+
+    if is_multi_intent:
+        logger.info(f"Chat {chat_id}: detected {len(intents)} intents")
+        await _send_response(
+            chat_id,
+            f"📋 检测到 {len(intents)} 个任务，依次执行...",
+            context,
+        )
+    # ── End NLP Pre-processing ─────────────────────────────────────────────────
+
     lock = _get_lock(chat_id)
 
     if lock.locked():
-        _queue_message(chat_id, user_message)
+        tid = _queue_message(chat_id, user_message)
         queue_size = len(_pending_messages.get(chat_id, []))
-        logger.info(f"Chat {chat_id}: queued message ({queue_size} pending)")
+        logger.info(f"Chat {chat_id}: queued message (#{tid}, {queue_size} pending)")
+        _ensure_queue_worker(chat_id, context)  # Background worker will process when lock is free
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"Queued (#{queue_size}). Will process after current task.",
+                text=f"⏳ 已排队 (任务#{tid}, 队列#{queue_size})。当前任务完成后处理。\n/tasks 查看 · /cancel 取消",
             )
         except Exception:
             pass
         return False  # Message was queued, NOT processed
 
-    async with lock:
-        # Route: named session for specific projects (e.g. "crypto" → crypto session)
-        session_name = _try_session_route(user_message, chat_id)
-        if session_name:
-            try:
-                logger.info(f"Chat {chat_id}: routing to session '{session_name}'")
-                result = await _session_mgr.send(session_name, user_message, timeout=300)
-                await _send_response(chat_id, result, context)
+    # Register this task as running
+    running_tid = _next_task_id()
+    _running_tasks[chat_id] = {
+        "task_id": running_tid,
+        "text": user_message[:100],
+        "start_time": time.time(),
+    }
+    try:
+        async with lock:
+            # ── Multi-intent: process each intent sequentially ──
+            if is_multi_intent:
+                all_success = True
+                last_response_for_suggestion = ""
+                for idx, intent in enumerate(intents):
+                    if idx > 0:
+                        await _send_response(chat_id, f"▶ 任务 {idx+1}/{len(intents)}：{intent[:60]}...", context)
+                    _update_chat_context(chat_id, intent)
+                    success = await _process_with_claude_cli(intent, chat_id, context)
+                    if not success:
+                        all_success = False
+                        await _send_response(chat_id, f"⚠️ 任务{idx+1}失败，继续下一个", context)
+                # Proactive suggestion after last intent
+                suggestion = _get_proactive_suggestion(user_message, "", chat_id)
+                if suggestion:
+                    await _send_response(chat_id, suggestion, context)
+                return all_success
+
+            # ── Single intent: normal routing ──
+            # Route: named session for specific projects (e.g. "crypto" → crypto session)
+            session_name = _try_session_route(user_message, chat_id)
+            if session_name:
+                try:
+                    logger.info(f"Chat {chat_id}: routing to session '{session_name}'")
+                    result = await _session_mgr.send(session_name, user_message, timeout=300)
+                    await _send_response(chat_id, result, context)
+                    _update_chat_context(chat_id, user_message, result)
+                    return True
+                except Exception as e:
+                    logger.warning(f"Chat {chat_id}: session '{session_name}' failed ({e}), falling back")
+
+            # Route: complex multi-step tasks → pipeline, simple → direct CLI
+            if _should_use_pipeline(user_message, chat_id):
+                try:
+                    logger.info(f"Chat {chat_id}: routing to multi-agent pipeline")
+                    await _process_with_pipeline(user_message, chat_id, context)
+                    return True
+                except Exception as e:
+                    logger.warning(f"Chat {chat_id}: pipeline failed ({e}), falling back to CLI")
+
+            # Primary path: Claude CLI with session persistence
+            success = await _process_with_claude_cli(user_message, chat_id, context)
+            if success:
+                # Proactive suggestion after successful single-intent response
+                # (We don't have the response text here, but we can use context)
+                suggestion = _get_proactive_suggestion(user_message, "", chat_id)
+                if suggestion:
+                    _fire_and_forget(
+                        _send_response(chat_id, suggestion, context),
+                        name="proactive_suggestion",
+                    )
                 return True
-            except Exception as e:
-                logger.warning(f"Chat {chat_id}: session '{session_name}' failed ({e}), falling back")
 
-        # Route: complex multi-step tasks → pipeline, simple → direct CLI
-        if _should_use_pipeline(user_message, chat_id):
-            try:
-                logger.info(f"Chat {chat_id}: routing to multi-agent pipeline")
-                await _process_with_pipeline(user_message, chat_id, context)
+            # ── Never-Die Fallback Chain ──
+            never_die = getattr(config, "NEVER_DIE_MODE", True)
+            if not never_die:
+                await _send_response(chat_id, "CLI failed. Please retry.", context)
+                return True  # We responded, even if with error
+
+            logger.warning(f"Chat {chat_id}: CLI failed, entering never-die fallback chain")
+
+            # Step 2: API providers (DISABLED — user opted out, too expensive)
+            # _fallback_to_api_providers always returns False now
+
+            # Step 3: Try free web AI (ChatGPT/Claude.ai/Gemini web)
+            web_ok = await _fallback_to_web_ai(user_message, chat_id, context)
+            if web_ok:
                 return True
-            except Exception as e:
-                logger.warning(f"Chat {chat_id}: pipeline failed ({e}), falling back to CLI")
 
-        # Primary path: Claude CLI with session persistence
-        success = await _process_with_claude_cli(user_message, chat_id, context)
-        if success:
+            # Step 4: Cached commands or template (NEVER silence)
+            await _fallback_cached_or_template(user_message, chat_id, context)
             return True
-
-        # ── Never-Die Fallback Chain ──
-        never_die = getattr(config, "NEVER_DIE_MODE", True)
-        if not never_die:
-            await _send_response(chat_id, "CLI failed. Please retry.", context)
-            return True  # We responded, even if with error
-
-        logger.warning(f"Chat {chat_id}: CLI failed, entering never-die fallback chain")
-
-        # Step 2: API providers (DISABLED — user opted out, too expensive)
-        # _fallback_to_api_providers always returns False now
-
-        # Step 3: Try free web AI (ChatGPT/Claude.ai/Gemini web)
-        web_ok = await _fallback_to_web_ai(user_message, chat_id, context)
-        if web_ok:
-            return True
-
-        # Step 4: Cached commands or template (NEVER silence)
-        await _fallback_cached_or_template(user_message, chat_id, context)
-        return True
+    finally:
+        _running_tasks.pop(chat_id, None)
 
 
 async def _skill_post_process(user_message: str, response: str, score: dict, matched_ids: list):
-    """Background: extract new skills and update reused skills."""
+    """Background: 4-layer skill lifecycle — observe, evaluate, decide, package."""
     try:
-        # Update reused skills
+        # ── Layer 1-3: Run lifecycle (Observe → Evaluate → Decide) ──
+        lifecycle_result = None
+        try:
+            from skill_lifecycle import run_lifecycle
+            matched_skills = []
+            for sid in matched_ids:
+                s = skill_library._load_skill(sid)
+                if s:
+                    matched_skills.append(s)
+            lifecycle_result = run_lifecycle(user_message, response, score, matched_skills)
+            logger.debug(
+                "SkillLifecycle: task=%s policy=%s action=%s",
+                lifecycle_result["task"]["type"],
+                lifecycle_result["policy"]["decision"],
+                lifecycle_result["action"],
+            )
+        except Exception as e:
+            logger.debug(f"Skill lifecycle unavailable: {e}")
+
+        # ── Layer 4: Update reused skills ──
         for sid in matched_ids:
             skill_library.update_skill_from_reuse(sid, score)
-            # Maybe evolve the skill if used multiple times
             await skill_library.maybe_evolve_skill(sid, user_message, response)
 
-        # Try to extract a new skill from this interaction
+        # ── Extract new skill (gated by lifecycle evaluation) ──
         new_id = await skill_library.maybe_extract_skill(user_message, response, score)
         if new_id:
             logger.info(f"New skill learned: {new_id}")
+            try:
+                from skill_lifecycle import record_promotion
+                task_type = lifecycle_result["task"]["type"] if lifecycle_result else "unknown"
+                eval_score = (lifecycle_result["evaluation"]["total_score"]
+                              if lifecycle_result and lifecycle_result.get("evaluation") else 0.0)
+                record_promotion(new_id, task_type, eval_score)
+            except Exception:
+                pass
+            try:
+                vital_signs.record_skill_created()
+            except Exception:
+                pass
 
-        # Periodic pruning
-        if score.get("overall", 0) > 0:  # Only if scoring worked
+        # ── Periodic pruning ──
+        if score.get("overall", 0) > 0:
             skill_library.prune_skills()
     except Exception as e:
         logger.debug(f"Skill post-process error: {e}")
+
+
+async def _auto_compile_check(response: str, tool_output_text: str, chat_id: int, context):
+    """Self-learning loop: after code changes, auto-scan for syntax errors.
+    If bugs found → auto-fix via CLI → extract fix as a skill (compound interest)."""
+    try:
+        combined = (response or "") + "\n" + (tool_output_text or "")
+        combined_lower = combined.lower()
+        # Only trigger if response indicates code was modified
+        code_signals = ["write(", "edit(", "wrote to", "edited", "created file",
+                        "修改了", "写入了", "已保存", ".py", "py_compile"]
+        if not any(sig in combined_lower for sig in code_signals):
+            return
+        # Quick py_compile scan of all bot .py files
+        import py_compile
+        errors = []
+        for fname in os.listdir(BOT_PROJECT_DIR):
+            if not fname.endswith(".py"):
+                continue
+            fpath = os.path.join(BOT_PROJECT_DIR, fname)
+            try:
+                py_compile.compile(fpath, doraise=True)
+            except py_compile.PyCompileError as e:
+                errors.append({"file": fname, "error": str(e)})
+        if not errors:
+            logger.debug("Auto-compile check: all .py files clean ✅")
+            return
+        # Found syntax errors! Log and attempt auto-fix
+        err_summary = "\n".join(f"  {e['file']}: {e['error'][:120]}" for e in errors[:5])
+        logger.warning(f"Auto-compile found {len(errors)} syntax error(s):\n{err_summary}")
+        # Try to auto-fix via CLI (send fix request to fresh session)
+        fix_prompt = (
+            f"以下.py文件有语法错误，请用Edit工具修复（不要问问题，直接修复）：\n{err_summary}\n"
+            f"工作目录: {BOT_PROJECT_DIR}"
+        )
+        try:
+            fix_resp, fix_sid, _, _ = await asyncio.wait_for(
+                _run_claude_cli(fix_prompt, chat_id, context, timeout=120),
+                timeout=130,
+            )
+            # Verify fix worked
+            still_broken = []
+            for e in errors:
+                fpath = os.path.join(BOT_PROJECT_DIR, e["file"])
+                try:
+                    py_compile.compile(fpath, doraise=True)
+                except py_compile.PyCompileError:
+                    still_broken.append(e["file"])
+            if not still_broken:
+                logger.info(f"✅ Auto-fix successful! Fixed {len(errors)} syntax error(s)")
+                # Extract fix as a skill (compound interest: learn from self-repair)
+                fix_score = {"overall": 0.9, "flags": ["auto_self_fix"]}
+                new_skill = await skill_library.maybe_extract_skill(
+                    f"auto-fix syntax errors: {err_summary[:200]}",
+                    fix_resp or "auto-fixed",
+                    fix_score,
+                )
+                if new_skill:
+                    logger.info(f"🧬 Learned self-fix skill: {new_skill}")
+                # Record successful self-heal
+                harness_learn.record_self_heal(
+                    err_summary[:200], "syntax errors detected by auto-compile",
+                    "auto-fixed via CLI", success=True,
+                )
+            else:
+                logger.warning(f"Auto-fix partial: {still_broken} still broken")
+                harness_learn.record_self_heal(
+                    err_summary[:200], "syntax errors detected by auto-compile",
+                    f"partial fix, still broken: {still_broken}", success=False,
+                )
+        except Exception as fix_err:
+            logger.warning(f"Auto-fix attempt failed: {fix_err}")
+            harness_learn.record_self_heal(
+                err_summary[:200], "syntax errors detected by auto-compile",
+                f"fix failed: {fix_err}", success=False,
+            )
+    except Exception as e:
+        logger.debug(f"Auto-compile check error: {e}")
 
 
 async def _auto_evolve(chat_id: int, context, decision: dict):

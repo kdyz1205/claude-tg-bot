@@ -1,0 +1,51 @@
+{
+  "id": "sk_seed_self_repair",
+  "title": "自我修复重启",
+  "summary": "崩溃自动重启 + 错误日志 + 热重载",
+  "task_type": "code_create",
+  "function_signature": "run_with_auto_restart(main_fn, restart_delay=3)",
+  "input_schema": "主函数引用",
+  "output_schema": "持续运行，崩溃后自动重启",
+  "trigger_pattern": "自动重启 崩溃恢复 热重载 watchdog self-repair",
+  "keywords": [
+    "重启",
+    "崩溃",
+    "热重载",
+    "watchdog",
+    "自修复",
+    "error_log",
+    "selfcheck"
+  ],
+  "generic_steps": [
+    "try/except包裹主循环",
+    "except时sleep(3)重启",
+    "写_error_log.txt",
+    "watchdog监控py文件变化"
+  ],
+  "specific_steps": [
+    "/selfcheck命令检查文件语法",
+    "importlib.reload热重载"
+  ],
+  "template_code": "while True:\n    try:\n        asyncio.run(main())\n    except Exception as e:\n        log_error(e)\n        time.sleep(3)  # auto-restart",
+  "key_decisions": [
+    "3秒延迟避免崩溃循环",
+    "热重载避免重启Telegram session"
+  ],
+  "files_created": [
+    "_error_log.txt"
+  ],
+  "use_count": 0,
+  "last_used": null,
+  "avg_score_when_used": null,
+  "version": 1,
+  "history": [
+    {
+      "version": 1,
+      "date": "2026-03-29",
+      "change": "seeded from evolution task 3"
+    }
+  ],
+  "created_at": "2026-03-29T07:59:56.689446",
+  "updated_at": "2026-03-29T07:59:56.689446",
+  "code_snippet": "while True:\n    try:\n        asyncio.run(main())\n    except Exception as e:\n        log_error(e)\n        time.sleep(3)  # auto-restart"
+}

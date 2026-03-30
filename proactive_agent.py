@@ -65,7 +65,12 @@ class ProactiveAgent:
 
         # Shared error buffer -- external code can push errors here
         self._error_buffer: list[dict] = []
-        self._error_buffer_lock = asyncio.Lock()
+        self._error_buffer_lock: asyncio.Lock | None = None
+
+    def _get_error_lock(self) -> asyncio.Lock:
+        if self._error_buffer_lock is None:
+            self._error_buffer_lock = asyncio.Lock()
+        return self._error_buffer_lock
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -128,7 +133,7 @@ class ProactiveAgent:
 
     async def push_error(self, error_type: str, message: str, source: str = "") -> None:
         """Push an error into the buffer for the hourly digest."""
-        async with self._error_buffer_lock:
+        async with self._get_error_lock():
             self._error_buffer.append({
                 "ts": datetime.now().isoformat(),
                 "type": error_type,
@@ -272,7 +277,7 @@ class ProactiveAgent:
                     mem_history.pop(0)
                 if len(mem_history) >= 12:
                     # Compare first quarter vs last quarter
-                    q = len(mem_history) // 4
+                    q = max(1, len(mem_history) // 4)
                     first_avg = sum(mem_history[:q]) / q
                     last_avg = sum(mem_history[-q:]) / q
                     climb = last_avg - first_avg
@@ -305,7 +310,7 @@ class ProactiveAgent:
                     break
 
                 # Drain the error buffer
-                async with self._error_buffer_lock:
+                async with self._get_error_lock():
                     errors = list(self._error_buffer)
                     self._error_buffer.clear()
 
@@ -499,7 +504,10 @@ class ProactiveAgent:
             return None
 
         counter = Counter(recent_failures)
-        top_error, count = counter.most_common(1)[0]
+        most_common = counter.most_common(1)
+        if not most_common:
+            return None
+        top_error, count = most_common[0]
         if count < 2:
             return None  # Only fix recurring issues
 
