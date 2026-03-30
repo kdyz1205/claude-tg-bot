@@ -223,8 +223,11 @@ class AdaptiveController:
                 (os.path.join(self._screenshot_dir, f)
                  for f in os.listdir(self._screenshot_dir)
                  if f.endswith(".png")),
-                key=lambda p: os.path.getmtime(p),
+                key=lambda p: os.path.getmtime(p),  # TOCTOU: file may vanish between listdir and getmtime
             )
+        except OSError:
+            return
+        try:
             while len(files) > self._MAX_SCREENSHOTS:
                 oldest = files.pop(0)
                 try:

@@ -176,6 +176,9 @@ async def _fetch_coingecko_trending(client: httpx.AsyncClient) -> list[dict]:
             "https://api.coingecko.com/api/v3/search/trending",
             timeout=12.0,
         )
+        if resp.status_code != 200:
+            logger.debug("alpha_engine: CoinGecko HTTP %s", resp.status_code)
+            return []
         coins = resp.json().get("coins", [])
         results = []
         for rank, item in enumerate(coins[:10]):
@@ -216,6 +219,9 @@ async def _fetch_dexscreener_trending(client: httpx.AsyncClient) -> list[dict]:
             "https://api.dexscreener.com/token-boosts/top/v1",
             timeout=12.0,
         )
+        if resp.status_code != 200:
+            logger.debug("alpha_engine: DEXScreener HTTP %s", resp.status_code)
+            return []
         data = resp.json()
         items = data if isinstance(data, list) else []
     except Exception as e:
@@ -300,6 +306,9 @@ async def _fetch_pumpfun_trending(client: httpx.AsyncClient) -> list[dict]:
             timeout=12.0,
             headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
         )
+        if resp.status_code != 200:
+            logger.debug("alpha_engine: Pump.fun HTTP %s", resp.status_code)
+            return []
         data = resp.json()
         items = data if isinstance(data, list) else []
     except Exception as e:
@@ -534,7 +543,7 @@ def format_onchain_filter_report(tokens: list[dict]) -> str:
         price_str = f"${price:.6f}" if price < 0.01 else f"${price:.4f}" if price < 1 else f"${price:.2f}"
         mcap = t.get("market_cap_usd", 0)
         mcap_str = f"${mcap/1e6:.1f}M" if mcap >= 1e6 else f"${mcap/1e3:.0f}K"
-        liq_str = f"${t['liquidity_usd']/1e3:.0f}K"
+        liq_str = f"${t.get('liquidity_usd', 0)/1e3:.0f}K"
         vol_5m = t.get("vol_5m", 0)
         vol_3m = t.get("vol_3m_approx", 0)
 
@@ -543,7 +552,7 @@ def format_onchain_filter_report(tokens: list[dict]) -> str:
         age_str = f"{age:.0f}h" if age and age < 100 else f"{age/24:.0f}d" if age else "?"
 
         lines.append(
-            f"{i}. {t['name']} (${t['symbol']}) [{t['chain']}]\n"
+            f"{i}. {t.get('name', '?')} (${t.get('symbol', '?')}) [{t.get('chain', '?')}]\n"
             f"   {price_str} | MCap: {mcap_str} | Liq: {liq_str}\n"
             f"   5m量: ${vol_5m:,.0f} | ~3m量: ${vol_3m:,.0f}\n"
             f"   5m交易: {buy_sell_5m} | 5m涨跌: {t.get('change_5m',0):+.1f}%\n"
@@ -591,7 +600,7 @@ async def scan_alpha(cfg: dict = None) -> list[dict]:
     seen: set[str] = set()
     unique: list[dict] = []
     for t in all_tokens:
-        key = f"{t['source']}:{t.get('chain','?')}:{t['symbol'].upper()}"
+        key = f"{t.get('source', '?')}:{t.get('chain', '?')}:{t.get('symbol', '?').upper()}"
         if key not in seen:
             seen.add(key)
             unique.append(t)
@@ -601,23 +610,23 @@ async def scan_alpha(cfg: dict = None) -> list[dict]:
     max_pump = cfg.get("max_price_change_24h", 500)
     scored: list[dict] = []
     for t in unique:
-        if t["liquidity_usd"] < min_liq:
+        if t.get("liquidity_usd", 0) < min_liq:
             continue
         # Market cap filter (if available)
         mcap = t.get("market_cap_usd", t.get("mcap", 0))
         if mcap and mcap < min_mcap:
             continue
         # Pump & dump filter
-        if t["price_change_24h"] > max_pump:
+        if t.get("price_change_24h", 0) > max_pump:
             continue
         # Negative momentum filter (crashing coins)
-        if t["price_change_24h"] < -50:
+        if t.get("price_change_24h", 0) < -50:
             continue
 
-        s_liq  = _score_liquidity(t["liquidity_usd"])
-        s_hold = _score_holder_dispersion(t["holder_count"])
-        s_mom  = _score_price_momentum(t["price_change_24h"])
-        s_heat = _score_community_heat(t["community_heat_raw"])
+        s_liq  = _score_liquidity(t.get("liquidity_usd", 0))
+        s_hold = _score_holder_dispersion(t.get("holder_count", 0))
+        s_mom  = _score_price_momentum(t.get("price_change_24h", 0))
+        s_heat = _score_community_heat(t.get("community_heat_raw", 0))
         total  = _composite(s_liq, s_hold, s_mom, s_heat, weights)
 
         if total >= threshold:
@@ -681,7 +690,7 @@ async def check_short_term_performance() -> dict:
     updated = 0
     results = {"checked": 0, "wins_1h": 0, "losses_1h": 0, "wins_24h": 0, "losses_24h": 0}
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         for r in records:
             if r.get("resolved"):
                 continue
@@ -808,7 +817,7 @@ async def resolve_old_records(cfg: dict = None) -> dict:
     }
     newly_resolved = 0
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         for r in pending:
             address = r.get("address", "")
             outcome = "unknown"

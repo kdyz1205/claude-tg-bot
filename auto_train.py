@@ -570,7 +570,7 @@ Bot回复: {f['response'][:300]}
 
         original_headers = re.findall(r"^## .+", current_prompt, re.MULTILINE)
         matched = sum(1 for h in original_headers if h in new_prompt)
-        if matched < 3:
+        if matched < min(3, len(original_headers)):
             return {"applied": False, "reason": f"丢失了太多章节标题（保留{matched}/{len(original_headers)}）"}
 
         # Save backup
@@ -696,9 +696,21 @@ def _log_training_entry(domain_id, round_num, test, response, score, duration, i
             if os.path.exists(TRAIN_LOG_FILE) and os.path.getsize(TRAIN_LOG_FILE) > _MAX_TRAIN_LOG_SIZE:
                 with open(TRAIN_LOG_FILE, "r", encoding="utf-8") as f:
                     lines = f.readlines()
-                # Keep last half of lines
-                with open(TRAIN_LOG_FILE, "w", encoding="utf-8") as f:
-                    f.writelines(lines[len(lines) // 2:])
+                # Keep last half of lines — atomic tmp+fsync+replace
+                import tempfile as _tf
+                _dir = os.path.dirname(os.path.abspath(TRAIN_LOG_FILE))
+                fd, tmp_path = _tf.mkstemp(dir=_dir, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as tmp_f:
+                        tmp_f.writelines(lines[len(lines) // 2:])
+                        tmp_f.flush()
+                        os.fsync(tmp_f.fileno())
+                    os.replace(tmp_path, TRAIN_LOG_FILE)
+                except Exception:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
         except Exception:
             pass
         with open(TRAIN_LOG_FILE, "a", encoding="utf-8") as f:

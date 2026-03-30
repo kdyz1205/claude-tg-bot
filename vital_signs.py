@@ -245,11 +245,11 @@ def record_task(success: bool, duration_ms: float = 0):
 
         _state["last_heartbeat"] = now
 
-    # Debounced evaluate + save (check inside lock scope to avoid race)
+    # Debounced evaluate + save (hold lock across check+call to avoid race)
     with _lock:
         _should_eval = _state.get("total_tasks", 0) % 5 == 0
-    if _should_eval:
-        evaluate_state()
+        if _should_eval:
+            evaluate_state()
 
 
 def record_skill_created():
@@ -274,6 +274,7 @@ def record_self_heal(success: bool):
             0.0 if _state.get("self_heal_successes", 0) == total_heals
             else 30.0 * (1 - _state.get("self_heal_successes", 0) / total_heals)
         )
+    _save()
 
 
 def record_revenue(amount_usd: float, source: str = ""):
@@ -309,15 +310,15 @@ def heartbeat():
         auto_tasks = _state.get("successful_tasks", 0)  # successful = autonomous
         _state["autonomy_pct"] = (auto_tasks / total) * 100
 
-    # Calculate runway (for subscription model: effectively infinite if active)
-    boot_time = _state.get("boot_time")
-    if boot_time:
-        try:
-            boot_dt = datetime.fromisoformat(boot_time)
-            uptime_days = (datetime.now() - boot_dt).total_seconds() / 86400
-            _state["runway_days"] = max(30 - uptime_days, 0) + 30  # subscription renewal
-        except Exception:
-            pass
+        # Calculate runway (for subscription model: effectively infinite if active)
+        boot_time = _state.get("boot_time")
+        if boot_time:
+            try:
+                boot_dt = datetime.fromisoformat(boot_time)
+                uptime_days = (datetime.now() - boot_dt).total_seconds() / 86400
+                _state["runway_days"] = max(30 - uptime_days, 0) + 30  # subscription renewal
+            except Exception:
+                pass
 
 
 # ── Query ────────────────────────────────────────────────────────────────────

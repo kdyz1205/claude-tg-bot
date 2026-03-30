@@ -442,7 +442,7 @@ def _main_loop(failures):
 
         # Track rapid failures
         now = time.time()
-        failures = [t for t in failures if now - t < RAPID_FAILURE_WINDOW]
+        failures[:] = [t for t in failures if now - t < RAPID_FAILURE_WINDOW]
         if elapsed < 10:  # Crashed within 10 seconds = rapid failure
             count = 3 if elapsed < 3 else 1  # Immediate exits count 3x
             failures.extend([now] * count)

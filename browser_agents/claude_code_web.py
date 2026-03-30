@@ -118,6 +118,8 @@ class ClaudeCodeWebAgent(BrowserAgent):
         await asyncio.sleep(2)
 
         # Get all response text
+        if not self._page:
+            return ""
         responses = await self._page.query_selector_all(self.SELECTORS["response"])
         if not responses:
             return ""
@@ -132,6 +134,8 @@ class ClaudeCodeWebAgent(BrowserAgent):
         return full_text.strip()
 
     async def extract_code_blocks(self) -> list[str]:
+        if not self._page:
+            return []
         code_elements = await self._page.query_selector_all(self.SELECTORS["code_block"])
         blocks = []
         for el in code_elements:

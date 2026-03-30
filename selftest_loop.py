@@ -231,6 +231,9 @@ def start_bot(bot_dir):
         if bot_log_fh is not None:
             bot_log_fh.close()
         raise
+    # Setting private attrs on Popen to track the log file handle and path.
+    # Fragile (relies on CPython allowing arbitrary attrs on Popen), but functional.
+    # These are read back in the caller to close the log file when the process exits.
     proc._log_fh = bot_log_fh  # attach so we can close it later
     proc._log_path = bot_log
     log(f"  Bot PID: {proc.pid} (log: {bot_log.name})")

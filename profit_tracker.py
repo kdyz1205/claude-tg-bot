@@ -43,12 +43,15 @@ def _load_signals() -> list:
 
 
 def _save_signals(signals: list) -> None:
-    _tmp = SIGNAL_HISTORY_FILE + ".tmp"
-    with open(_tmp, "w", encoding="utf-8") as f:
-        json.dump(signals, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(_tmp, SIGNAL_HISTORY_FILE)
+    try:
+        _tmp = SIGNAL_HISTORY_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            json.dump(signals, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, SIGNAL_HISTORY_FILE)
+    except Exception as e:
+        logger.warning("profit_tracker: _save_signals failed: %s", e)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -176,7 +179,10 @@ async def update_pending_signals() -> None:
             if "24" in pnl_dict:
                 final_pnl = pnl_dict["24"]
             elif pnl_dict:
-                final_pnl = pnl_dict[max(pnl_dict.keys(), key=int)]
+                try:
+                    final_pnl = pnl_dict[max(pnl_dict.keys(), key=int)]
+                except (ValueError, KeyError):
+                    final_pnl = 0
             else:
                 final_pnl = 0
             sig["final_pnl_pct"] = round(final_pnl, 3)
@@ -422,7 +428,8 @@ async def _fetch_price(symbol: str) -> Optional[float]:
             resp = await client.get(url)
             data = resp.json()
             if data.get("code") == "0" and data.get("data"):
-                return float(data["data"][0].get("last", 0)) or None
+                val = data["data"][0].get("last")
+                return float(val) if val is not None else None
     except Exception as e:
         logger.warning("profit_tracker: failed to fetch %s: %s", symbol, e)
     return None

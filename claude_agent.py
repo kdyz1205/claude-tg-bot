@@ -65,7 +65,12 @@ async def _forward_new_screenshots(chat_id: int, context, *, user_requested: boo
         return
 
     # Sort by modification time (oldest first)
-    files.sort(key=lambda x: os.path.getmtime(x))
+    def _safe_mtime(x):
+        try:
+            return os.path.getmtime(x)
+        except OSError:
+            return 0
+    files.sort(key=_safe_mtime)
 
     # Only send the latest screenshot unless user explicitly asked
     if not user_requested and len(files) > 1:
@@ -679,7 +684,7 @@ def _try_session_route(user_message: str, chat_id: int) -> str | None:
     - There's no active CLI session for this chat (would lose context)
     """
     try:
-        if not _session_mgr or not _session_mgr.sessions:
+        if not _session_mgr or not hasattr(_session_mgr, 'sessions') or not _session_mgr.sessions:
             return None
         if chat_id in _claude_sessions:
             return None
@@ -802,6 +807,9 @@ def _fire_and_forget(coro, name: str = "background"):
         done = [t for t in _background_tasks if t.done()]
         for t in done:
             _background_tasks.discard(t)
+    if len(_background_tasks) >= _MAX_BACKGROUND_TASKS:
+        logger.warning("Background task limit reached, dropping task")
+        return
 
     async def _wrapper():
         try:
@@ -1398,7 +1406,7 @@ async def _send_response(chat_id: int, response: str, context):
 def _drain_pending(chat_id: int) -> list[dict]:
     msgs = _pending_messages.pop(chat_id, [])
     now = time.time()
-    fresh = [m for m in msgs if now - m["time"] < _MAX_PENDING_AGE]
+    fresh = [m for m in msgs if now - m.get("time", 0) < _MAX_PENDING_AGE]
     if len(fresh) < len(msgs):
         logger.info(f"Chat {chat_id}: dropped {len(msgs) - len(fresh)} stale queued messages")
     return fresh
@@ -1757,7 +1765,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
                 duration_ms=_duration,
                 session_id=new_session_id,
             )
-            logger.info(f"Chat {chat_id}: score={score['overall']:.2f} flags={score['flags']}")
+            logger.info(f"Chat {chat_id}: score={score.get('overall', 0):.2f} flags={score.get('flags', [])}")
 
             # ── Vital Signs: record task for lifecycle tracking ──
             try:
@@ -2061,7 +2069,7 @@ def _check_disambiguation(message: str, chat_id: int) -> list[str] | None:
     options = []
     if ctx.get("tokens"):
         tok = ctx["tokens"][0]
-        ref = tok.get("symbol") or (tok.get("address", "")[:8] + "...") if tok else None
+        ref = (tok.get("symbol") or ((tok.get("address") or "")[:8] + "...")) if tok else None
         if ref:
             options.append(f"分析代币 {ref}")
 
@@ -2366,7 +2374,7 @@ async def _auto_compile_check(response: str, tool_output_text: str, chat_id: int
         )
         try:
             fix_resp, fix_sid, _, _ = await asyncio.wait_for(
-                _run_claude_cli(fix_prompt, chat_id, context, timeout=120),
+                _run_claude_cli(fix_prompt, f"__compile_fix_{chat_id}", context, timeout=120),
                 timeout=130,
             )
             # Verify fix worked
@@ -2514,39 +2522,44 @@ async def _run_claude_cli_direct(
         "--append-system-prompt-file", str(_PROMPT_FILE),
     ]
 
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=BOT_PROJECT_DIR,
-        env=_clean_env(),
-    )
-
+    sem = _get_cli_semaphore()
+    await sem.acquire()
     try:
-        stdout_data, stderr_data = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout,
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=BOT_PROJECT_DIR,
+            env=_clean_env(),
         )
-    except asyncio.TimeoutError:
-        await _kill_process_tree(proc)
-        return "Timed out", None
+
+        try:
+            stdout_data, stderr_data = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            await _kill_process_tree(proc)
+            return "Timed out", None
+        finally:
+            if _direct_msg_file:
+                try:
+                    os.unlink(_direct_msg_file)
+                except Exception:
+                    pass
+
+        raw = stdout_data.decode("utf-8", errors="replace").strip()
+        if not raw:
+            return "No output", None
+
+        try:
+            data = json.loads(raw)
+            response = data.get("result", "").strip() or "Done."
+            session_id = data.get("session_id")
+            return response, session_id
+        except json.JSONDecodeError:
+            return raw[:1000], None
     finally:
-        if _direct_msg_file:
-            try:
-                os.unlink(_direct_msg_file)
-            except Exception:
-                pass
-
-    raw = stdout_data.decode("utf-8", errors="replace").strip()
-    if not raw:
-        return "No output", None
-
-    try:
-        data = json.loads(raw)
-        response = data.get("result", "").strip() or "Done."
-        session_id = data.get("session_id")
-        return response, session_id
-    except json.JSONDecodeError:
-        return raw[:1000], None
+        sem.release()
 
 
 async def _run_claude_raw(
@@ -2576,29 +2589,34 @@ async def _run_claude_raw(
             "--model", model,
         ]
 
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=BOT_PROJECT_DIR,
-            env=_clean_env(),
-        )
-
+        sem = _get_cli_semaphore()
+        await sem.acquire()
         try:
-            stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await _kill_process_tree(proc)
-            return ""
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=BOT_PROJECT_DIR,
+                env=_clean_env(),
+            )
 
-        raw = stdout_data.decode("utf-8", errors="replace").strip()
-        if not raw:
-            return ""
+            try:
+                stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                await _kill_process_tree(proc)
+                return ""
 
-        try:
-            data = json.loads(raw)
-            return data.get("result", "").strip()
-        except json.JSONDecodeError:
-            return raw[:2000]
+            raw = stdout_data.decode("utf-8", errors="replace").strip()
+            if not raw:
+                return ""
+
+            try:
+                data = json.loads(raw)
+                return data.get("result", "").strip()
+            except json.JSONDecodeError:
+                return raw[:2000]
+        finally:
+            sem.release()
     finally:
         try:
             os.unlink(tmp.name)
@@ -2635,7 +2653,8 @@ def clear_history(chat_id: int):
     _session_timestamps.pop(chat_id, None)
     _save_sessions()
     _pending_messages.pop(chat_id, None)
-    _processing_locks.pop(chat_id, None)
+    # Don't delete the lock - it may be held by another coroutine
+    # _processing_locks.pop(chat_id, None)  # removed: causes hangs
 
 
 # ─── Public SessionManager API ───────────────────────────────────────────────

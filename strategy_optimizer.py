@@ -147,12 +147,24 @@ def _append_evolution_log(entry: dict) -> None:
     with open(EVOLUTION_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
     # Truncate to last 5000 lines to prevent unbounded growth
+    # Uses atomic write via temp file to avoid data loss on concurrent access
     try:
         with open(EVOLUTION_LOG_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
         if len(lines) > 5000:
-            with open(EVOLUTION_LOG_FILE, "w", encoding="utf-8") as f:
-                f.writelines(lines[-5000:])
+            import tempfile
+            dir_name = os.path.dirname(os.path.abspath(EVOLUTION_LOG_FILE))
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp_f:
+                    tmp_f.writelines(lines[-5000:])
+                os.replace(tmp_path, EVOLUTION_LOG_FILE)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
     except Exception:
         pass
 
@@ -386,6 +398,9 @@ def _backtest_macd(c, params: dict) -> dict:
 
     ema_fast    = _ema(c, fast_p)
     ema_slow    = _ema(c, slow_p)
+    # Guard: if either EMA is all-NaN (insufficient data), bail early
+    if np.all(np.isnan(ema_fast)) or np.all(np.isnan(ema_slow)):
+        return {"sharpe": -1.0, "max_dd_pct": 100.0, "trades": 0, "win_rate": 0.0}
     macd_line   = ema_fast - ema_slow
     signal_line = _ema(macd_line, signal_p)
     start_idx   = max(slow_p + signal_p, n - 168)
@@ -1789,7 +1804,7 @@ def _p3_weekly_winrates(signals: list, n_weeks: int = 5) -> list:
         end_ts   = now - i * 7 * 86400
         week_sigs = [
             s for s in signals
-            if start_ts <= s["timestamp"] < end_ts
+            if start_ts <= s.get("timestamp", 0) < end_ts
             and s.get("outcome") in ("win", "loss")
         ]
         wins  = sum(1 for s in week_sigs if s["outcome"] == "win")
@@ -1910,7 +1925,7 @@ def format_daily_performance_summary() -> str:
 
     # Today's stats
     today_cutoff = now - 86400
-    today_sigs   = [s for s in signals if s["timestamp"] >= today_cutoff]
+    today_sigs   = [s for s in signals if s.get("timestamp", 0) >= today_cutoff]
     today_res    = [s for s in today_sigs if s.get("outcome") in ("win", "loss")]
     today_wins   = sum(1 for s in today_res if s["outcome"] == "win")
     today_wr     = round(today_wins / len(today_res) * 100, 1) if today_res else None
@@ -1918,7 +1933,7 @@ def format_daily_performance_summary() -> str:
     # 7-day stats
     week_cutoff = now - 7 * 86400
     week_res    = [s for s in signals
-                   if s["timestamp"] >= week_cutoff and s.get("outcome") in ("win", "loss")]
+                   if s.get("timestamp", 0) >= week_cutoff and s.get("outcome") in ("win", "loss")]
     week_wins   = sum(1 for s in week_res if s["outcome"] == "win")
     week_wr     = round(week_wins / len(week_res) * 100, 1) if week_res else None
 

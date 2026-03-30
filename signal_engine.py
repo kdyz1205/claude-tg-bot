@@ -917,7 +917,9 @@ async def scan_symbol(symbol: str, cfg: dict) -> Optional[dict]:
 
     # ── FILTER 6: Adaptive threshold — dynamic based on recent win rate ──
     threshold = _adaptive_threshold()
-    threshold = cfg.get("confidence_threshold", threshold)  # user override wins
+    # User override: if confidence_threshold is set in config, it takes priority
+    # over the adaptive threshold calculated from recent win rate
+    threshold = cfg.get("confidence_threshold", threshold)
     if confidence < threshold:
         return None
 
@@ -972,7 +974,7 @@ async def scan_all(cfg: dict = None) -> list:
 
 def format_signal(sig: dict) -> str:
     direction_emoji = "🟢" if sig.get("direction") == "long" else "🔴"
-    strength = "⚡" * sig.get("score", 0)
+    strength = "⚡" * int(sig.get("score", 0) or 0)
     conf = max(0, min(100, sig.get("confidence", 0)))
     conf_bar = "█" * (conf // 10) + "░" * (10 - conf // 10)
 

@@ -225,7 +225,11 @@ def run_ribbon_backtest(o, h, l, c, v, params: dict) -> dict:
     sharpe = 0.0
     if len(returns) >= 2:
         r = np.array(returns)
-        sharpe = float(np.mean(r) / (np.std(r) + 1e-12) * np.sqrt(252 * 24))
+        std_r = float(np.std(r))
+        if std_r < 1e-10:
+            sharpe = 0.0
+        else:
+            sharpe = float(np.mean(r) / std_r * np.sqrt(252 * 24))
     total_return = equity - 1.0
     win_rate = wins / trades * 100 if trades else 0
 

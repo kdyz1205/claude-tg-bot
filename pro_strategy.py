@@ -99,14 +99,22 @@ _pro_client: Optional[httpx.AsyncClient] = None
 
 async def _fetch_okx(symbol: str, bar: str = "1H", limit: int = 100) -> list:
     try:
-        c = _pro_client or httpx.AsyncClient(timeout=12)
-        r = await c.get(
-            "https://www.okx.com/api/v5/market/candles",
-            params={"instId": symbol, "bar": bar, "limit": str(limit)},
-        )
-        data = r.json()
-        if data.get("code") == "0":
-            return list(reversed(data.get("data", [])))
+        client = _pro_client
+        should_close = False
+        if not client:
+            client = httpx.AsyncClient(timeout=12)
+            should_close = True
+        try:
+            r = await client.get(
+                "https://www.okx.com/api/v5/market/candles",
+                params={"instId": symbol, "bar": bar, "limit": str(limit)},
+            )
+            data = r.json()
+            if data.get("code") == "0":
+                return list(reversed(data.get("data", [])))
+        finally:
+            if should_close:
+                await client.aclose()
     except Exception as e:
         logger.debug("pro_fetch_okx %s: %s", symbol, e)
     return []
@@ -114,18 +122,26 @@ async def _fetch_okx(symbol: str, bar: str = "1H", limit: int = 100) -> list:
 
 async def _fetch_orderbook(symbol: str, depth: int = 50) -> dict:
     try:
-        c = _pro_client or httpx.AsyncClient(timeout=10)
-        r = await c.get(
-            "https://www.okx.com/api/v5/market/books",
-            params={"instId": symbol, "sz": str(depth)},
-        )
-        data = r.json()
-        if data.get("code") == "0" and data.get("data"):
-            book = data["data"][0]
-            return {
-                "bids": [[float(b[0]), float(b[1])] for b in book.get("bids", [])],
-                "asks": [[float(a[0]), float(a[1])] for a in book.get("asks", [])],
-            }
+        client = _pro_client
+        should_close = False
+        if not client:
+            client = httpx.AsyncClient(timeout=10)
+            should_close = True
+        try:
+            r = await client.get(
+                "https://www.okx.com/api/v5/market/books",
+                params={"instId": symbol, "sz": str(depth)},
+            )
+            data = r.json()
+            if data.get("code") == "0" and data.get("data"):
+                book = data["data"][0]
+                return {
+                    "bids": [[float(b[0]), float(b[1])] for b in book.get("bids", [])],
+                    "asks": [[float(a[0]), float(a[1])] for a in book.get("asks", [])],
+                }
+        finally:
+            if should_close:
+                await client.aclose()
     except Exception as e:
         logger.debug("pro_fetch_ob %s: %s", symbol, e)
     return {}
@@ -135,14 +151,22 @@ async def _fetch_funding_rate(symbol: str) -> Optional[float]:
     """Funding rate — positive = longs pay shorts (bearish crowd), negative = bullish crowd."""
     try:
         inst = symbol + "-SWAP" if not symbol.endswith("-SWAP") else symbol
-        c = _pro_client or httpx.AsyncClient(timeout=8)
-        r = await c.get(
-            "https://www.okx.com/api/v5/public/funding-rate",
-            params={"instId": inst},
-        )
-        data = r.json()
-        if data.get("code") == "0" and data.get("data"):
-            return float(data["data"][0].get("fundingRate", 0))
+        client = _pro_client
+        should_close = False
+        if not client:
+            client = httpx.AsyncClient(timeout=8)
+            should_close = True
+        try:
+            r = await client.get(
+                "https://www.okx.com/api/v5/public/funding-rate",
+                params={"instId": inst},
+            )
+            data = r.json()
+            if data.get("code") == "0" and data.get("data"):
+                return float(data["data"][0].get("fundingRate", 0))
+        finally:
+            if should_close:
+                await client.aclose()
     except Exception:
         pass
     return None
@@ -152,14 +176,22 @@ async def _fetch_long_short_ratio(symbol: str) -> Optional[float]:
     """OKX long/short account ratio. >1 = more longs, <1 = more shorts."""
     try:
         ccy = symbol.split("-")[0]
-        c = _pro_client or httpx.AsyncClient(timeout=8)
-        r = await c.get(
-            "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio",
-            params={"ccy": ccy, "period": "1H"},
-        )
-        data = r.json()
-        if data.get("code") == "0" and data.get("data"):
-            return float(data["data"][0][1])  # [ts, ratio]
+        client = _pro_client
+        should_close = False
+        if not client:
+            client = httpx.AsyncClient(timeout=8)
+            should_close = True
+        try:
+            r = await client.get(
+                "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                params={"ccy": ccy, "period": "1H"},
+            )
+            data = r.json()
+            if data.get("code") == "0" and data.get("data"):
+                return float(data["data"][0][1])  # [ts, ratio]
+        finally:
+            if should_close:
+                await client.aclose()
     except Exception:
         pass
     return None
@@ -293,6 +325,8 @@ def _adx(candles: list, period: int = 14) -> Optional[float]:
 
 
 def _macd(closes: list) -> dict:
+    if not closes:
+        return {"line": None, "signal": None, "hist": None}
     ema12 = _ema(closes, 12)
     ema26 = _ema(closes, 26)
     if ema12[-1] is None or ema26[-1] is None:
@@ -774,6 +808,7 @@ class ProStrategyEngine:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="pro_strategy")
+        self._task.add_done_callback(self._on_done)
         logger.info("ProStrategyEngine started")
 
     async def stop(self) -> None:
@@ -784,6 +819,13 @@ class ProStrategyEngine:
                 await self._task
             except asyncio.CancelledError:
                 pass
+
+    def _on_done(self, task: asyncio.Task) -> None:
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception as e:
+                logger.error("ProStrategyEngine loop crashed: %s", e, exc_info=True)
 
     async def _loop(self) -> None:
         await asyncio.sleep(30)

@@ -333,6 +333,8 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    if not update.effective_chat:
+        return
     try:
         claude_agent.clear_history(update.effective_chat.id)
         await update.message.reply_text("✅ 对话已清空，新会话已开始。")
@@ -347,6 +349,8 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kill any stuck Claude CLI process and clear the queue."""
     if not update.message:
+        return
+    if not update.effective_chat:
         return
     try:
         chat_id = update.effective_chat.id
@@ -379,6 +383,8 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/tasks — show running and queued tasks."""
     if not update.message:
+        return
+    if not update.effective_chat:
         return
     try:
         chat_id = update.effective_chat.id
@@ -420,7 +426,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append("\n⏳ 排队中: 无")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _safe_reply(update.message, "\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Tasks command error: {e}", exc_info=True)
         try:
@@ -464,6 +470,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    if not update.effective_chat:
+        return
     try:
         await _send_status(context, update.effective_chat.id)
     except Exception as e:
@@ -477,9 +485,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    if not update.effective_chat:
+        return
     try:
         if not context.args:
-            await update.message.reply_text(
+            await _safe_reply(
+                update.message,
                 f"当前模型: `{config.CLAUDE_MODEL}`\n"
                 "用法: `/model sonnet|opus|haiku`",
                 parse_mode="Markdown",
@@ -493,7 +504,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         config.CLAUDE_MODEL = AVAILABLE_MODELS[name]
         claude_agent.clear_history(update.effective_chat.id)
-        await update.message.reply_text(f"✅ 已切换为 `{config.CLAUDE_MODEL}`", parse_mode="Markdown")
+        await _safe_reply(update.message, f"✅ 已切换为 `{config.CLAUDE_MODEL}`", parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Model command error: {e}", exc_info=True)
         try:
@@ -519,7 +530,7 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     status = "❌ 无key"
                 lines.append(f"{status} — {name}")
             lines.append(f"\n用法: `/provider claude|openai|gemini`")
-            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            await _safe_reply(update.message, "\n".join(lines), parse_mode="Markdown")
             return
 
         choice = context.args[0].lower()
@@ -1036,6 +1047,8 @@ async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle panel category and command button presses."""
     query = update.callback_query
+    if not query or not query.from_user:
+        return
     if not _is_authorized(query.from_user.id):
         await query.answer("⛔ Unauthorized", show_alert=True)
         return
@@ -1129,7 +1142,7 @@ async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TY
         "click":     "🖱 Tell me where to click, e.g. \"click the start button\"",
         "type":      "⌨️ Tell me what to type, e.g. \"type hello world\"",
         "browse":    "🌐 Send me a URL or say \"open google.com\"",
-        "search":    "🔍 Tell me what to search, e.g. \"search python tutorials\"",
+        "search":    "🔍 发送 search <关键词> 或 搜索 <关键词> 即可搜索\n例如: search BTC price today",
         "scrape":    "🕷 Send me a URL to scrape, e.g. \"scrape https://example.com\"",
         "evolve":    "🧬 Use /train to start the evolution/training system.",
         "backtest":  "📈 Send a backtest request, e.g. \"backtest BTC MA crossover last 30 days\"",
@@ -1414,7 +1427,7 @@ async def _send_memory_info(context, chat_id):
         except Exception:
             pass
         text += f"\nSessions: {len(claude_agent._claude_sessions)} active"
-        await context.bot.send_message(chat_id=chat_id, text=text[:4096], parse_mode="Markdown")
+        await _safe_send(context.bot, chat_id, text, parse_mode="Markdown")
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"🧠 Memory error: {e}")
 
@@ -1498,7 +1511,7 @@ async def _send_vol_filter(context, chat_id):
         from onchain_filter import scan_filtered, format_filtered
         results = await scan_filtered()
         text = format_filtered(results)
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        await _safe_send(context.bot, chat_id, text, parse_mode="Markdown")
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"筛选失败: {e}")
 
@@ -1531,7 +1544,7 @@ async def _send_portfolio(context, chat_id):
             with open(portfolio_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for pos in data.get("positions", []):
-                pnl = pos.get("pnl", 0)
+                pnl = float(pos.get("pnl", 0) or 0)
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 lines.append(
                     f"  {emoji} {pos.get('symbol', '?')}: {pos.get('size', '?')} "
@@ -1681,7 +1694,7 @@ async def _send_okx_top30(context, chat_id):
             resp.raise_for_status()
             data = resp.json().get("data") or []
 
-        usdt = [d for d in data if d["instId"].endswith("-USDT-SWAP")]
+        usdt = [d for d in data if d.get("instId", "").endswith("-USDT-SWAP")]
         usdt.sort(key=lambda x: float(x.get("volCcy24h", 0) or 0), reverse=True)
         top30 = usdt[:30]
 
@@ -1752,7 +1765,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += "\n\n🌐 Web dashboard: http://localhost:8080"
         else:
             text = "❌ Dashboard module not available. Run: pip install flask"
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await _safe_reply(update.message, text, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Dashboard command error: {e}", exc_info=True)
         try:
@@ -1955,6 +1968,27 @@ async def whales_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Whales command error: {e}", exc_info=True)
         try:
             await update.message.reply_text(f"❌ 链上数据错误: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Web search. Usage: /search <query>"""
+    if not update.message:
+        return
+    query = " ".join(context.args) if context.args else ""
+    if not query:
+        await update.message.reply_text("🔍 用法: /search <关键词>\n例如: /search python async tutorial")
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        from tools import execute_web_search
+        result = await execute_web_search(query, max_results=5)
+        await update.message.reply_text(f"🔍 {result[:4000]}")
+    except Exception as e:
+        logger.error(f"Search command error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 搜索失败: {str(e)[:200]}")
         except Exception:
             pass
 
@@ -2188,12 +2222,13 @@ async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if sub == "history":
             summary = _strategy_optimizer.get_optimization_summary()
-            await update.message.reply_text(summary, parse_mode="Markdown")
+            await _safe_reply(update.message, summary, parse_mode="Markdown")
             return
 
         if sub == "ga":
             # P3_24: Genetic Algorithm parameter optimization
-            await update.message.reply_text(
+            await _safe_reply(
+                update.message,
                 "🧬 **P3_24 遗传算法优化启动**\n"
                 f"种群大小: {_strategy_optimizer.GA24_POPULATION_SIZE}  "
                 f"进化代数: {_strategy_optimizer.GA24_GENERATIONS}\n"
@@ -2202,13 +2237,13 @@ async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             result = await _strategy_optimizer.genetic_optimizer.optimize_now(trigger="manual")
             msg = _strategy_optimizer.format_ga24_result(result)
-            await update.message.reply_text(msg, parse_mode="Markdown")
+            await _safe_reply(update.message, msg, parse_mode="Markdown")
             return
 
         # Default: Phase 1 win-rate optimization
         await update.message.reply_text("⚙️ 正在分析信号数据并优化参数...")
         result = await _strategy_optimizer.strategy_optimizer.optimize_now(trigger="manual")
-        await update.message.reply_text(result["message"], parse_mode="Markdown")
+        await _safe_reply(update.message, result["message"], parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"Optimize command error: {e}", exc_info=True)
@@ -2263,7 +2298,7 @@ async def selfcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("\n📋 `_error_log.txt` — no crashes recorded ✅")
 
         lines.append(f"\n{'✅ All checks passed' if all_ok else '⚠️ Issues found — see above'}")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _safe_reply(update.message, "\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Selfcheck error: {e}", exc_info=True)
         try:
@@ -2292,7 +2327,7 @@ async def repairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ts = r.get("ts", "?")[:19].replace("T", " ")
             ok = "✅" if r.get("success") else "❌"
             bak = " 💾bak" if r.get("backed_up") else ""
-            conf = r.get("confidence", 0)
+            conf = float(r.get("confidence", 0) or 0)
             etype = r.get("error_type", "?")
             fname = r.get("file", "?")
             line = r.get("line", "?")
@@ -2302,7 +2337,7 @@ async def repairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   📄 `{fname}:{line}` conf={conf:.0%}\n"
                 f"   _{emsg}_"
             )
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _safe_reply(update.message, "\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         logger.error(f"repairs_command error: {e}", exc_info=True)
         try:
@@ -2325,7 +2360,7 @@ async def repair_status_command(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("🔍 正在扫描代码健康状态...")
             await proactive_repair.run_scan_now()
         report = format_repair_status(n_recent=10)
-        await update.message.reply_text(report, parse_mode="Markdown")
+        await _safe_reply(update.message, report, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"repair_status_command error: {e}", exc_info=True)
         try:
@@ -2350,7 +2385,8 @@ async def evostatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target = result.get("target", "N/A")
             applied = result.get("applied", False)
             rolled = result.get("rolled_back", False)
-            await update.message.reply_text(
+            await _safe_reply(
+                update.message,
                 f"进化结果: `{status}`\n"
                 f"目标: `{target}`\n"
                 f"已应用: {'✅' if applied else '❌'}\n"
@@ -2358,7 +2394,7 @@ async def evostatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
         report = format_evostatus()
-        await update.message.reply_text(report, parse_mode="Markdown")
+        await _safe_reply(update.message, report, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"evostatus_command error: {e}", exc_info=True)
         try:
@@ -2386,7 +2422,7 @@ async def code_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"低质量文件{low_count}个",
             )
         health = format_code_health()
-        await update.message.reply_text(health, parse_mode="Markdown")
+        await _safe_reply(update.message, health, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"code_health_command error: {e}", exc_info=True)
         try:
@@ -2739,7 +2775,7 @@ async def okx_top30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             resp.raise_for_status()
             data = resp.json().get("data") or []
 
-        usdt = [d for d in data if d["instId"].endswith("-USDT-SWAP")]
+        usdt = [d for d in data if d.get("instId", "").endswith("-USDT-SWAP")]
         usdt.sort(key=lambda x: float(x.get("volCcy24h", 0) or 0), reverse=True)
         top30 = usdt[:30]
 
@@ -2765,7 +2801,10 @@ async def okx_top30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{i:>2} {sym:<14} {price:>12.4f} {emoji}{chg:>6.2f}% {vol_str:>14}")
 
         text = "\n".join(lines)
-        await msg.edit_text(f"```\n{text}\n```", parse_mode="Markdown")
+        try:
+            await msg.edit_text(f"```\n{text}\n```", parse_mode="Markdown")
+        except Exception:
+            await msg.edit_text(text[:4096])
     except Exception as e:
         await msg.edit_text(f"OKX Top 30 failed: {str(e)[:300]}")
 
@@ -3056,14 +3095,14 @@ async def consciousness_command(update: Update, context: ContextTypes.DEFAULT_TY
         if gaps:
             text += "\nCapability gaps:\n"
             for g in gaps[:3]:
-                text += f"  • {g['reason'][:60]} (×{g['count']})\n"
+                text += f"  • {g.get('reason', '?')[:60]} (×{g.get('count', 0)})\n"
 
         evolutions = report.get("recent_evolutions", [])
         if evolutions:
             text += f"\nRecent evolutions: {len(evolutions)}\n"
             for e in evolutions[-3:]:
                 outcome = e.get("outcome", "?")
-                text += f"  • [{outcome}] {e['description'][:60]}\n"
+                text += f"  • [{outcome}] {e.get('description', '?')[:60]}\n"
 
         await update.message.reply_text(text[:4000])
     except Exception as e:
@@ -3139,7 +3178,7 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if subcmd == "show" or subcmd == "":
             text = memory_engine.format_display()
-            await update.message.reply_text(text[:4096], parse_mode="Markdown")
+            await _safe_reply(update.message, text[:4096], parse_mode="Markdown")
 
         elif subcmd == "shortcuts":
             shortcuts = memory_engine.get_shortcuts()
@@ -3149,7 +3188,7 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = ["⚡ **Shortcuts** (by frequency)\n"]
             for s in shortcuts[:20]:
                 lines.append(f"[{s.get('frequency',0)}x] {s['trigger'][:80]}")
-            await update.message.reply_text("\n".join(lines)[:4096], parse_mode="Markdown")
+            await _safe_reply(update.message, "\n".join(lines)[:4096], parse_mode="Markdown")
 
         elif subcmd == "patterns":
             patterns = memory_engine.get_patterns(20)
@@ -3161,7 +3200,7 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tot = p["success_count"] + p.get("fail_count", 0)
                 score = f"{p.get('score',0):.2f}"
                 lines.append(f"{p['success_count']}/{tot} [{score}] {p['text'][:70]}")
-            await update.message.reply_text("\n".join(lines)[:4096], parse_mode="Markdown")
+            await _safe_reply(update.message, "\n".join(lines)[:4096], parse_mode="Markdown")
 
         elif subcmd == "summary" and len(args) >= 2:
             text = " ".join(args[1:])
@@ -3564,6 +3603,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard: truncate extremely long messages to prevent CLI arg overflow on Windows
     if len(text) > 30000:
         text = text[:30000] + "\n\n...(消息过长，已截断到30000字符)"
+
+    # ── Fast search shortcut: "search XXX" / "搜索 XXX" → direct DDG search ──
+    _lower = text.lower().strip()
+    _search_match = None
+    for _prefix in ("search ", "搜索 ", "搜索:", "search:"):
+        if _lower.startswith(_prefix):
+            _search_match = text[len(_prefix):].strip()
+            break
+    if _search_match:
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            from tools import execute_web_search
+            result = await execute_web_search(_search_match, max_results=5)
+            await context.bot.send_message(chat_id=chat_id, text=f"🔍 {result[:4000]}")
+            self_monitor.record_message_success()
+            return
+        except Exception as e:
+            logger.error(f"Fast search error: {e}")
+            # Fall through to normal processing
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -4219,6 +4277,7 @@ def main():
     app.add_handler(CommandHandler("alpha", alpha_command, filters=auth_filter))
     app.add_handler(CommandHandler("onchain", onchain_command, filters=auth_filter))
     app.add_handler(CommandHandler("arb", arb_command, filters=auth_filter))
+    app.add_handler(CommandHandler("search", search_command, filters=auth_filter))
     app.add_handler(CommandHandler("whales", whales_command, filters=auth_filter))
     app.add_handler(CommandHandler("track", track_command, filters=auth_filter))
     app.add_handler(CommandHandler("wallets", wallets_command, filters=auth_filter))

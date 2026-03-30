@@ -235,6 +235,8 @@ class BrowserAgent(ABC):
         if self._page is None:
             raise RuntimeError("Browser page not initialized. Call launch() first.")
         element = await self._page.wait_for_selector(selector, timeout=10_000)
+        if not element:
+            return
         # Use clipboard paste for speed — Playwright fill() is too fast
         await element.click()
         await self._page.keyboard.insert_text(text)

@@ -80,14 +80,14 @@ except OSError:
 DANGEROUS_PATTERNS = [
     r"rm\s+-rf\s+/",          # rm -rf / (root deletion)
     r"del\s+/[sfq].*[\\\/]Windows",  # Deleting Windows system files
-    r"format\s+[a-zA-Z]:",    # Formatting drives
-    r"shutdown\s+/[sr]",      # Shutdown/restart system
-    r"reg\s+delete.*HKLM",    # Deleting system registry keys
-    r"diskpart",              # Disk partitioning
-    r"bcdedit",               # Boot config editing
-    r"Set-ExecutionPolicy\s+Unrestricted",  # Unrestricted execution
-    r"Remove-Item.*-Recurse.*[\\\/]Windows",  # Recursive delete Windows
-    r"Remove-Item.*-Recurse.*[\\\/]Program Files",  # Recursive delete Program Files
+    r"\bformat\b\s+[a-zA-Z]:",    # Formatting drives
+    r"\bshutdown\b\s+/[sr]",      # Shutdown/restart system
+    r"\breg\b\s+delete.*HKLM",    # Deleting system registry keys
+    r"\bdiskpart\b",              # Disk partitioning
+    r"\bbcdedit\b",               # Boot config editing
+    r"\bSet-ExecutionPolicy\b\s+Unrestricted",  # Unrestricted execution
+    r"\bRemove-Item\b.*-Recurse.*[\\\/]Windows",  # Recursive delete Windows
+    r"\bRemove-Item\b.*-Recurse.*[\\\/]Program Files",  # Recursive delete Program Files
 ]
 
 # ─── AI Capabilities ───────────────────────────────────────────────────────────

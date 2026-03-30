@@ -342,7 +342,12 @@ def update_memory_with_insights(insights: list[str]):
         else:
             content = content.rstrip() + "\n\n" + new_perf
 
-        Path(MEMORY_FILE).write_text(content, encoding="utf-8")
+        _tmp = str(Path(MEMORY_FILE)) + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, str(Path(MEMORY_FILE)))
     except Exception:
         pass
 
@@ -382,7 +387,12 @@ def prune_memory(max_lines: int = 100):
         # Keep all protected + last N dynamic lines
         budget = max(max_lines - len(protected_lines), 10)
         kept = protected_lines + dynamic_lines[-budget:]
-        Path(MEMORY_FILE).write_text("".join(kept), encoding="utf-8")
+        _tmp = str(Path(MEMORY_FILE)) + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write("".join(kept))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, str(Path(MEMORY_FILE)))
     except Exception:
         pass
 
@@ -750,6 +760,8 @@ def record_self_heal(error: str, diagnosis: str, fix: str, success: bool):
         entry = f"\n## [{date}] 自愈 {result_str}\n- 错误: {error[:100]}\n- 诊断: {diagnosis[:100]}\n- 修复: {fix[:100]}\n"
         with open(MEMORY_FILE, "a", encoding="utf-8") as f:
             f.write(entry)
+            f.flush()
+            os.fsync(f.fileno())
         # Prune to prevent unbounded memory file growth from frequent self-heals
         prune_memory(max_lines=100)
     except Exception:

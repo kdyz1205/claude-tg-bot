@@ -349,9 +349,9 @@ def start_dashboard(host: str = "0.0.0.0", port: int = 8080) -> bool:
             _server_started = False
             logging.getLogger(__name__).error("Dashboard failed to start: %s", e)
 
-    _server_started = True
     _server_thread = threading.Thread(target=_run, name="dashboard-server", daemon=True)
     _server_thread.start()
+    _server_started = True  # Set after thread.start() so the thread is actually running
 
     logging.getLogger(__name__).info("Dashboard started at http://localhost:%d", port)
     return True
