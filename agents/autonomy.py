@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,9 @@ class AutonomyEngine:
             if os.path.exists(self._STATE_FILE):
                 with open(self._STATE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self.goals = [Goal(**g) for g in data.get("goals", [])]
+                valid_fields = {f.name for f in fields(Goal)}
+                raw = data.get("goals", [])
+                self.goals = [Goal(**{k: v for k, v in g.items() if k in valid_fields}) for g in raw]
                 self.history = data.get("history", [])[-self._MAX_HISTORY:]
         except Exception as e:
             logger.warning(f"Autonomy: failed to load state: {e}")
@@ -242,7 +244,7 @@ class AutonomyEngine:
         try:
             from tools import execute_tool
             result, _ = await execute_tool(tool_name, params)
-            success = "error" not in result.lower()[:100]
+            success = not any(w in result.lower()[:200] for w in ["traceback", "exception", "raise ", "errno"])
             return success, result[:1000]
         except Exception as e:
             return False, str(e)[:500]
@@ -296,7 +298,10 @@ class AutonomyEngine:
                 return False
         else:
             # Check if goal is complete (simple check — could use Claude for complex goals)
-            if "done" in result.lower() or "complete" in result.lower() or "success" in result.lower():
+            low = result.lower()
+            if any(neg in low for neg in ["not done", "incomplete", "not complete", "failed"]):
+                pass  # not complete
+            elif any(pos in low for pos in ["done", "complete", "success", "finished"]):
                 self.complete_goal(goal, result[:500])
                 return True
 

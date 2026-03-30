@@ -70,6 +70,15 @@ class SolutionStore:
                 f.write(json.dumps(solution, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.warning(f"RAG: save failed: {e}")
+        # Truncate if file too large
+        try:
+            from pathlib import Path
+            path = Path(_SOLUTIONS_FILE)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            if len(lines) > 500:
+                path.write_text("\n".join(lines[-300:]) + "\n", encoding="utf-8")
+        except Exception:
+            pass
 
     def store_solution(
         self,

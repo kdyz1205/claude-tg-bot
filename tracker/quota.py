@@ -291,7 +291,7 @@ class QuotaTracker:
         if actual_used < quota.max_messages_per_window:
             # We hit the limit sooner than expected — adjust down
             old_max = quota.max_messages_per_window
-            quota.max_messages_per_window = max(1, actual_used - 1)
+            quota.max_messages_per_window = max(5, actual_used - 1)
             logger.info(
                 f"[{platform}] Adjusted quota: {old_max} → "
                 f"{quota.max_messages_per_window} (adaptive)"

@@ -3,6 +3,7 @@
 检查local session是否空闲，空闲时自动发下一个进化任务
 """
 import json
+import os
 import time
 import sys
 import subprocess
@@ -85,8 +86,12 @@ def mark_task_sent(task_id):
             task["status"] = "sent"
             task["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+    tmp = str(QUEUE_FILE) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, str(QUEUE_FILE))
 
 def send_to_session(message):
     """Send a message to the tg bot session"""

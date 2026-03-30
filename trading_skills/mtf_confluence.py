@@ -96,7 +96,8 @@ def _sma(values: np.ndarray, period: int) -> np.ndarray:
     if len(values) < period:
         return out
     cs = np.cumsum(values)
-    out[period - 1:] = (cs[period - 1:] - np.concatenate([[0.0], cs[:-period]])[period - 1:]) / period
+    padded = np.concatenate([[0.0], cs])  # length n+1
+    out[period - 1:] = (cs[period - 1:] - padded[:len(values) - period + 1]) / period
     return out
 
 

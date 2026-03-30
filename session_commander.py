@@ -58,7 +58,7 @@ def _pacific_now():
 
 # Screen dimensions (auto-detected once, with fallback)
 try:
-    _SCREEN_W, _SCREEN_H = pyautogui.size()
+    _SCREEN_W, _SCREEN_H = pyautogui.size() if pyautogui else (1920, 1080)
 except Exception:
     _SCREEN_W, _SCREEN_H = 1920, 1080  # safe fallback
 
@@ -113,6 +113,9 @@ _file_snapshot = {}
 # ============================================================
 
 def screenshot(path="current_screen.png"):
+    if pyautogui is None:
+        print("[WARN] pyautogui not installed, cannot take screenshot")
+        return None
     img = pyautogui.screenshot()
     if img is None:
         print("[WARN] Screenshot returned None (desktop locked or headless?)")
@@ -302,6 +305,9 @@ def safe_click(x, y, reason="", img=None):
         print(f"[DRY RUN] Would click ({x},{y}) - {reason}")
         return False
 
+    if pyautogui is None:
+        print("[WARN] pyautogui not installed, cannot click")
+        return False
     pyautogui.click(x, y)
     time.sleep(0.3)
     print(f"[CLICK] ({x},{y}) - {reason}")
@@ -631,13 +637,15 @@ class RateLimitScheduler:
             # Only keep last 2 hours of data
             cutoff = time.time() - 7200
             self._timestamps = [t for t in self._timestamps if t > cutoff]
-            with open(self._usage_log_path, "w", encoding="utf-8") as f:
+            tmp_usage = self._usage_log_path + ".tmp"
+            with open(tmp_usage, "w", encoding="utf-8") as f:
                 json.dump({
                     "timestamps": self._timestamps,
                     "limit_hit_at": self._limit_hit_at.isoformat() if self._limit_hit_at else None,
                 }, f)
                 f.flush()
                 os.fsync(f.fileno())
+            os.replace(tmp_usage, self._usage_log_path)
         except Exception as e:
             print(f"[RATE] Failed to save usage log: {e}")
 
@@ -864,11 +872,17 @@ rate_scheduler = RateLimitScheduler()
 
 def click_at(x, y):
     """Legacy click - only used for reply box, not sidebar."""
+    if pyautogui is None:
+        print("[WARN] pyautogui not installed, cannot click")
+        return
     pyautogui.click(x, y)
     time.sleep(0.3)
 
 
 def type_text(text):
+    if pyperclip is None or pyautogui is None:
+        print("[WARN] pyperclip/pyautogui not installed, cannot type text")
+        return
     pyperclip.copy(text)
     pyautogui.hotkey('ctrl', 'v')
 
@@ -928,6 +942,9 @@ def send_to_session(message, session=None):
     time.sleep(0.5)
     type_text(message)
     time.sleep(0.3)
+    if pyautogui is None:
+        print("[WARN] pyautogui not installed, cannot send")
+        return False
     pyautogui.press('enter')
     print(f"[SENT] {message[:60]}...")
 

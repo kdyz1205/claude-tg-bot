@@ -129,6 +129,8 @@ class PostTradeAnalyzer:
         lookforward_bars: int = _LOOKFORWARD_BARS,
     ) -> None:
         self._history: list[dict] = list(trade_history) if trade_history else []
+        if len(self._history) > 5000:
+            self._history = self._history[-5000:]
         self._lookforward: int = lookforward_bars
 
     # ------------------------------------------------------------------
@@ -509,7 +511,7 @@ class PostTradeAnalyzer:
                 suggestions.append({
                     "priority": "HIGH",
                     "suggestion": (
-                        f"Averaging {ev.get('avg_daily', '?'):.1f} trades/day on "
+                        f"Averaging {ev.get('avg_daily', 0):.1f} trades/day on "
                         f"peak days. Cap daily trades at 5 and prioritise higher-"
                         f"confidence setups."
                     ),

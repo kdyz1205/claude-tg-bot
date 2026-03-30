@@ -99,7 +99,11 @@ class LoopController:
 
         for i in range(self.max_iterations):
             logger.info(f"Self-loop iteration {i + 1}/{self.max_iterations}")
-            handoff = agent.process(handoff)
+            try:
+                handoff = agent.process(handoff)
+            except Exception as e:
+                logger.error(f"Self-loop: agent.process failed at iteration {i + 1}: {e}")
+                break
             history.append(handoff)
 
             if self.on_iteration:
@@ -130,7 +134,11 @@ class LoopController:
 
         for i in range(self.max_iterations):
             logger.info(f"Ping-pong iteration {i + 1}: {current_agent.name}")
-            handoff = current_agent.process(handoff)
+            try:
+                handoff = current_agent.process(handoff)
+            except Exception as e:
+                logger.error(f"Ping-pong: agent '{current_agent.name}' failed at iteration {i + 1}: {e}")
+                break
             history.append(handoff)
 
             if self.on_iteration:
@@ -165,7 +173,11 @@ class LoopController:
             logger.info(f"Pipeline cycle {cycle + 1}/{self.max_iterations}")
 
             for agent in agents:
-                handoff = agent.process(handoff)
+                try:
+                    handoff = agent.process(handoff)
+                except Exception as e:
+                    logger.error(f"Pipeline: agent '{agent.name}' failed at cycle {cycle + 1}: {e}")
+                    break
                 history.append(handoff)
 
             if self.on_iteration:

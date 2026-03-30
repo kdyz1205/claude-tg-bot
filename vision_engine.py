@@ -33,7 +33,10 @@ try:
     import numpy as np
 except ImportError:
     np = None
-from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +215,7 @@ def annotate_screenshot_som(
     elif isinstance(image, BytesIO):
         image.seek(0)
         pil_img = Image.open(image).convert("RGB")
-    elif isinstance(image, np.ndarray):
+    elif np is not None and isinstance(image, np.ndarray):
         pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
     else:
         pil_img = image.convert("RGB")
@@ -1107,7 +1110,7 @@ class AccessibilityTree:
 
                 # Handle non-ASCII via clipboard (escape quotes to prevent injection)
                 if any(ord(c) > 127 for c in text):
-                    safe_text = text.replace("'", "''")
+                    safe_text = text.replace("'", "''").replace("`", "``").replace("$", "`$")
                     subprocess.run(
                         ["powershell", "-Command", f"Set-Clipboard -Value '{safe_text}'"],
                         capture_output=True, timeout=5,
@@ -1353,7 +1356,7 @@ def _classify_image_type(img_bgr: np.ndarray, ocr_text: str) -> tuple[str, float
 
     # UI screenshots tend to have many distinct colors (icons, buttons)
     if img_bgr.size > 0:
-        unique_colors = len(np.unique(img_bgr.reshape(-1, 3), axis=0))
+        unique_colors = len(np.unique(img_bgr[::4, ::4].reshape(-1, 3), axis=0))
         if unique_colors > 5000:
             scores["ui_screenshot"] += 0.15
 

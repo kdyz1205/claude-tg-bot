@@ -123,7 +123,7 @@ if _flask_available:
                 "avg_ms": avg_ms,
             },
             "system": sys_stats,
-            "recent_messages": list(_recent_messages),
+            "recent_messages": (lambda: (_stats_lock.acquire(), list(_recent_messages), _stats_lock.release())[1])(),
             "evolution": evolution,
         })
 
@@ -390,9 +390,11 @@ def get_stats_text() -> str:
         f"**Dashboard URL:** http://localhost:8080\n",
     ]
 
-    if _recent_messages:
+    with _stats_lock:
+        recent_snap = list(_recent_messages)
+    if recent_snap:
         lines.append("**Recent Messages:**")
-        for msg in list(_recent_messages)[-5:]:
+        for msg in recent_snap[-5:]:
             icon = "✅" if msg["success"] else "❌"
             lines.append(f"  {icon} [{msg['ts']}] {msg['text'][:50]} ({msg['duration_ms']}ms)")
 

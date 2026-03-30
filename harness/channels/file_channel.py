@@ -68,7 +68,10 @@ class FileChannel:
             try:
                 files[0].rename(files[0].with_suffix(".json.bad"))
             except Exception:
-                pass
+                try:
+                    files[0].unlink()
+                except Exception:
+                    pass
             return None
         try:
             files[0].unlink()
@@ -88,7 +91,10 @@ class FileChannel:
                 try:
                     f.rename(f.with_suffix(".json.bad"))
                 except Exception:
-                    pass
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
         return handoffs
 
     def peek(self, agent_name: str) -> list[Handoff]:

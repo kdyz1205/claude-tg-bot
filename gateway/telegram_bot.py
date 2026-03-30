@@ -164,7 +164,10 @@ class TelegramBot:
                     "timeout": 30,
                 })
                 for update in result.get("result", []):
-                    self._offset = update["update_id"] + 1
+                    uid = update.get("update_id")
+                    if uid is None:
+                        continue
+                    self._offset = uid + 1
                     msg = self._parse_update(update)
                     if msg and self._handler:
                         # send_status uses blocking urllib — run in executor

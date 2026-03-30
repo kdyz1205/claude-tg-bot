@@ -70,7 +70,7 @@ class Message:
     @classmethod
     def from_dict(cls, data: dict) -> Message:
         data = dict(data)  # Don't mutate the caller's dict
-        data["msg_type"] = MessageType(data.get("msg_type", "text"))
+        data["msg_type"] = MessageType(data.get("msg_type", "handoff"))
         # Only pass known fields to avoid TypeError on extra keys
         valid_keys = {"msg_type", "sender", "receiver", "content", "timestamp", "metadata"}
         return cls(**{k: v for k, v in data.items() if k in valid_keys})
@@ -146,7 +146,9 @@ class Handoff:
     def save(self, path: str | Path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.to_json(), encoding="utf-8")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(self.to_json(), encoding="utf-8")
+        tmp.replace(path)
 
     @classmethod
     def load(cls, path: str | Path) -> Handoff:

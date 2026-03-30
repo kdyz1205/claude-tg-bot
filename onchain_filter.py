@@ -143,10 +143,17 @@ def _load_alerted():
 
 def _save_alerted():
     try:
-        with open(ALERTED_FILE, "w", encoding="utf-8") as f:
+        tmp = str(ALERTED_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_alerted, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(ALERTED_FILE))
     except Exception:
-        pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 def _is_new_alert(symbol: str, cooldown: int = 900) -> bool:
     """Only alert once per symbol per cooldown (default 15 min)."""
@@ -186,10 +193,21 @@ def _macd(closes: list, fast=12, slow=26, signal=9):
         for v in data[1:]:
             e = v * k + e * (1 - k)
         return e
-    ema_fast = ema(closes[-fast - signal:], fast)
-    ema_slow = ema(closes[-slow - signal:], slow)
-    macd_val = ema_fast - ema_slow
-    return macd_val, None
+    def ema_series(data, period):
+        k = 2 / (period + 1)
+        result = [data[0]]
+        for v in data[1:]:
+            result.append(v * k + result[-1] * (1 - k))
+        return result
+    # Compute MACD line as series over recent window
+    ema_fast_series = ema_series(closes[-(slow + signal):], fast)
+    ema_slow_series = ema_series(closes[-(slow + signal):], slow)
+    macd_series = [f - s for f, s in zip(ema_fast_series, ema_slow_series)]
+    # Signal line = 9-period EMA of MACD series
+    signal_series = ema_series(macd_series, signal)
+    macd_val = macd_series[-1]
+    signal_val = signal_series[-1]
+    return macd_val, signal_val
 
 
 def _quick_score(closes: list) -> tuple:

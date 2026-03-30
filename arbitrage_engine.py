@@ -610,6 +610,7 @@ class ArbEngine:
                     async with session.ws_connect(url, heartbeat=25) as ws:
                         await ws.send_json({"op": "subscribe", "args": args})
                         logger.debug("ArbEngine: OKX WS connected")
+                        _okx_delay = RECONNECT_DELAY  # reset on successful connection
                         async for msg in ws:
                             if not self._running:
                                 break
@@ -649,6 +650,7 @@ class ArbEngine:
                     async with session.ws_connect(url, heartbeat=20) as ws:
                         await ws.send_json({"op": "subscribe", "args": args})
                         logger.debug("ArbEngine: Bybit WS connected")
+                        _bybit_delay = RECONNECT_DELAY  # reset on successful connection
                         async for msg in ws:
                             if not self._running:
                                 break
@@ -691,6 +693,7 @@ class ArbEngine:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, heartbeat=30) as ws:
                         logger.debug("ArbEngine: Binance WS connected")
+                        _binance_delay = RECONNECT_DELAY  # reset on successful connection
                         async for msg in ws:
                             if not self._running:
                                 break

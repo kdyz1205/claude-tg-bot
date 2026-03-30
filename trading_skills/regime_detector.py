@@ -580,7 +580,7 @@ class MarketRegimeDetector:
             if mask.any():
                 for i in range(len(arr)):
                     if mask[i]:
-                        arr[i] = arr[i - 1] if i > 0 and not mask[i - 1] else 0.0
+                        arr[i] = arr[i - 1] if i > 0 else 0.0
         return high, low, close
 
     @staticmethod

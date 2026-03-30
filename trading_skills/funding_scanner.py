@@ -286,7 +286,7 @@ class FundingRateScanner:
                 "mean_reversion_risk": 0.5,
             }
 
-        rates = [h["fundingRate"] * 100 for h in history]  # → percentage
+        rates = [h.get("fundingRate", 0) * 100 for h in history]  # → percentage
         n = len(rates)
 
         avg = sum(rates) / n if n else 0

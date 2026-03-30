@@ -16,6 +16,8 @@ MODEL = "claude-opus-4-6"
 
 
 async def teacher_agent(topic: str, feedback: str = None) -> str:
+    if query is None:
+        return "claude_agent_sdk not installed"
     prompt = f"主题: {topic}"
     if feedback:
         prompt += f"\n\nManager反馈: {feedback}\n请根据反馈改进你的讲解。"
@@ -35,6 +37,8 @@ async def teacher_agent(topic: str, feedback: str = None) -> str:
 
 
 async def manager_agent(teacher_output: str, topic: str) -> tuple[str, bool]:
+    if query is None:
+        return "claude_agent_sdk not installed", False
     prompt = f"""主题: {topic}
 
 Teacher回答:

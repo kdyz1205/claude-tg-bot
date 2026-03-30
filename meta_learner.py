@@ -258,7 +258,11 @@ def inject_pattern_skills(analysis: dict) -> list:
         }
 
         # Only add if not already exists (check by title)
-        index = sl._load_index()
+        try:
+            index = sl._load_index()
+        except Exception as exc:
+            logger.warning("MetaLearner: failed to load skill_library index (private API _load_index may have changed): %s", exc)
+            continue
         existing_titles = {e.get("title", "") for e in index.get("entries", [])}
         if title not in existing_titles:
             sl._save_skill(skill)
@@ -271,7 +275,11 @@ def inject_pattern_skills(analysis: dict) -> list:
                 "use_count": 0,
                 "avg_score": pat["win_rate"],
             })
-            sl._save_index(index)
+            try:
+                sl._save_index(index)
+            except Exception as exc:
+                logger.warning("MetaLearner: failed to save skill_library index (private API _save_index may have changed): %s", exc)
+                continue
             added.append(skill_id)
             logger.info(f"MetaLearner: added pattern skill {skill_id}")
 

@@ -246,10 +246,10 @@ class EntryTimingOptimizer:
         ``support``, ``resistance``, ``volume_node``, and
         ``momentum_strength``.
         """
-        closes = df["close"].to_numpy().astype(np.float64)
-        highs = df["high"].to_numpy().astype(np.float64)
-        lows = df["low"].to_numpy().astype(np.float64)
-        volumes = df["volume"].to_numpy().astype(np.float64)
+        closes = df["close"].to_numpy(zero_copy_only=False).astype(np.float64)
+        highs = df["high"].to_numpy(zero_copy_only=False).astype(np.float64)
+        lows = df["low"].to_numpy(zero_copy_only=False).astype(np.float64)
+        volumes = df["volume"].to_numpy(zero_copy_only=False).astype(np.float64)
 
         last_close = float(closes[-1])
 
@@ -308,11 +308,11 @@ class EntryTimingOptimizer:
 
         Positive means price is *above* VWAP; negative means below.
         """
-        closes = df["close"].to_numpy().astype(np.float64)
+        closes = df["close"].to_numpy(zero_copy_only=False).astype(np.float64)
         if vwap is None:
-            highs = df["high"].to_numpy().astype(np.float64)
-            lows = df["low"].to_numpy().astype(np.float64)
-            volumes = df["volume"].to_numpy().astype(np.float64)
+            highs = df["high"].to_numpy(zero_copy_only=False).astype(np.float64)
+            lows = df["low"].to_numpy(zero_copy_only=False).astype(np.float64)
+            volumes = df["volume"].to_numpy(zero_copy_only=False).astype(np.float64)
             vwap = self._compute_vwap(closes, highs, lows, volumes)
         if vwap == 0:
             return 0.0
@@ -328,9 +328,9 @@ class EntryTimingOptimizer:
         Returns a value in ``(-1, +1)`` where positive is buy pressure.
         No real order-book data is required.
         """
-        closes = df["close"].to_numpy().astype(np.float64)
-        opens = df["open"].to_numpy().astype(np.float64)
-        volumes = df["volume"].to_numpy().astype(np.float64)
+        closes = df["close"].to_numpy(zero_copy_only=False).astype(np.float64)
+        opens = df["open"].to_numpy(zero_copy_only=False).astype(np.float64)
+        volumes = df["volume"].to_numpy(zero_copy_only=False).astype(np.float64)
 
         lookback = min(len(closes), 10)
         c = closes[-lookback:]
@@ -369,9 +369,9 @@ class EntryTimingOptimizer:
         confidence = float(signal["confidence"])
         market_price = float(signal["price"])
 
-        closes = df["close"].to_numpy().astype(np.float64)
-        highs = df["high"].to_numpy().astype(np.float64)
-        lows = df["low"].to_numpy().astype(np.float64)
+        closes = df["close"].to_numpy(zero_copy_only=False).astype(np.float64)
+        highs = df["high"].to_numpy(zero_copy_only=False).astype(np.float64)
+        lows = df["low"].to_numpy(zero_copy_only=False).astype(np.float64)
 
         atr = _compute_atr(highs, lows, closes)
 
@@ -440,8 +440,8 @@ class EntryTimingOptimizer:
         Uses the empirical distribution of recent lows (for longs) or
         highs (for shorts) over the patience window.
         """
-        highs = df["high"].to_numpy().astype(np.float64)
-        lows = df["low"].to_numpy().astype(np.float64)
+        highs = df["high"].to_numpy(zero_copy_only=False).astype(np.float64)
+        lows = df["low"].to_numpy(zero_copy_only=False).astype(np.float64)
 
         lookback = min(len(highs), max(self.patience_bars * 4, 20))
 
@@ -559,7 +559,9 @@ class EntryTimingOptimizer:
             # Determine which bins this bar spans
             lo_idx = max(0, int((bar_lo - price_min) / (price_max - price_min) * _VOLUME_PROFILE_BINS))
             hi_idx = min(_VOLUME_PROFILE_BINS - 1, int((bar_hi - price_min) / (price_max - price_min) * _VOLUME_PROFILE_BINS))
-            n_bins = hi_idx - lo_idx + 1
+            if hi_idx < lo_idx:
+                continue
+            n_bins = max(1, hi_idx - lo_idx + 1)
             profile[lo_idx : hi_idx + 1] += bar_vol / n_bins
 
         poc_idx = int(np.argmax(profile))

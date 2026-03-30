@@ -851,8 +851,13 @@ def main():
     lock_fh = None
     try:
         lock_fh = open(lock_path, "w")  # noqa: SIM115 — lock must stay open for process lifetime
-        import msvcrt
-        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        import sys as _sys
+        if _sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         lock_fh.write(str(os.getpid()))
         lock_fh.flush()
     except (OSError, IOError):

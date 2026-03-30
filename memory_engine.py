@@ -148,8 +148,12 @@ def learn_pattern(text: str, success: bool, duration_ms: float = 0.0) -> None:
     if not text or len(text) < 2:
         return
     key = text.strip()[:120]
-    mem = get_memory()
+    # Hold the lock for the entire read-modify-write to avoid races
     with _lock:
+        global _memory
+        if _memory is None:
+            _memory = _load()
+        mem = _memory
         # Find existing pattern
         for p in mem["patterns"]:
             if p["text"] == key:

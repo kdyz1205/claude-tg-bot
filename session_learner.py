@@ -173,7 +173,23 @@ class SessionLearner:
             },
         }
 
+    # Maximum entries per knowledge list to prevent unbounded growth
+    _MAX_PATTERNS = 1000
+    _MAX_STRATEGIES = 500
+    _MAX_SUMMARIES = 200
+    _MAX_SKILL_GAPS = 100
+
     def _save_knowledge(self):
+        # Enforce caps before saving — prune oldest entries
+        k = self._knowledge
+        if len(k.get("patterns", [])) > self._MAX_PATTERNS:
+            k["patterns"] = k["patterns"][-self._MAX_PATTERNS:]
+        if len(k.get("strategies", [])) > self._MAX_STRATEGIES:
+            k["strategies"] = k["strategies"][-self._MAX_STRATEGIES:]
+        if len(k.get("session_summaries", [])) > self._MAX_SUMMARIES:
+            k["session_summaries"] = k["session_summaries"][-self._MAX_SUMMARIES:]
+        if len(k.get("skill_gaps", [])) > self._MAX_SKILL_GAPS:
+            k["skill_gaps"] = k["skill_gaps"][-self._MAX_SKILL_GAPS:]
         _atomic_save(_KNOWLEDGE_FILE, self._knowledge)
 
     # =====================================================================

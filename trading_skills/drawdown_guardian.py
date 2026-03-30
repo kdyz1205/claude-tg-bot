@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -111,7 +112,7 @@ class DrawdownGuardian:
         self.vol_scale: bool = vol_scale
 
         # --- equity tracking ---
-        self.equity_curve: List[Tuple[float, float]] = []
+        self.equity_curve: deque[Tuple[float, float]] = deque(maxlen=self._MAX_CURVE_LEN)
         self.peak_equity: float = 0.0
         self.current_dd: float = 0.0        # current drawdown fraction
         self.alert_level: AlertLevel = AlertLevel.NORMAL
@@ -159,8 +160,6 @@ class DrawdownGuardian:
 
         # --- update equity curve (ring buffer) ---
         self.equity_curve.append((ts, equity))
-        if len(self.equity_curve) > self._MAX_CURVE_LEN:
-            self.equity_curve = self.equity_curve[-self._MAX_CURVE_LEN:]
 
         # --- initialise daily start if needed ---
         if self.daily_start_equity <= 0:

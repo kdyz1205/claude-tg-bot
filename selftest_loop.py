@@ -348,6 +348,10 @@ def main():
         token = chat_id = None
         for line in env_file.read_text(encoding="utf-8").split("\n"):
             line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
             if line.startswith("TELEGRAM_BOT_TOKEN="):
                 token = line.split("=", 1)[1].strip().strip('"\'')
             if line.startswith("AUTHORIZED_USER_ID="):

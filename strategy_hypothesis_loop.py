@@ -13,6 +13,7 @@ Usage:  python strategy_hypothesis_loop.py
 
 import asyncio
 import json
+import os
 import sys
 import time
 import math
@@ -358,6 +359,8 @@ def record_experiment(experiment: dict):
     """Append experiment to JSONL log."""
     with open(RESULTS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(experiment, ensure_ascii=False, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 async def run_hypothesis_loop(n_hypotheses: int = 3):

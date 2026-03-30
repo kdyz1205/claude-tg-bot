@@ -15,6 +15,11 @@ import time
 from datetime import datetime
 from typing import Callable, Coroutine
 
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 SYMBOLS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
@@ -94,9 +99,7 @@ class MarketMonitor:
 
     async def _check_all(self) -> None:
         """Fetch tickers for all symbols and evaluate alert conditions."""
-        try:
-            import httpx
-        except ImportError:
+        if httpx is None:
             logger.error("httpx not installed — market monitor cannot fetch prices")
             return
 

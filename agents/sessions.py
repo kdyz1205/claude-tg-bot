@@ -77,13 +77,12 @@ class Session:
                     await proc.wait()
                 except Exception:
                     pass
-            self.busy = False
             return f"Session '{self.name}' timed out ({timeout}s)"
         except Exception as e:
-            self.busy = False
             return f"Session '{self.name}' error: {e}"
+        finally:
+            self.busy = False
 
-        self.busy = False
         raw = stdout.decode("utf-8", errors="replace").strip()
         if not raw:
             return "No output"

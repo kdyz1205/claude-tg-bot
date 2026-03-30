@@ -489,8 +489,8 @@ def main():
                 log.info(f"✅ 任务完成: {task['name']}")
                 tg(f"✅ Phase{phase}-{task_index+1} 完成: {task['name']}")
 
-                completed = state.get("completed_tasks", []) + [task_id]
-                state["completed_tasks"] = completed[-200:]  # keep only last 200
+                completed_list = state.get("completed_tasks", []) + [task_id]
+                state["completed_tasks"] = completed_list[-200:]  # keep only last 200
                 state["task_index"] = task_index + 1
                 state["consecutive_failures"] = 0
                 save_state(state)
@@ -507,7 +507,7 @@ def main():
                 if failures >= 3:
                     log.error(f"❌ 任务连续失败3次，跳过: {task['name']}")
                     tg(f"⚠️ 跳过失败任务: {task['name']}（将在下轮重试）")
-                    state["failed_tasks"] = state.get("failed_tasks", []) + [task_id]
+                    state["failed_tasks"] = (state.get("failed_tasks", []) + [task_id])[-200:]
                     state["task_index"] = task_index + 1
                     state["consecutive_failures"] = 0
                     save_state(state)

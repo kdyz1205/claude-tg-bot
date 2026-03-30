@@ -292,13 +292,17 @@ async def _apply_syntax_fix(
         })
         return False
 
-    # Backup original
+    # Backup original (atomic: write to tmp, fsync, then rename)
     backup_path = file_path + f".bak.{int(time.time())}"
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             original = f.read()
-        with open(backup_path, "w", encoding="utf-8") as f:
+        tmp_backup = backup_path + ".tmp"
+        with open(tmp_backup, "w", encoding="utf-8") as f:
             f.write(original)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_backup, backup_path)
     except Exception as exc:
         logger.warning("self_repair: backup failed for %s: %s", file_path, exc)
 

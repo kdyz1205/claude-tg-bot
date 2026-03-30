@@ -124,7 +124,11 @@ class SessionState:
         import dataclasses
         valid_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in valid_fields}
-        filtered["status"] = SessionStatus(filtered.get("status", "active"))
+        try:
+            filtered["status"] = SessionStatus(filtered.get("status", "active"))
+        except ValueError:
+            logger.warning("Invalid SessionStatus value %r, falling back to 'active'", filtered.get("status"))
+            filtered["status"] = SessionStatus("active")
         return cls(**filtered)
 
 

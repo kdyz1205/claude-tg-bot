@@ -33,7 +33,10 @@ Usage:
 from __future__ import annotations
 
 import re
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -115,6 +118,8 @@ class Harness:
     @classmethod
     def from_config(cls, config_path: str | Path) -> Harness:
         """Create a Harness from a YAML config file."""
+        if yaml is None:
+            raise ImportError("PyYAML required: pip install pyyaml")
         path = Path(config_path)
         if not path.exists():
             raise FileNotFoundError(f"Harness config not found: {path}")
@@ -130,7 +135,11 @@ class Harness:
         # Set loop mode
         loop_config = config.get("loop", {})
         mode_str = loop_config.get("mode", "self")
-        harness.loop_mode = LoopMode(mode_str)
+        try:
+            harness.loop_mode = LoopMode(mode_str)
+        except ValueError:
+            valid = [m.value for m in LoopMode]
+            raise ValueError(f"Invalid loop mode '{mode_str}'. Valid modes: {valid}")
         harness.max_iterations = loop_config.get("max_iterations", 10)
         harness.convergence_threshold = loop_config.get("convergence_threshold", 0.9)
 
@@ -220,6 +229,8 @@ class Harness:
 
     def to_yaml(self) -> str:
         """Export the current harness configuration as YAML."""
+        if yaml is None:
+            raise ImportError("PyYAML required: pip install pyyaml")
         config = {
             "name": self.name,
             "channel": {

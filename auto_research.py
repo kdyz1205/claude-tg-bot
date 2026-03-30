@@ -561,8 +561,12 @@ def _save_hypothesis(hypothesis: dict):
             if os.path.exists(HYPOTHESES_FILE) and os.path.getsize(HYPOTHESES_FILE) > 512 * 1024:
                 with open(HYPOTHESES_FILE, "r", encoding="utf-8") as f:
                     lines = f.readlines()
-                with open(HYPOTHESES_FILE, "w", encoding="utf-8") as f:
+                tmp_hyp = HYPOTHESES_FILE + ".tmp"
+                with open(tmp_hyp, "w", encoding="utf-8") as f:
                     f.writelines(lines[len(lines) // 2:])
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_hyp, HYPOTHESES_FILE)
         except Exception:
             pass
         with open(HYPOTHESES_FILE, "a", encoding="utf-8") as f:
@@ -750,7 +754,12 @@ async def _learn_domain(domains: list, doc_urls: list):
         try:
             raw = await _run_claude_raw(prompt=prompt, model="claude-haiku-4-5-20251001", timeout=20)
             if raw and len(raw) > 100:
-                Path(kb_file).write_text(raw, encoding="utf-8")
+                tmp_kb = kb_file + ".tmp"
+                Path(tmp_kb).write_text(raw, encoding="utf-8")
+                with open(tmp_kb, "rb+") as _fh:
+                    _fh.flush()
+                    os.fsync(_fh.fileno())
+                os.replace(tmp_kb, kb_file)
                 logger.info(f"Knowledge learned: {domain} ({len(raw)} chars) → {kb_file}")
         except Exception as e:
             logger.debug(f"Failed to learn {domain}: {e}")
