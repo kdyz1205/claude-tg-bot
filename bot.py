@@ -4766,7 +4766,7 @@ def main():
             if getattr(config, "HEARTBEAT_ENABLED", True):
                 async def _heartbeat_loop():
                     """Periodic self-test. If the bot can't respond to itself, auto-restart."""
-                    import os as _hb_os
+                    # os already imported at module level
                     interval = getattr(config, "HEARTBEAT_INTERVAL", 1800)
                     timeout = getattr(config, "HEARTBEAT_TIMEOUT", 60)
                     _consecutive_failures = 0
@@ -4805,7 +4805,7 @@ def main():
                             except Exception:
                                 pass
                             # Exit with non-zero code so run.py restarts us
-                            _hb_os._exit(1)
+                            os._exit(1)
 
                 _hb_task = asyncio.create_task(_heartbeat_loop())
                 _track_task(application.bot_data, _hb_task)
@@ -4907,6 +4907,31 @@ def main():
         try:
             if _smart_tracker_available and _smart_tracker is not None and _smart_tracker.running:
                 await _smart_tracker.stop()
+        except Exception:
+            pass
+        # Stop self_monitor
+        try:
+            if self_monitor._running:
+                await self_monitor.stop()
+        except Exception:
+            pass
+        # Stop market_monitor
+        try:
+            if market_monitor._running:
+                await market_monitor.stop()
+        except Exception:
+            pass
+        # Stop MetaLearner
+        try:
+            import meta_learner as _meta_learner
+            if _meta_learner.meta_learner._running:
+                await _meta_learner.meta_learner.stop()
+        except Exception:
+            pass
+        # Stop ProfitTracker
+        try:
+            if _profit_tracker.profit_tracker.running:
+                await _profit_tracker.profit_tracker.stop()
         except Exception:
             pass
         # Stop EvolveWatcher subprocess
