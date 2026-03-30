@@ -70,8 +70,12 @@ def load_pro_config() -> dict:
 
 def _save_pro_perf(perf: dict) -> None:
     try:
-        with open(PRO_PERF_FILE, "w", encoding="utf-8") as f:
+        _tmp = PRO_PERF_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
             json.dump(perf, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, PRO_PERF_FILE)
     except Exception:
         pass
 
@@ -90,16 +94,19 @@ def _load_pro_perf() -> dict:
 # DATA FETCHING (multi-exchange, parallel)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Shared httpx client for pro strategy scans (created per scan cycle)
+_pro_client: Optional[httpx.AsyncClient] = None
+
 async def _fetch_okx(symbol: str, bar: str = "1H", limit: int = 100) -> list:
     try:
-        async with httpx.AsyncClient(timeout=12) as c:
-            r = await c.get(
-                "https://www.okx.com/api/v5/market/candles",
-                params={"instId": symbol, "bar": bar, "limit": str(limit)},
-            )
-            data = r.json()
-            if data.get("code") == "0":
-                return list(reversed(data.get("data", [])))
+        c = _pro_client or httpx.AsyncClient(timeout=12)
+        r = await c.get(
+            "https://www.okx.com/api/v5/market/candles",
+            params={"instId": symbol, "bar": bar, "limit": str(limit)},
+        )
+        data = r.json()
+        if data.get("code") == "0":
+            return list(reversed(data.get("data", [])))
     except Exception as e:
         logger.debug("pro_fetch_okx %s: %s", symbol, e)
     return []
@@ -107,18 +114,18 @@ async def _fetch_okx(symbol: str, bar: str = "1H", limit: int = 100) -> list:
 
 async def _fetch_orderbook(symbol: str, depth: int = 50) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
-                "https://www.okx.com/api/v5/market/books",
-                params={"instId": symbol, "sz": str(depth)},
-            )
-            data = r.json()
-            if data.get("code") == "0" and data.get("data"):
-                book = data["data"][0]
-                return {
-                    "bids": [[float(b[0]), float(b[1])] for b in book.get("bids", [])],
-                    "asks": [[float(a[0]), float(a[1])] for a in book.get("asks", [])],
-                }
+        c = _pro_client or httpx.AsyncClient(timeout=10)
+        r = await c.get(
+            "https://www.okx.com/api/v5/market/books",
+            params={"instId": symbol, "sz": str(depth)},
+        )
+        data = r.json()
+        if data.get("code") == "0" and data.get("data"):
+            book = data["data"][0]
+            return {
+                "bids": [[float(b[0]), float(b[1])] for b in book.get("bids", [])],
+                "asks": [[float(a[0]), float(a[1])] for a in book.get("asks", [])],
+            }
     except Exception as e:
         logger.debug("pro_fetch_ob %s: %s", symbol, e)
     return {}
@@ -127,17 +134,15 @@ async def _fetch_orderbook(symbol: str, depth: int = 50) -> dict:
 async def _fetch_funding_rate(symbol: str) -> Optional[float]:
     """Funding rate — positive = longs pay shorts (bearish crowd), negative = bullish crowd."""
     try:
-        inst = symbol.replace("USDT", "USDT-SWAP").replace("-USDT-SWAP", "-USDT-SWAP")
-        if not inst.endswith("-SWAP"):
-            inst = symbol.replace("-USDT", "-USDT-SWAP")
-        async with httpx.AsyncClient(timeout=8) as c:
-            r = await c.get(
-                "https://www.okx.com/api/v5/public/funding-rate",
-                params={"instId": inst},
-            )
-            data = r.json()
-            if data.get("code") == "0" and data.get("data"):
-                return float(data["data"][0].get("fundingRate", 0))
+        inst = symbol + "-SWAP" if not symbol.endswith("-SWAP") else symbol
+        c = _pro_client or httpx.AsyncClient(timeout=8)
+        r = await c.get(
+            "https://www.okx.com/api/v5/public/funding-rate",
+            params={"instId": inst},
+        )
+        data = r.json()
+        if data.get("code") == "0" and data.get("data"):
+            return float(data["data"][0].get("fundingRate", 0))
     except Exception:
         pass
     return None
@@ -147,14 +152,14 @@ async def _fetch_long_short_ratio(symbol: str) -> Optional[float]:
     """OKX long/short account ratio. >1 = more longs, <1 = more shorts."""
     try:
         ccy = symbol.split("-")[0]
-        async with httpx.AsyncClient(timeout=8) as c:
-            r = await c.get(
-                "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio",
-                params={"ccy": ccy, "period": "1H"},
-            )
-            data = r.json()
-            if data.get("code") == "0" and data.get("data"):
-                return float(data["data"][0][1])  # [ts, ratio]
+        c = _pro_client or httpx.AsyncClient(timeout=8)
+        r = await c.get(
+            "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio",
+            params={"ccy": ccy, "period": "1H"},
+        )
+        data = r.json()
+        if data.get("code") == "0" and data.get("data"):
+            return float(data["data"][0][1])  # [ts, ratio]
     except Exception:
         pass
     return None
@@ -206,7 +211,7 @@ def _rsi(closes: list, period: int = 14) -> Optional[float]:
         return 100.0
     ag = sum(gains[-period:]) / period
     al = sum(losses[-period:]) / period
-    if al == 0:
+    if al < 1e-12:
         return 100.0
     return round(100 - 100 / (1 + ag / al), 2)
 
@@ -222,11 +227,11 @@ def _rsi_series(closes: list, period: int = 14) -> list:
         losses.append(max(-d, 0))
     ag = sum(gains[:period]) / period
     al = sum(losses[:period]) / period
-    result.append(100.0 if al == 0 else round(100 - 100 / (1 + ag / al), 2))
+    result.append(100.0 if al < 1e-12 else round(100 - 100 / (1 + ag / al), 2))
     for i in range(period, len(gains)):
         ag = (ag * (period - 1) + gains[i]) / period
         al = (al * (period - 1) + losses[i]) / period
-        result.append(100.0 if al == 0 else round(100 - 100 / (1 + ag / al), 2))
+        result.append(100.0 if al < 1e-12 else round(100 - 100 / (1 + ag / al), 2))
     return result
 
 
@@ -697,15 +702,22 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
 
 async def scan_all_pro(cfg: dict = None) -> list:
     """Scan all symbols with pro strategies, return ranked signals."""
+    global _pro_client
     if cfg is None:
         cfg = load_pro_config()
-    tasks = [analyze_symbol(sym, cfg) for sym in cfg["symbols"]]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Share one HTTP client across all symbol scans (reduces 60+ connections to 1)
+    async with httpx.AsyncClient(timeout=12) as client:
+        _pro_client = client
+        try:
+            tasks = [analyze_symbol(sym, cfg) for sym in cfg["symbols"]]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            _pro_client = None
     signals = []
     for r in results:
         if isinstance(r, dict):
             signals.append(r)
-    signals.sort(key=lambda x: x["combined_score"], reverse=True)
+    signals.sort(key=lambda x: x.get("combined_score", 0), reverse=True)
     return signals
 
 

@@ -79,10 +79,22 @@ def _get_repair_stats() -> dict:
     return {"total": total, "ok": ok, "rate": rate}
 
 
+_MAX_REPAIR_LOG_LINES = 5000
+
+
 def _append_repair_log(record: dict) -> None:
     try:
         with REPAIR_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        # Truncate if too many lines
+        try:
+            with REPAIR_LOG.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > _MAX_REPAIR_LOG_LINES:
+                with REPAIR_LOG.open("w", encoding="utf-8") as f:
+                    f.writelines(lines[-_MAX_REPAIR_LOG_LINES:])
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning("self_repair: failed to write repair log: %s", exc)
 

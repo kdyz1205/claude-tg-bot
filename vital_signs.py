@@ -245,8 +245,10 @@ def record_task(success: bool, duration_ms: float = 0):
 
         _state["last_heartbeat"] = now
 
-    # Debounced evaluate + save
-    if _state["total_tasks"] % 5 == 0:
+    # Debounced evaluate + save (check inside lock scope to avoid race)
+    with _lock:
+        _should_eval = _state.get("total_tasks", 0) % 5 == 0
+    if _should_eval:
         evaluate_state()
 
 

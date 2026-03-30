@@ -7,7 +7,10 @@ Teacher讲解 -> Manager审查 -> loop直到满意
 import anyio
 import json
 import re
-from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+try:
+    from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+except ImportError:
+    query = ClaudeAgentOptions = ResultMessage = None
 
 MODEL = "claude-opus-4-6"
 
@@ -99,4 +102,5 @@ async def main():
     final = await run_loop(topic, max_rounds=3)
     print(f"\n=== Final Output ===\n{final}")
 
-anyio.run(main)
+if __name__ == "__main__":
+    anyio.run(main)

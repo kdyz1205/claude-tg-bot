@@ -201,7 +201,7 @@ def _classify_erc20(tx: dict, address: str) -> Optional[dict]:
     if token not in _STABLECOINS:
         return None  # no free per-token price source; skip
     try:
-        decimals = min(int(tx.get("tokenDecimal", 18)), 18)
+        decimals = max(0, min(int(tx.get("tokenDecimal", 18)), 18))
         amount_usd = int(tx.get("value", "0")) / (10 ** decimals)
     except Exception:
         return None
@@ -305,8 +305,12 @@ class OnchainTracker:
 
     def _save_addresses(self):
         try:
-            with open(ADDRESSES_FILE, "w", encoding="utf-8") as f:
+            _tmp = ADDRESSES_FILE + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 json.dump(self._addresses, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(_tmp, ADDRESSES_FILE)
         except Exception as e:
             logger.warning("OnchainTracker: save addresses failed: %s", e)
 
@@ -344,8 +348,12 @@ class OnchainTracker:
         cutoff = time.time() - 86400
         self._signals = [s for s in self._signals if s.get("timestamp", 0) >= cutoff]
         try:
-            with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
+            _tmp = SIGNALS_FILE + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 json.dump(self._signals, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(_tmp, SIGNALS_FILE)
         except Exception as e:
             logger.warning("OnchainTracker: save signals failed: %s", e)
 
@@ -409,6 +417,10 @@ class OnchainTracker:
                 logger.debug("scan_address %s error: %s", address[:8], e)
             await asyncio.sleep(1)  # rate-limit buffer
 
+        if new_signals:
+            # Dedup by tx_hash to avoid recording same transaction twice
+            existing_hashes = {s.get("tx_hash") for s in self._signals if s.get("tx_hash")}
+            new_signals = [s for s in new_signals if s.get("tx_hash") not in existing_hashes]
         if new_signals:
             self._signals.extend(new_signals)
             self._save_signals()

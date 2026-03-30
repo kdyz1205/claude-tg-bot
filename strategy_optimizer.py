@@ -106,8 +106,12 @@ def _load_json(path: str, default=None):
 
 
 def _save_json(path: str, data) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    _tmp = path + ".tmp"
+    with open(_tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(_tmp, path)
 
 
 def _load_signal_history() -> list:
@@ -197,7 +201,7 @@ def _rsi_arr(closes, period):
     avg_gain = float(np.mean(gains[:period]))
     avg_loss = float(np.mean(losses[:period]))
     def _to_rsi(ag, al):
-        return 100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al)
+        return 100.0 if al < 1e-12 else 100.0 - 100.0 / (1.0 + ag / al)
     out[period] = _to_rsi(avg_gain, avg_loss)
     for i in range(period + 1, n):
         avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
@@ -886,6 +890,7 @@ def compute_optimized_config(signals: list, stats: dict, cfg: dict) -> tuple:
             tf_stats.setdefault(tf, {"wins": 0, "total": 0})
             tf_stats[tf]["wins"]  += d.get("wins", 0)
             tf_stats[tf]["total"] += d.get("total", 0)
+    tf_stats = {k: v for k, v in tf_stats.items() if v.get("total", 0) > 0}
     if tf_stats:
         best_tf = max(tf_stats, key=lambda t: tf_stats[t]["wins"] / tf_stats[t]["total"])
         if best_tf != cfg.get("timeframe"):

@@ -75,12 +75,24 @@ def _save_json(path: str, data) -> None:
             pass
 
 
+_MAX_CHANGELOG_LINES = 5000
+
+
 def _append_changelog(entry: dict) -> None:
-    """Append one entry to .evolution_changelog.jsonl"""
+    """Append one entry to .evolution_changelog.jsonl (truncated to last _MAX_CHANGELOG_LINES)."""
     entry["timestamp"] = datetime.now().isoformat()
     try:
         with open(EVOLUTION_CHANGELOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        # Truncate if too many lines
+        try:
+            with open(EVOLUTION_CHANGELOG, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > _MAX_CHANGELOG_LINES:
+                with open(EVOLUTION_CHANGELOG, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-_MAX_CHANGELOG_LINES:])
+        except Exception:
+            pass
     except Exception as e:
         logger.warning(f"Failed to append changelog: {e}")
 

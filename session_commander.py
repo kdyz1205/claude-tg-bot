@@ -3,8 +3,14 @@ Session Commander v4.0 - Bulletproof Session Targeting + Smart Rate Limit Schedu
 Controls Claude Code sessions with adaptive sidebar detection.
 Uses OCR-based session identification with safety guards against mis-clicks.
 """
-import pyautogui
-import pyperclip
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None
 import re
 import time
 import os

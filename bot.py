@@ -259,9 +259,38 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
+# --- Safe send helpers -----------------------------------------------------------
+
+async def _safe_reply(message, text, **kwargs):
+    """Send with Markdown, fallback to plain text on parse error."""
+    if not message:
+        return
+    try:
+        return await message.reply_text(text[:4096], **kwargs)
+    except Exception:
+        kwargs.pop("parse_mode", None)
+        try:
+            return await message.reply_text(text[:4096], **kwargs)
+        except Exception:
+            pass
+
+async def _safe_send(bot, chat_id, text, **kwargs):
+    """Send with Markdown, fallback to plain text on parse error."""
+    try:
+        return await bot.send_message(chat_id, text[:4096], **kwargs)
+    except Exception:
+        kwargs.pop("parse_mode", None)
+        try:
+            return await bot.send_message(chat_id, text[:4096], **kwargs)
+        except Exception:
+            pass
+
+
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         await update.message.reply_text(
             "🤖 Remote Controller v3.0\n\n"
@@ -289,6 +318,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick health check — responds instantly."""
+    if not update.message:
+        return
     try:
         import time
         start = time.time()
@@ -300,6 +331,8 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         claude_agent.clear_history(update.effective_chat.id)
         await update.message.reply_text("✅ 对话已清空，新会话已开始。")
@@ -313,6 +346,8 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kill any stuck Claude CLI process and clear the queue."""
+    if not update.message:
+        return
     try:
         chat_id = update.effective_chat.id
         claude_agent._pending_messages.pop(chat_id, None)
@@ -343,6 +378,8 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/tasks — show running and queued tasks."""
+    if not update.message:
+        return
     try:
         chat_id = update.effective_chat.id
         status = claude_agent.get_task_status()
@@ -394,6 +431,8 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cancel [task_id] — cancel queued tasks."""
+    if not update.message:
+        return
     try:
         chat_id = update.effective_chat.id
         args = context.args or []
@@ -423,6 +462,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         await _send_status(context, update.effective_chat.id)
     except Exception as e:
@@ -434,6 +475,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         if not context.args:
             await update.message.reply_text(
@@ -460,6 +503,8 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         valid = list(PROVIDER_DISPLAY.keys())
         if not context.args:
@@ -494,6 +539,8 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         await update.message.reply_text(
             "🤖 我能做什么:\n\n"
@@ -511,19 +558,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show quota status for all AI platforms."""
+    if not update.message:
+        return
     try:
         from tracker.quota import QuotaTracker
         qt = QuotaTracker()
         report = qt.status_report()
         rate_info = ""
         if claude_agent.is_rate_limited():
-            remaining = int(claude_agent._rate_limited_until - time.time())
+            remaining = max(0, int(claude_agent._rate_limited_until - time.time()))
             rate_info = f"\n⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
         await update.message.reply_text(f"📊 AI 平台用量\n{rate_info}\n{report}")
     except Exception as e:
         rate_info = ""
         if claude_agent.is_rate_limited():
-            remaining = int(claude_agent._rate_limited_until - time.time())
+            remaining = max(0, int(claude_agent._rate_limited_until - time.time()))
             rate_info = f"⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
         await update.message.reply_text(f"📊 Quota\n{rate_info}\nHarness 未初始化 (首次限速时自动启动)")
 
@@ -535,6 +584,8 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /sessions ask <name> <question>  - ask a specific session a question
     /sessions delegate <name> <task> - delegate task to a session
     """
+    if not update.message:
+        return
     try:
         return await _sessions_command_impl(update, context)
     except Exception as e:
@@ -545,6 +596,8 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def _sessions_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not _session_learner_available:
         await update.message.reply_text("session_learner module not available.")
         return
@@ -636,6 +689,8 @@ async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /learn report        - show intelligence report
     /learn gaps          - show skill gaps and training curriculum
     """
+    if not update.message:
+        return
     try:
         return await _learn_command_impl(update, context)
     except Exception as e:
@@ -646,6 +701,8 @@ async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not _session_learner_available:
         await update.message.reply_text("session_learner module not available.")
         return
@@ -767,6 +824,8 @@ async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show agent performance scores and insights."""
+    if not update.message:
+        return
     try:
         import harness_learn
         scores = harness_learn.get_recent_scores(10)
@@ -824,6 +883,8 @@ async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Self-training curriculum system."""
+    if not update.message:
+        return
     try:
         import auto_train
     except ImportError:
@@ -893,6 +954,8 @@ async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         if not context.args:
             harness = "✅ 开启" if config.HARNESS_MODE else "❌ 关闭"
@@ -950,6 +1013,8 @@ PANEL_CATEGORIES = [
 
 async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the main command panel with category buttons."""
+    if not update.message:
+        return
     try:
         rows = []
         for i in range(0, len(PANEL_CATEGORIES), 2):
@@ -1198,7 +1263,7 @@ async def _send_status_impl(context, chat_id):
 
     rate_info = ""
     if claude_agent.is_rate_limited():
-        remaining = int(claude_agent._rate_limited_until - time.time())
+        remaining = max(0, int(claude_agent._rate_limited_until - time.time()))
         rate_info = f"\n⚠️ CLI限速: 还剩 {remaining}s"
 
     # Bot uptime
@@ -1679,6 +1744,8 @@ async def _send_session_control(context, chat_id):
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send current performance stats. Dashboard at http://localhost:8080"""
+    if not update.message:
+        return
     try:
         if _dashboard_available:
             text = _dashboard.get_stats_text()
@@ -1696,6 +1763,8 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detailed health check command."""
+    if not update.message:
+        return
     try:
         await _send_health(context, update.effective_chat.id)
     except Exception as e:
@@ -1708,6 +1777,8 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def vital_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show vital signs — the 5 invariants of 'being alive'."""
+    if not update.message:
+        return
     try:
         import vital_signs
         text = vital_signs.get_status_text()
@@ -1722,6 +1793,8 @@ async def vital_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show trading positions."""
+    if not update.message:
+        return
     try:
         await _send_portfolio(context, update.effective_chat.id)
     except Exception as e:
@@ -1734,6 +1807,8 @@ async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show latest trading signals."""
+    if not update.message:
+        return
     try:
         await _send_signals(context, update.effective_chat.id)
     except Exception as e:
@@ -1746,6 +1821,8 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def signal_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show 24h signal accuracy statistics."""
+    if not update.message:
+        return
     try:
         from signal_engine import format_signal_stats
         text = format_signal_stats()
@@ -1763,6 +1840,8 @@ async def signal_stats_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def alpha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Immediately scan for current top Alpha opportunities."""
+    if not update.message:
+        return
     try:
         if not _alpha_available or _scan_alpha is None:
             await update.message.reply_text("❌ Alpha引擎模块不可用。")
@@ -1806,6 +1885,8 @@ async def alpha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def onchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Onchain filter — scan DEXScreener with strict volume/liquidity/mcap criteria."""
+    if not update.message:
+        return
     try:
         from alpha_engine import scan_onchain_filter, format_onchain_filter_report
         await update.message.reply_text("🔗 Onchain Filter 扫描中...(Liq/MCap/量能筛选)")
@@ -1822,6 +1903,8 @@ async def onchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def arb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show today's arbitrage summary + live top-5 spreads."""
+    if not update.message:
+        return
     try:
         if not _arb_available or _arb_engine is None:
             await update.message.reply_text("❌ 套利引擎模块不可用。")
@@ -1859,6 +1942,8 @@ async def arb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def whales_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show 24h on-chain smart money activity."""
+    if not update.message:
+        return
     try:
         if not _whale_available or _whale_tracker is None:
             await update.message.reply_text("⚠️ 链上追踪器未启动")
@@ -1876,6 +1961,8 @@ async def whales_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a custom whale address to monitor. Usage: /track <address> [label]"""
+    if not update.message:
+        return
     try:
         if not _whale_available or _whale_tracker is None:
             await update.message.reply_text("⚠️ 链上追踪器未启动")
@@ -1912,6 +1999,8 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show smart money wallet list and recent buy activity. /wallets"""
+    if not update.message:
+        return
     try:
         if not _smart_tracker_available or _smart_tracker is None:
             await update.message.reply_text("⚠️ 聪明钱追踪器未启动")
@@ -1929,6 +2018,8 @@ async def wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a smart money wallet to track. Usage: /addwallet <address> [label]"""
+    if not update.message:
+        return
     try:
         if not _smart_tracker_available or _smart_tracker is None:
             await update.message.reply_text("⚠️ 聪明钱追踪器未启动")
@@ -1968,6 +2059,8 @@ async def addwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate and send signal performance report."""
+    if not update.message:
+        return
     try:
         await _send_profit_report(context, update.effective_chat.id)
     except Exception as e:
@@ -1980,6 +2073,8 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show signal win-rate trend, current param version, and optimization rounds."""
+    if not update.message:
+        return
     try:
         if not _optimizer_available:
             await update.message.reply_text("❌ strategy_optimizer 模块不可用")
@@ -2000,6 +2095,8 @@ async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show risk metrics."""
+    if not update.message:
+        return
     try:
         await _send_risk(context, update.effective_chat.id)
     except Exception as e:
@@ -2012,6 +2109,8 @@ async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def codex_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Codex自充能 — 显示状态或手动触发Codex进化任务。"""
+    if not update.message:
+        return
     try:
         if not _codex_available:
             await update.message.reply_text("❌ codex_charger 模块不可用")
@@ -2077,6 +2176,8 @@ async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /optimize ga       — P3_24 Genetic Algorithm optimization
     /optimize history  — show Phase 1 optimization history
     """
+    if not update.message:
+        return
     try:
         if not _optimizer_available:
             await update.message.reply_text("❌ strategy_optimizer 模块不可用")
@@ -2119,6 +2220,8 @@ async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def selfcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check critical files exist and have valid Python syntax."""
+    if not update.message:
+        return
     try:
         import ast
         base = os.path.dirname(os.path.abspath(__file__))
@@ -2171,6 +2274,8 @@ async def selfcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def repairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show recent auto-repair history from CodeSelfRepair."""
+    if not update.message:
+        return
     try:
         n = 10
         if context.args:
@@ -2208,6 +2313,8 @@ async def repairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def repair_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show code health status and repair history (/repair_status)."""
+    if not update.message:
+        return
     try:
         if not _self_repair_available:
             await update.message.reply_text("⚠️ self_repair module not available.")
@@ -2229,6 +2336,8 @@ async def repair_status_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def evostatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show this week's self-evolution stats (/evostatus). Pass 'run' to trigger immediately."""
+    if not update.message:
+        return
     try:
         if not _self_repair_available:
             await update.message.reply_text("⚠️ self_repair module not available.")
@@ -2260,6 +2369,8 @@ async def evostatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def code_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show code quality scores and pending patches. Pass 'scan' to re-run analysis."""
+    if not update.message:
+        return
     try:
         if not _self_repair_available:
             await update.message.reply_text("⚠️ self_repair module not available.")
@@ -2286,6 +2397,8 @@ async def code_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def selfrepair_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Full syntax scan + auto-repair of all .py files (/selfrepair)."""
+    if not update.message:
+        return
     try:
         if not _self_repair_available:
             await update.message.reply_text("⚠️ self_repair module not available.")
@@ -2335,6 +2448,8 @@ async def token_analyze_command(update: Update, context: ContextTypes.DEFAULT_TY
     Usage: /token_analyze <address> [network] [pool]
     Example: /token_analyze So11...  solana
     """
+    if not update.message:
+        return
     if not context.args:
         await update.message.reply_text(
             "Usage: /token_analyze <token_address> [network] [pool]\n\n"
@@ -2397,6 +2512,8 @@ async def okx_backtest_command(update: Update, context: ContextTypes.DEFAULT_TYP
     Usage: /okx_backtest [timeframe]
     Example: /okx_backtest 1H
     """
+    if not update.message:
+        return
     tf = context.args[0] if context.args else "1H"
     chat_id = update.effective_chat.id
 
@@ -2465,6 +2582,8 @@ async def ma_ribbon_backtest_command(update: Update, context: ContextTypes.DEFAU
     Usage: /ma_ribbon_backtest <symbol> [anchor_tf] [forward_bars] [success_pct]
     Example: /ma_ribbon_backtest BTC 1d 5 2.0
     """
+    if not update.message:
+        return
     if not context.args:
         await update.message.reply_text(
             "Usage: /ma_ribbon_backtest <symbol> [anchor_tf] [forward_bars] [success_pct]\n\n"
@@ -2541,6 +2660,8 @@ async def ma_ribbon_screener_command(update: Update, context: ContextTypes.DEFAU
 
     Usage: /ma_ribbon_screener
     """
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
     msg = await update.message.reply_text(
         "Starting MA Ribbon full-market screener...\n"
@@ -2606,6 +2727,8 @@ async def okx_top30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Usage: /okx_top30
     """
+    if not update.message:
+        return
     msg = await update.message.reply_text("Fetching OKX Top 30 by volume...")
     try:
         import httpx
@@ -2652,6 +2775,8 @@ async def session_control_command(update: Update, context: ContextTypes.DEFAULT_
 
     Usage: /session_control [harness|bridge|api|status]
     """
+    if not update.message:
+        return
     try:
         return await _session_control_impl(update, context)
     except Exception as e:
@@ -2662,6 +2787,8 @@ async def session_control_command(update: Update, context: ContextTypes.DEFAULT_
             pass
 
 async def _session_control_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not context.args:
         # Show interactive panel
         if config.HARNESS_MODE:
@@ -2673,7 +2800,7 @@ async def _session_control_impl(update: Update, context: ContextTypes.DEFAULT_TY
 
         rate_info = ""
         if claude_agent.is_rate_limited():
-            remaining = int(claude_agent._rate_limited_until - time.time())
+            remaining = max(0, int(claude_agent._rate_limited_until - time.time()))
             rate_info = f"\nRate limited: {remaining}s remaining"
 
         sessions_count = len(claude_agent._claude_sessions)
@@ -2743,6 +2870,8 @@ async def _session_control_impl(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Control the self-monitoring system. Usage: /monitor [on|off|status]"""
+    if not update.message:
+        return
     try:
         action = (context.args[0].lower() if context.args else "status")
 
@@ -2775,6 +2904,8 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def proactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Control the proactive agent. Usage: /proactive [on|off|status]"""
+    if not update.message:
+        return
     try:
         from proactive_agent import PROACTIVE_CONFIG
 
@@ -2812,6 +2943,8 @@ async def proactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Control the market monitor. Usage: /market [on|off|status]"""
+    if not update.message:
+        return
     try:
         action = (context.args[0].lower() if context.args else "status")
 
@@ -2852,6 +2985,8 @@ async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def autonomy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Control autonomous agent. Usage: /autonomy [start|stop|status|goal <text>]"""
+    if not update.message:
+        return
     if not _autonomy_available:
         await update.message.reply_text("Autonomy module not available.")
         return
@@ -2904,6 +3039,8 @@ async def autonomy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def consciousness_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Self-awareness report. Usage: /consciousness"""
+    if not update.message:
+        return
     if not _autonomy_available:
         await update.message.reply_text("Consciousness module not available.")
         return
@@ -2939,6 +3076,8 @@ async def consciousness_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Self-evolution: bot analyzes and improves its own code. Usage: /evolve [focus]"""
+    if not update.message:
+        return
     try:
         from agents.loop import self_evolve
         focus = " ".join(context.args) if context.args else ""
@@ -2964,6 +3103,8 @@ async def evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def strategy_evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """GA strategy parameter evolution. Usage: /strategy_evolve"""
+    if not update.message:
+        return
     try:
         from strategy_optimizer import strategy_optimizer, format_ga_result
         chat_id = update.effective_chat.id
@@ -2989,6 +3130,8 @@ async def strategy_evolve_command(update: Update, context: ContextTypes.DEFAULT_
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View or edit bot memory. Usage: /memory [show|shortcuts|patterns|summary <text>|set <key> <value>]"""
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
     args = context.args or []
     subcmd = args[0].lower() if args else "show"
@@ -3055,6 +3198,8 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View synthesized skill library. Usage: /skills [list|stats|top]"""
+    if not update.message:
+        return
     try:
         import skill_library
         args = context.args or []
@@ -3112,6 +3257,8 @@ async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def multi_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Multi-session control. Usage: /ms [list|create <name> <dir>|send <name> <msg>]"""
+    if not update.message:
+        return
     if not _sessions_available:
         await update.message.reply_text("Sessions module not available.")
         return
@@ -3174,6 +3321,8 @@ async def multi_session_command(update: Update, context: ContextTypes.DEFAULT_TY
 # ─── Screenshot & Quick Actions ───────────────────────────────────────────────
 
 async def quick_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         from screenshots import capture_screenshot
     except ImportError:
@@ -3200,6 +3349,8 @@ async def quick_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def quick_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         return await _quick_action_impl(update, context)
     except Exception as e:
@@ -3210,6 +3361,8 @@ async def quick_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def _quick_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📸 截图", callback_data="qa_screenshot"),
@@ -3836,6 +3989,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     try:
         user = update.effective_user
         if not user:
@@ -4304,11 +4459,17 @@ def main():
                     try:
                         await application.bot.send_message(
                             chat_id=config.AUTHORIZED_USER_ID,
-                            text=text[:4000],
+                            text=text[:4096],
                             parse_mode="Markdown",
                         )
                     except Exception:
-                        pass
+                        try:
+                            await application.bot.send_message(
+                                chat_id=config.AUTHORIZED_USER_ID,
+                                text=text[:4096],
+                            )
+                        except Exception:
+                            pass
                 proactive_repair.set_notify_fn(_repair_notify)
                 await proactive_repair.start()
                 logger.info("ProactiveSelfRepair background scanner started")
@@ -4333,11 +4494,17 @@ def main():
                     try:
                         await application.bot.send_message(
                             chat_id=config.AUTHORIZED_USER_ID,
-                            text=text[:4000],
+                            text=text[:4096],
                             parse_mode="Markdown",
                         )
                     except Exception:
-                        pass
+                        try:
+                            await application.bot.send_message(
+                                chat_id=config.AUTHORIZED_USER_ID,
+                                text=text[:4096],
+                            )
+                        except Exception:
+                            pass
                 _arb_engine._send = _arb_send
                 await _arb_engine.start()
                 logger.info("ArbEngine started (OKX/Bybit/Binance WS + REST scanner)")
@@ -4424,11 +4591,17 @@ def main():
                     try:
                         await application.bot.send_message(
                             chat_id=config.AUTHORIZED_USER_ID,
-                            text=text[:4000],
+                            text=text[:4096],
                             parse_mode="Markdown",
                         )
                     except Exception:
-                        pass
+                        try:
+                            await application.bot.send_message(
+                                chat_id=config.AUTHORIZED_USER_ID,
+                                text=text[:4096],
+                            )
+                        except Exception:
+                            pass
 
                 _strategy_optimizer.strategy_optimizer._notify = _optimizer_notify
                 await _strategy_optimizer.strategy_optimizer.start()
@@ -4461,11 +4634,17 @@ def main():
                     try:
                         await application.bot.send_message(
                             chat_id=config.AUTHORIZED_USER_ID,
-                            text=text[:4000],
+                            text=text[:4096],
                             parse_mode="Markdown",
                         )
                     except Exception:
-                        pass
+                        try:
+                            await application.bot.send_message(
+                                chat_id=config.AUTHORIZED_USER_ID,
+                                text=text[:4096],
+                            )
+                        except Exception:
+                            pass
 
                 _alpha_engine._send = _alpha_send
                 await _alpha_engine.start()
@@ -4578,11 +4757,17 @@ def main():
                 try:
                     await application.bot.send_message(
                         chat_id=config.AUTHORIZED_USER_ID,
-                        text=text[:4000],
+                        text=text[:4096],
                         parse_mode="Markdown",
                     )
                 except Exception:
-                    pass
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4096],
+                        )
+                    except Exception:
+                        pass
 
             _meta_learner.meta_learner._send = _meta_send
             await _meta_learner.meta_learner.start()

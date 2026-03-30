@@ -43,8 +43,12 @@ def _load_signals() -> list:
 
 
 def _save_signals(signals: list) -> None:
-    with open(SIGNAL_HISTORY_FILE, "w", encoding="utf-8") as f:
+    _tmp = SIGNAL_HISTORY_FILE + ".tmp"
+    with open(_tmp, "w", encoding="utf-8") as f:
         json.dump(signals, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(_tmp, SIGNAL_HISTORY_FILE)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -261,8 +265,12 @@ def compute_stats(signals: list = None) -> dict:
 def save_performance_stats(stats: dict) -> None:
     """Persist stats to _performance_stats.json."""
     serialisable = json.loads(json.dumps(stats, default=str))
-    with open(PERFORMANCE_STATS_FILE, "w", encoding="utf-8") as f:
+    _tmp = PERFORMANCE_STATS_FILE + ".tmp"
+    with open(_tmp, "w", encoding="utf-8") as f:
         json.dump(serialisable, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(_tmp, PERFORMANCE_STATS_FILE)
 
 
 def format_report(stats: dict, title: str = "信号表现报告") -> str:

@@ -756,7 +756,7 @@ async def _learn_domain(domains: list, doc_urls: list):
             logger.debug(f"Failed to learn {domain}: {e}")
 
 
-_MAX_EXPERIMENTS_LOG_SIZE = 1 * 1024 * 1024  # 1 MB max
+_MAX_EXPERIMENTS_LOG_LINES = 5000
 
 def _log_experiment(experiment: dict, result: dict):
     try:
@@ -768,17 +768,17 @@ def _log_experiment(experiment: dict, result: dict):
             "success": result.get("success", False),
             "summary": result.get("summary", "")[:200],
         }
-        # Truncate if too large
-        try:
-            if os.path.exists(EXPERIMENTS_LOG) and os.path.getsize(EXPERIMENTS_LOG) > _MAX_EXPERIMENTS_LOG_SIZE:
-                with open(EXPERIMENTS_LOG, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                with open(EXPERIMENTS_LOG, "w", encoding="utf-8") as f:
-                    f.writelines(lines[len(lines) // 2:])
-        except Exception:
-            pass
         with open(EXPERIMENTS_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # Truncate if too many lines
+        try:
+            with open(EXPERIMENTS_LOG, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > _MAX_EXPERIMENTS_LOG_LINES:
+                with open(EXPERIMENTS_LOG, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-_MAX_EXPERIMENTS_LOG_LINES:])
+        except Exception:
+            pass
     except Exception:
         pass
 

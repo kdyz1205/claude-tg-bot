@@ -138,13 +138,18 @@ def log_interaction(score: dict):
                 with open(SCORES_FILE, "r", encoding="utf-8") as f:
                     lines = f.readlines()
                 # Keep last half
-                with open(SCORES_FILE, "w", encoding="utf-8") as f:
+                _tmp_trunc = SCORES_FILE + ".tmp"
+                with open(_tmp_trunc, "w", encoding="utf-8") as f:
                     f.writelines(lines[len(lines) // 2:])
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(_tmp_trunc, SCORES_FILE)
         except Exception:
             pass
         with open(SCORES_FILE, "a", encoding="utf-8", errors="replace") as f:
             f.write(json.dumps(score, ensure_ascii=False, default=str) + "\n")
             f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"Failed to log interaction: {e}")
@@ -571,10 +576,12 @@ def _load_user_language() -> dict:
 
 def _save_user_language(profile: dict):
     try:
-        Path(_USER_LANG_FILE).write_text(
-            json.dumps(profile, ensure_ascii=False, indent=1),
-            encoding="utf-8",
-        )
+        _tmp = _USER_LANG_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(profile, ensure_ascii=False, indent=1))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, _USER_LANG_FILE)
     except Exception:
         pass
 

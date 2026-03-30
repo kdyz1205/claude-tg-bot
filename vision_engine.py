@@ -25,8 +25,14 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+try:
+    import numpy as np
+except ImportError:
+    np = None
 from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)

@@ -409,9 +409,19 @@ def _acquire_singleton_lock():
         sys.exit(1)
 
 
+def _cleanup_lock():
+    """Remove stale lock file on exit so restarts work after crash."""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.unlink(LOCK_FILE)
+    except Exception:
+        pass
+
 def run_loop(interval=180):
     """Main monitoring loop -- checks every interval seconds (default 3 min)."""
     lock_fh = _acquire_singleton_lock()  # Exit if another instance running
+    import atexit
+    atexit.register(_cleanup_lock)
     log(f"Watcher v2.0 (CLI-based) started. Check interval: {interval}s (PID {os.getpid()})")
     log(f"Target session: {TARGET_SESSION_ID}")
     # Suppress startup spam — only log locally, don't notify user every boot

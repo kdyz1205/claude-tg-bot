@@ -225,7 +225,7 @@ async def _fetch_dexscreener_trending(client: httpx.AsyncClient) -> list[dict]:
     results = []
     seen_addr: set[str] = set()
 
-    for item in items[:15]:
+    for _idx, item in enumerate(items[:15]):
         try:
             address = item.get("tokenAddress", "")
             chain = item.get("chainId", "")
@@ -236,6 +236,9 @@ async def _fetch_dexscreener_trending(client: httpx.AsyncClient) -> list[dict]:
             boost_amount = float(item.get("amount", 0) or 0)
             heat = min(100.0, math.log10(max(1.0, boost_amount)) / 4.0 * 100.0)
 
+            # Rate limit between API calls
+            if _idx > 0:
+                await asyncio.sleep(0.2)
             # Fetch pair data for liquidity / price change
             try:
                 pr = await client.get(
@@ -419,7 +422,9 @@ async def scan_onchain_filter(filter_set: dict = None, client: httpx.AsyncClient
             candidates.append({"address": addr, "chain": chain})
 
         # 2. Fetch pair data and apply filters
-        for cand in candidates[:30]:  # limit API calls
+        for _ci, cand in enumerate(candidates[:30]):  # limit API calls
+            if _ci > 0:
+                await asyncio.sleep(0.2)  # rate-limit: max 5 req/s for DexScreener
             try:
                 pr = await client.get(
                     f"https://api.dexscreener.com/latest/dex/tokens/{cand['address']}",
@@ -582,11 +587,11 @@ async def scan_alpha(cfg: dict = None) -> list[dict]:
         if isinstance(batch, list):
             all_tokens.extend(batch)
 
-    # Deduplicate by (source, symbol)
+    # Deduplicate by (source, chain, symbol) — avoid cross-chain false dedup
     seen: set[str] = set()
     unique: list[dict] = []
     for t in all_tokens:
-        key = f"{t['source']}:{t['symbol'].upper()}"
+        key = f"{t['source']}:{t.get('chain','?')}:{t['symbol'].upper()}"
         if key not in seen:
             seen.add(key)
             unique.append(t)
@@ -638,7 +643,12 @@ def record_push(tokens: list[dict]) -> None:
     """Persist pushed tokens with entry price for real P&L tracking."""
     records = _load_tracking()
     now = time.time()
+    # Dedup: skip tokens already pushed in last 6 hours
+    recent_addrs = {r.get("address") for r in records
+                    if r.get("address") and now - r.get("pushed_at", 0) < 21600}
     for t in tokens:
+        if t.get("address") and t["address"] in recent_addrs:
+            continue
         records.append({
             "name": t.get("name", "unknown"),
             "symbol": t.get("symbol", "???"),

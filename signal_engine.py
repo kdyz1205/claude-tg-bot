@@ -33,6 +33,7 @@ OUTCOME_CHECK_72H      = 72 * 3600  # 72 hours
 # ── Evolution: cooldown dedup ────────────────────────────────────────────────
 _signal_cooldowns: dict = {}  # symbol → last_signal_timestamp
 COOLDOWN_SECONDS = 3600  # same coin must wait 1h between signals
+_COOLDOWN_MAX_SIZE = 500  # max entries before cleanup
 
 DEFAULT_CONFIG = {
     "rsi_period": 14,
@@ -90,8 +91,12 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    _tmp = CONFIG_FILE + ".tmp"
+    with open(_tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(_tmp, CONFIG_FILE)
 
 
 # ── Symbol format conversion ──────────────────────────────────────────────────
@@ -256,7 +261,7 @@ def _rsi(closes: list, period: int) -> Optional[float]:
         losses.append(max(-delta, 0))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
+    if avg_loss < 1e-12:
         return 100.0
     return round(100 - 100 / (1 + avg_gain / avg_loss), 2)
 
@@ -544,8 +549,12 @@ def _load_performance() -> dict:
 
 def _save_performance(perf: dict) -> None:
     try:
-        with open(PERF_FILE, "w", encoding="utf-8") as f:
+        _tmp = PERF_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
             json.dump(perf, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, PERF_FILE)
     except Exception as e:
         logger.warning("signal_engine: save_performance: %s", e)
 
@@ -665,8 +674,8 @@ def get_signal_stats_24h() -> dict:
     perf = _load_performance()
     now = time.time()
     cutoff = now - 86400
-    recent = [s for s in perf["signals"] if s["timestamp"] >= cutoff]
-    resolved = [s for s in recent if s["outcome"] is not None]
+    recent = [s for s in perf.get("signals", []) if s.get("timestamp", 0) >= cutoff]
+    resolved = [s for s in recent if s.get("outcome") is not None]
     wins = sum(1 for s in resolved if s["outcome"] == "win")
     total_resolved = len(resolved)
     accuracy = round(wins / total_resolved * 100, 1) if total_resolved > 0 else None
@@ -914,6 +923,12 @@ async def scan_symbol(symbol: str, cfg: dict) -> Optional[dict]:
 
     # Signal passed all 6 filters — record cooldown
     _signal_cooldowns[symbol] = now
+    # Periodic cleanup of stale cooldown entries
+    if len(_signal_cooldowns) > _COOLDOWN_MAX_SIZE:
+        cutoff = now - COOLDOWN_SECONDS * 2
+        stale = [k for k, v in _signal_cooldowns.items() if v < cutoff]
+        for k in stale:
+            _signal_cooldowns.pop(k, None)
 
     return {
         "symbol": symbol,

@@ -599,8 +599,8 @@ def _schedule_rate_limit_resume(cooldown_seconds: float):
             if engine.get_active_goals() and not engine._running:
                 engine.start(interval=15.0)
                 logger.info("Autonomy engine auto-resumed after rate limit reset.")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Autonomy engine resume failed: {e}")
 
     # Cancel previous resume task if any
     if _rate_limit_resume_task and not _rate_limit_resume_task.done():
@@ -701,7 +701,8 @@ def _try_session_route(user_message: str, chat_id: int) -> str | None:
                 if not getattr(session, "busy", False):
                     return name
         return None
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Session routing error: {e}")
         return None
 
 
@@ -920,8 +921,8 @@ async def _run_claude_cli(
         solutions = get_solution_store().retrieve(user_message, top_k=2)
         if solutions:
             rag_text = get_solution_store().format_for_prompt(solutions, max_chars=400)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"RAG solution retrieval failed: {e}")
 
     # Layer 7: Reflexion — inject recent insights to avoid past mistakes
     try:
@@ -929,15 +930,15 @@ async def _run_claude_cli(
         insights = get_reflexion_engine().get_all_insights(n=3)
         if insights:
             rag_text += "\n## 经验教训\n" + "\n".join(f"- {i}" for i in insights[-3:]) + "\n"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Reflexion engine failed: {e}")
 
     # Layer 8: Structured JSON memory — top shortcuts and high-success patterns
     mem_engine_context = ""
     try:
         mem_engine_context = _memory_engine.get_context_for_prompt(max_chars=400)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Memory engine context failed: {e}")
 
     try:
         if mem_context or workflow or skills_text or knowledge_text or user_lang or rag_text or mem_engine_context:
@@ -964,8 +965,8 @@ async def _run_claude_cli(
                 _mem_tmp.write(mem_text)
             finally:
                 _mem_tmp.close()
-    except OSError as e:
-        logger.warning(f"Failed to write temp prompt file (disk full?): {e}")
+    except Exception as e:
+        logger.warning(f"Failed to write temp prompt file: {e}")
         # Continue without enriched prompt — better than crashing
 
     prompt_file = _mem_prompt_path or str(_PROMPT_FILE)
@@ -1290,7 +1291,7 @@ _DANGEROUS_OUTPUT_PATTERNS = [
     _re_mod.compile(r'\b\d{9,10}:AA[A-Za-z0-9\-_]{30,}'),  # Telegram bot tokens
 ]
 _SECRET_REQUEST_PATTERNS = _re_mod.compile(
-    r'(api.?key|密钥|token|secret|password|credential|ANTHROPIC_API_KEY|OPENAI_API_KEY|环境变量丢失).*'
+    r'(api.?key|密钥|token|secret|password|credential|ANTHROPIC_API_KEY|OPENAI_API_KEY|环境变量丢失).{0,500}'
     r'(发给|send|provide|share|paste|输入|告诉|give|设置|重启|重新)',
     _re_mod.IGNORECASE | _re_mod.DOTALL,
 )
@@ -1426,8 +1427,22 @@ def _queue_message(chat_id: int, text: str) -> int:
 
 # ─── Self-Healing ────────────────────────────────────────────────────────────
 
+_SELF_HEAL_DEPTH = 0
+
 async def _self_heal(user_message: str, chat_id: int, context, error: Exception) -> bool:
     """Attempt auto-recovery from errors. Returns True if healed and retried successfully."""
+    global _SELF_HEAL_DEPTH
+    if _SELF_HEAL_DEPTH >= 2:
+        logger.warning("Self-heal recursion limit reached, aborting")
+        return False
+    _SELF_HEAL_DEPTH += 1
+    try:
+        return await _self_heal_inner(user_message, chat_id, context, error)
+    finally:
+        _SELF_HEAL_DEPTH -= 1
+
+async def _self_heal_inner(user_message: str, chat_id: int, context, error: Exception) -> bool:
+    """Inner self-heal logic."""
     err_str = str(error).lower()
     tb = traceback.format_exc()
     logger.info(f"Self-heal attempting for: {err_str[:100]}")
@@ -1485,8 +1500,9 @@ async def _self_heal(user_message: str, chat_id: int, context, error: Exception)
             )
             try:
                 stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, Exception) as comm_err:
                 await _kill_process_tree(proc)
+                logger.debug(f"Self-heal subprocess error: {comm_err}")
                 return False
             raw = stdout_data.decode("utf-8", errors="replace").strip()
             response = raw
@@ -1658,6 +1674,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
 
         # Session recovery: if response indicates session error, retry without resume
+        _cli_retried = False
         resp_lower = response.lower() if response else ""
         _stale = response == "__STALE_SESSION__"
         if _stale or (response and (
@@ -1671,9 +1688,10 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
             _session_timestamps.pop(chat_id, None)
             _save_sessions()
             response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
+            _cli_retried = True
 
         # Auth error: session already cleared in _run_claude_cli, retry fresh immediately
-        if response == "__AUTH_ERROR__":
+        if response == "__AUTH_ERROR__" and not _cli_retried:
             logger.warning(f"Chat {chat_id}: CLI auth error, retrying fresh (no resume)")
             response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
             if response == "__AUTH_ERROR__":
