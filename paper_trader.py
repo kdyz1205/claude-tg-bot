@@ -259,7 +259,11 @@ def close_paper_trade(trade_id: str, current_price: float, reason: str) -> Optio
             if entry <= 0:
                 entry = 1e-12
 
-            pnl_pct = ((current_price - entry) / entry) * 100
+            direction = t.get("direction", "long")
+            if direction == "short":
+                pnl_pct = ((entry - current_price) / entry) * 100
+            else:
+                pnl_pct = ((current_price - entry) / entry) * 100
             pnl_sol = t.get("position_sol", 0) * (pnl_pct / 100)
 
             t["status"] = "closed"
@@ -281,7 +285,6 @@ async def _fetch_okx_price(symbol: str) -> Optional[float]:
     """Fetch current price from OKX (free, no API key)."""
     try:
         import httpx
-        instId = symbol.replace("-USDT", "-USDT-SWAP") if "-USDT" in symbol else symbol
         url = f"https://www.okx.com/api/v5/market/ticker?instId={symbol}"
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url)
@@ -421,6 +424,7 @@ async def check_and_update_trades(send_func=None) -> dict:
                     "take_profit": "\u6b62\u76c8 \u2705",
                     "stop_loss": "\u6b62\u635f \u274c",
                     "time_stop": "\u65f6\u95f4\u6b62\u635f \u23f0",
+                    "trailing_stop": "\u8ffd\u8e2a\u6b62\u635f \U0001f4c9",
                 }.get(close_reason, close_reason)
 
                 msg = (
@@ -593,6 +597,7 @@ def format_stats_full() -> str:
                 "take_profit": "\u6b62\u76c8",
                 "stop_loss": "\u6b62\u635f",
                 "time_stop": "\u65f6\u95f4\u6b62\u635f",
+                "trailing_stop": "\u8ffd\u8e2a\u6b62\u635f",
                 "manual": "\u624b\u52a8",
             }.get(reason, reason)
             wr = (data["wins"] / data["count"] * 100) if data["count"] > 0 else 0

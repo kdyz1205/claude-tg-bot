@@ -95,6 +95,17 @@ except ImportError:
     _dex_available = False
 
 try:
+    import secure_wallet as _wallet
+    import live_trader as _live_trader
+    import trade_scheduler as _trade_scheduler
+    _live_available = True
+except ImportError:
+    _wallet = None
+    _live_trader = None
+    _trade_scheduler = None
+    _live_available = False
+
+try:
     from alpha_engine import alpha_engine as _alpha_engine, scan_alpha as _scan_alpha
     from alpha_engine import format_alpha_report as _format_alpha_report
     from alpha_engine import format_alpha_stats as _format_alpha_stats
@@ -1992,6 +2003,134 @@ async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update.message, report[:4096])
 
 
+# ── Live Trading Commands ────────────────────────────────────────────
+
+_live_trader_instance = None
+_trade_scheduler_instance = None
+
+async def wallet_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set up wallet for live trading. /wallet_setup <private_key_or_seed>"""
+    if not update.message:
+        return
+    if not _live_available:
+        await _safe_reply(update.message, "\u274c Live Trading \u6a21\u5757\u4e0d\u53ef\u7528")
+        return
+
+    args = context.args or []
+    if not args:
+        has_wallet = _wallet.wallet_exists()
+        if has_wallet:
+            pubkey = _wallet.get_public_key()
+            bal = await _wallet.get_sol_balance()
+            await _safe_reply(update.message,
+                f"\U0001f512 Wallet configured\n"
+                f"\u5730\u5740: {pubkey[:8]}...{pubkey[-6:] if pubkey else '?'}\n"
+                f"\u4f59\u989d: {bal:.4f} SOL" if bal else f"\u4f59\u989d: fetch failed\n"
+                f"\n\u2139\ufe0f /wallet_setup <key_or_seed> \u66f4\u6362\u94b1\u5305\n"
+                f"\u2139\ufe0f /wallet_delete \u5220\u9664\u94b1\u5305"
+            )
+        else:
+            await _safe_reply(update.message,
+                "\U0001f512 \u672a\u914d\u7f6e\u94b1\u5305\n\n"
+                "\u7528\u6cd5: /wallet_setup <private_key_or_seed_phrase>\n\n"
+                "\u26a0\ufe0f \u53d1\u9001\u540e\u7acb\u5373\u5220\u9664\u6d88\u606f\uff01\n"
+                "\u26a0\ufe0f \u8bf7\u786e\u4fdd\u8bbe\u7f6e WALLET_PASSWORD \u73af\u5883\u53d8\u91cf"
+            )
+        return
+
+    # SECURITY: Delete the user's message containing the key
+    try:
+        await update.message.delete()
+    except Exception:
+        pass  # May not have delete permissions in groups
+
+    key_input = " ".join(args)
+    success = _wallet.store_wallet(key_input)
+
+    if success:
+        pubkey = _wallet.get_public_key()
+        bal = await _wallet.get_sol_balance()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"\u2705 \u94b1\u5305\u5df2\u52a0\u5bc6\u5b58\u50a8\n"
+                f"\u5730\u5740: {pubkey[:8]}...{pubkey[-6:] if pubkey else '?'}\n"
+                f"\u4f59\u989d: {bal:.4f} SOL\n" if bal else ""
+                f"\n\U0001f512 \u79c1\u94a5\u5df2AES\u52a0\u5bc6\uff0c\u539f\u6d88\u606f\u5df2\u5220\u9664\n"
+                f"\u26a0\ufe0f Bot\u4ec5\u7b7e\u540d\u4ea4\u6362\u4ea4\u6613\uff0c\u65e0\u8f6c\u8d26\u6743\u9650"
+            )
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="\u274c \u94b1\u5305\u5b58\u50a8\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u5bc6\u94a5\u683c\u5f0f\u548c WALLET_PASSWORD \u73af\u5883\u53d8\u91cf"
+        )
+
+
+async def wallet_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete wallet securely. /wallet_delete"""
+    if not update.message or not _live_available:
+        return
+    if _wallet.delete_wallet():
+        await _safe_reply(update.message, "\u2705 \u94b1\u5305\u5df2\u5b89\u5168\u5220\u9664")
+    else:
+        await _safe_reply(update.message, "\u274c \u6ca1\u6709\u53ef\u5220\u9664\u7684\u94b1\u5305")
+
+
+async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Live trading control. /live [start|stop|status|positions]"""
+    if not update.message:
+        return
+    if not _live_available:
+        await _safe_reply(update.message, "\u274c Live Trading \u6a21\u5757\u4e0d\u53ef\u7528")
+        return
+
+    global _live_trader_instance, _trade_scheduler_instance
+    args = context.args or []
+    subcmd = args[0].lower() if args else "status"
+
+    if subcmd == "start":
+        if not _wallet.wallet_exists():
+            await _safe_reply(update.message, "\u274c \u8bf7\u5148\u914d\u7f6e\u94b1\u5305: /wallet_setup")
+            return
+
+        chat_id = update.effective_chat.id
+        async def _live_send(msg):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception:
+                pass
+
+        _trade_scheduler_instance = _trade_scheduler.TradeScheduler(send_func=_live_send)
+        result = await _trade_scheduler_instance.start(mode="live")
+        await _safe_reply(update.message, f"\U0001f680 {result}")
+
+    elif subcmd == "stop":
+        if _trade_scheduler_instance:
+            result = await _trade_scheduler_instance.stop()
+            await _safe_reply(update.message, f"\u23f8 {result}")
+        else:
+            await _safe_reply(update.message, "\u274c No active trading session")
+
+    elif subcmd == "positions":
+        positions = _live_trader._load_positions()
+        open_pos = [p for p in positions if p.get("status") == "open"]
+        if not open_pos:
+            await _safe_reply(update.message, "\U0001f4ad \u65e0\u6301\u4ed3")
+            return
+        lines = ["\U0001f4b0 Live Positions:\n"]
+        for p in open_pos:
+            age_h = (time.time() - p.get("entry_time", 0)) / 3600
+            lines.append(f"  {p.get('symbol','?')} | {p.get('amount_sol',0):.4f} SOL | {age_h:.1f}h")
+        await _safe_reply(update.message, "\n".join(lines))
+
+    else:  # status
+        status = _live_trader.format_live_status()
+        if _trade_scheduler_instance:
+            status += f"\n\n{_trade_scheduler_instance.status()}"
+        await _safe_reply(update.message, status)
+
+
 # ── DEX Trading Commands ─────────────────────────────────────────────
 
 # Address cache for callback lookups (callback_data limited to 64 bytes)
@@ -2085,7 +2224,8 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     if not query or not query.from_user:
         return
-    if config.AUTHORIZED_USER_ID and query.from_user.id != config.AUTHORIZED_USER_ID:
+    if not _is_authorized(query.from_user.id):
+        await query.answer("\u26d4 Unauthorized", show_alert=True)
         return
     await query.answer()
 
@@ -2421,11 +2561,12 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
     query = update.callback_query
     if not query or not query.from_user:
         return
-    if config.AUTHORIZED_USER_ID and query.from_user.id != config.AUTHORIZED_USER_ID:
+    if not _is_authorized(query.from_user.id):
+        await query.answer("\u26d4 Unauthorized", show_alert=True)
         return
     await query.answer()
     data = query.data or ""
-    chat_id = query.from_user.id
+    chat_id = query.message.chat_id if query.message else query.from_user.id
 
     # ── Refresh Dashboard ──
     if data == "td_refresh":
@@ -2580,13 +2721,14 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
                 )
 
             # Graduation check
-            if len(closed_t) >= 50 and (sum(1 for t in closed_t if (t.get("pnl_pct") or 0) > 0) / len(closed_t)) >= 0.55:
+            if len(closed_t) >= 100 and (sum(1 for t in closed_t if (t.get("pnl_pct") or 0) > 0) / len(closed_t)) >= 0.55:
                 msg += "\n\U0001f393 READY FOR LIVE TRADING!"
             elif closed_t:
-                needed = max(0, 50 - len(closed_t))
-                msg += f"\n\U0001f393 Graduation: {len(closed_t)}/50 trades"
+                needed = max(0, 100 - len(closed_t))
+                msg += f"\n\U0001f393 Graduation: {len(closed_t)}/100 trades"
         except Exception:
             msg = "Paper Trading: Error loading data"
+            enabled = False
 
         toggle_text = "\u23f8 Pause" if enabled else "\u25b6\ufe0f Start"
         toggle_data = "td_paper_off" if enabled else "td_paper_on"
@@ -3734,7 +3876,7 @@ async def okx_top30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for i, t in enumerate(top30, 1):
             sym = t.get("instId", "?").replace("-USDT-SWAP", "")
-            price = float(t.get("last", 0))
+            price = float(t.get("last", 0) or 0)
             open24 = float(t.get("open24h", 0) or 0)
             chg = ((price - open24) / open24 * 100) if abs(open24) > 0.0001 else 0
             vol = float(t.get("volCcy24h", 0) or 0)
@@ -5289,6 +5431,10 @@ def main():
     app.add_handler(CommandHandler("dashboard", dashboard_command, filters=auth_filter))
     app.add_handler(CommandHandler("codex", codex_command, filters=auth_filter))
     app.add_handler(CommandHandler("optimize", optimize_command, filters=auth_filter))
+    # Live trading commands
+    app.add_handler(CommandHandler("wallet_setup", wallet_setup_command, filters=auth_filter))
+    app.add_handler(CommandHandler("wallet_delete", wallet_delete_command, filters=auth_filter))
+    app.add_handler(CommandHandler("live", live_command, filters=auth_filter))
 
     # Callbacks — panel first, then DEX trading, then session control, then quick actions, then safety confirmations
     app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))

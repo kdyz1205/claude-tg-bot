@@ -36,11 +36,14 @@ DEFAULT_PRO_CONFIG = {
         "NEAR-USDT", "UNI-USDT", "ATOM-USDT", "FIL-USDT", "LTC-USDT",
     ],
     "scan_interval": 900,
-    # Strategy weights (sum = 1.0)
-    "w_smart_money": 0.25,
-    "w_mean_revert": 0.20,
-    "w_momentum": 0.25,
-    "w_short_momentum": 0.30,  # highest — best backtested (PF 1.89, WR 60%)
+    # Strategy weights (7 strategies, sum = 1.0)
+    "w_smart_money": 0.15,
+    "w_mean_revert": 0.12,
+    "w_momentum": 0.15,
+    "w_short_momentum": 0.20,  # highest — best backtested (PF 1.89, WR 60%)
+    "w_market_maker": 0.13,
+    "w_pump_dump": 0.10,
+    "w_patterns": 0.15,
     # Risk
     "min_combined_score": 30,  # 0-100, minimum to emit signal (tuned for real market conditions)
     "max_risk_pct": 2.0,      # max % risk per trade
@@ -427,7 +430,7 @@ async def _strategy_smart_money(symbol: str, candles: list, cfg: dict) -> dict:
             reasons.append(f"多空比极端偏空({ls_ratio:.2f})")
 
     # 4. Institutional candle detection (big body, small wicks, high volume)
-    if len(candles) >= 3:
+    if len(closes) >= 3:
         for i in range(-3, 0):
             body = abs(closes[i] - opens[i])
             total_range = highs[i] - lows[i]
@@ -755,43 +758,350 @@ async def _strategy_short_momentum(symbol: str, candles: list, cfg: dict) -> dic
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FUSION ENGINE (策略融合引擎)
+# STRATEGY 5: Market Maker Detection (做市商识别)
+# Detect MM activity via spread compression, inventory cycling, quote stuffing
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _strategy_market_maker(symbol: str, candles: list, cfg: dict) -> dict:
+    """Detect market maker patterns: tight spread cycles, inventory rebalancing.
+    When MM is accumulating → follow. When distributing → fade."""
+    d = _parse_candles(candles)
+    closes, highs, lows, volumes = d["close"], d["high"], d["low"], d["volume"]
+    if len(closes) < 30:
+        return {"score": 0, "direction": "neutral", "reasons": ["数据不足"]}
+
+    score = 0
+    direction_votes = {"long": 0, "short": 0}
+    reasons = []
+
+    # 1. Spread compression detection: (high-low)/close ratio shrinking = MM tightening
+    recent_spreads = [(highs[i] - lows[i]) / closes[i] if closes[i] else 0 for i in range(-20, 0)]
+    avg_spread_recent = sum(recent_spreads[-5:]) / 5 if recent_spreads[-5:] else 0
+    avg_spread_old = sum(recent_spreads[:10]) / 10 if recent_spreads[:10] else 1
+    if avg_spread_old > 0 and avg_spread_recent / avg_spread_old < 0.6:
+        score += 20
+        reasons.append("价差压缩(做市商控盘)")
+        # Direction: look at price drift during compression
+        drift = (closes[-1] - closes[-10]) / closes[-10] if closes[-10] else 0
+        if drift > 0.005:
+            direction_votes["long"] += 2
+        elif drift < -0.005:
+            direction_votes["short"] += 2
+
+    # 2. Volume-price divergence: price flat but volume rising = MM accumulation
+    price_change_20 = abs(closes[-1] - closes[-20]) / closes[-20] if closes[-20] else 0
+    vol_avg_recent = sum(volumes[-5:]) / 5 if volumes[-5:] else 0
+    vol_avg_old = sum(volumes[-20:-10]) / 10 if volumes[-20:-10] else 1
+    if price_change_20 < 0.02 and vol_avg_old > 0 and vol_avg_recent / vol_avg_old > 1.5:
+        score += 25
+        reasons.append("量价背离(隐性吸筹)")
+        # Check which side: are closes drifting up or down?
+        micro_drift = sum(1 for i in range(-5, 0) if closes[i] > closes[i - 1]) / 5
+        if micro_drift >= 0.6:
+            direction_votes["long"] += 2
+            reasons.append("微观上行漂移→多")
+        elif micro_drift <= 0.4:
+            direction_votes["short"] += 2
+            reasons.append("微观下行漂移→空")
+
+    # 3. Inventory cycling: rapid alternating candles with declining range = MM testing levels
+    alt_count = sum(1 for i in range(-10, -1) if
+                    (closes[i] > closes[i - 1]) != (closes[i + 1] > closes[i]))
+    if alt_count >= 7:  # 7 out of 9 alternations
+        score += 15
+        reasons.append("K线交替(做市商试盘)")
+
+    # 4. Order book imbalance (if we fetched it already in smart_money, use funding rate as proxy)
+    funding = await _fetch_funding_rate(symbol)
+    if funding is not None:
+        if funding > 0.0008:  # high positive = crowded long, MM may distribute
+            score += 10
+            direction_votes["short"] += 1
+            reasons.append(f"资金费率偏高({funding:.4f})→空")
+        elif funding < -0.0005:  # negative = crowded short, MM may squeeze
+            score += 10
+            direction_votes["long"] += 1
+            reasons.append(f"资金费率为负({funding:.4f})→多")
+
+    direction = "long" if direction_votes["long"] > direction_votes["short"] else (
+        "short" if direction_votes["short"] > direction_votes["long"] else "neutral")
+    return {"score": min(score, 100), "direction": direction, "reasons": reasons[:10]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY 6: Pump/Dump Detection (拉盘/砸盘识别)
+# Detect abnormal price acceleration + volume spikes → ride or fade
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _strategy_pump_dump(candles: list, cfg: dict) -> dict:
+    """Detect pumps/dumps via volume spikes, price acceleration, and candle body ratios."""
+    d = _parse_candles(candles)
+    closes, highs, lows, volumes, opens = d["close"], d["high"], d["low"], d["volume"], d["open"]
+    if len(closes) < 30:
+        return {"score": 0, "direction": "neutral", "reasons": ["数据不足"]}
+
+    score = 0
+    direction_votes = {"long": 0, "short": 0}
+    reasons = []
+
+    # 1. Volume spike: current bar > 3x 20-bar average (exclude current bar)
+    vol_avg = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else (sum(volumes[:-1]) / max(len(volumes) - 1, 1) if len(volumes) > 1 else 1)
+    vol_current = volumes[-1] if volumes else 0
+    vol_spike = vol_current / vol_avg if vol_avg > 0 else 0
+    if vol_spike > 3.0:
+        score += 25
+        reasons.append(f"成交量飙升({vol_spike:.1f}x)")
+        # Pump or dump?
+        if closes[-1] > opens[-1]:
+            direction_votes["long"] += 2
+        else:
+            direction_votes["short"] += 2
+    elif vol_spike > 2.0:
+        score += 12
+        reasons.append(f"成交量放大({vol_spike:.1f}x)")
+
+    # 2. Price acceleration: 5-bar return vs 20-bar return magnitude
+    ret_5 = (closes[-1] - closes[-5]) / closes[-5] if len(closes) >= 5 and closes[-5] else 0
+    ret_20 = (closes[-1] - closes[-20]) / closes[-20] if len(closes) >= 20 and closes[-20] else 0
+    if abs(ret_5) > 0.05 and abs(ret_5) > abs(ret_20) * 2:
+        score += 20
+        if ret_5 > 0:
+            reasons.append(f"价格加速上涨({ret_5*100:.1f}%/5bar)")
+            direction_votes["long"] += 2
+        else:
+            reasons.append(f"价格加速下跌({ret_5*100:.1f}%/5bar)")
+            direction_votes["short"] += 2
+
+    # 3. Consecutive candle bodies (3+ same-direction large bodies = strong move)
+    consecutive = 0
+    last_dir = None
+    for i in range(-5, 0):
+        body = closes[i] - opens[i]
+        bar_range = highs[i] - lows[i] if highs[i] != lows[i] else 1e-10
+        body_ratio = abs(body) / bar_range
+        if body_ratio > 0.6:  # >60% body = strong candle
+            curr_dir = "up" if body > 0 else "down"
+            if curr_dir == last_dir:
+                consecutive += 1
+            else:
+                consecutive = 1
+                last_dir = curr_dir
+    if consecutive >= 3:
+        score += 15
+        if last_dir == "up":
+            direction_votes["long"] += 1
+            reasons.append(f"连续{consecutive}根大阳线")
+        else:
+            direction_votes["short"] += 1
+            reasons.append(f"连续{consecutive}根大阴线")
+
+    # 4. Wick rejection: long wicks on recent bars = exhaustion signal (fade the move)
+    for i in range(-3, 0):
+        bar_range = highs[i] - lows[i] if highs[i] != lows[i] else 1e-10
+        upper_wick = (highs[i] - max(opens[i], closes[i])) / bar_range
+        lower_wick = (min(opens[i], closes[i]) - lows[i]) / bar_range
+        if upper_wick > 0.6:  # long upper wick = rejection
+            score += 8
+            direction_votes["short"] += 1
+            reasons.append("长上影线(顶部拒绝)")
+            break
+        elif lower_wick > 0.6:  # long lower wick = support
+            score += 8
+            direction_votes["long"] += 1
+            reasons.append("长下影线(底部支撑)")
+            break
+
+    # 5. Wash trading detection: unusually uniform volume = fake pump
+    if len(volumes) >= 10:
+        recent_vols = volumes[-10:]
+        vol_std = (sum((v - sum(recent_vols)/10)**2 for v in recent_vols) / 10) ** 0.5
+        vol_cv = vol_std / (sum(recent_vols)/10) if sum(recent_vols) > 0 else 0
+        if vol_cv < 0.1 and vol_spike > 2.0:
+            score = max(score - 20, 0)
+            reasons.append("⚠️ 可能刷量(成交量过于均匀)")
+
+    direction = "long" if direction_votes["long"] > direction_votes["short"] else (
+        "short" if direction_votes["short"] > direction_votes["long"] else "neutral")
+    return {"score": min(score, 100), "direction": direction, "reasons": reasons[:10]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY 7: Classic Pattern Recognition (经典形态识别)
+# Head & Shoulders, Double Top/Bottom, Triangle, Flag/Pennant
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _strategy_patterns(candles: list, cfg: dict) -> dict:
+    """Detect classic TA chart patterns using price pivot analysis."""
+    d = _parse_candles(candles)
+    closes, highs, lows = d["close"], d["high"], d["low"]
+    if len(closes) < 50:
+        return {"score": 0, "direction": "neutral", "reasons": ["数据不足"]}
+
+    score = 0
+    direction_votes = {"long": 0, "short": 0}
+    reasons = []
+
+    # Find pivots (local highs/lows over 5-bar window)
+    pivot_highs, pivot_lows = [], []
+    for i in range(5, len(highs) - 5):
+        if highs[i] == max(highs[i-5:i+6]):
+            pivot_highs.append((i, highs[i]))
+        if lows[i] == min(lows[i-5:i+6]):
+            pivot_lows.append((i, lows[i]))
+
+    # Use last 6 pivots for pattern detection
+    ph = pivot_highs[-6:] if len(pivot_highs) >= 3 else pivot_highs
+    pl = pivot_lows[-6:] if len(pivot_lows) >= 3 else pivot_lows
+
+    # 1. Double Top: two highs at similar level + lower in between
+    if len(ph) >= 2:
+        h1_idx, h1 = ph[-2]
+        h2_idx, h2 = ph[-1]
+        if h2_idx - h1_idx >= 8 and abs(h1 - h2) / h1 < 0.015:  # <1.5% diff
+            # Neckline: lowest low between the two peaks
+            neckline_low = min(lows[h1_idx:h2_idx+1])
+            if closes[-1] < neckline_low:
+                score += 30
+                direction_votes["short"] += 3
+                reasons.append("双顶形态(已跌破颈线)")
+            elif closes[-1] < h2 * 0.99:
+                score += 15
+                direction_votes["short"] += 1
+                reasons.append("双顶形态(接近颈线)")
+
+    # 2. Double Bottom: two lows at similar level + higher in between
+    if len(pl) >= 2:
+        l1_idx, l1 = pl[-2]
+        l2_idx, l2 = pl[-1]
+        if l2_idx - l1_idx >= 8 and abs(l1 - l2) / l1 < 0.015:
+            neckline_high = max(highs[l1_idx:l2_idx+1])
+            if closes[-1] > neckline_high:
+                score += 30
+                direction_votes["long"] += 3
+                reasons.append("双底形态(已突破颈线)")
+            elif closes[-1] > l2 * 1.01:
+                score += 15
+                direction_votes["long"] += 1
+                reasons.append("双底形态(接近颈线)")
+
+    # 3. Head and Shoulders (3 pivot highs: shoulder-head-shoulder)
+    if len(ph) >= 3:
+        ls_idx, ls = ph[-3]  # left shoulder
+        hd_idx, hd = ph[-2]  # head
+        rs_idx, rs = ph[-1]  # right shoulder
+        if hd > ls and hd > rs and abs(ls - rs) / ls < 0.03:
+            # Head higher than both shoulders, shoulders similar
+            neckline = min(lows[ls_idx:rs_idx+1])
+            if closes[-1] < neckline:
+                score += 35
+                direction_votes["short"] += 4
+                reasons.append("头肩顶(已跌破颈线)")
+            elif closes[-1] < rs:
+                score += 18
+                direction_votes["short"] += 2
+                reasons.append("头肩顶形态形成中")
+
+    # 4. Inverse Head and Shoulders
+    if len(pl) >= 3:
+        ls_idx, ls = pl[-3]
+        hd_idx, hd = pl[-2]
+        rs_idx, rs = pl[-1]
+        if hd < ls and hd < rs and abs(ls - rs) / ls < 0.03:
+            neckline = max(highs[ls_idx:rs_idx+1])
+            if closes[-1] > neckline:
+                score += 35
+                direction_votes["long"] += 4
+                reasons.append("倒头肩底(已突破颈线)")
+            elif closes[-1] > rs:
+                score += 18
+                direction_votes["long"] += 2
+                reasons.append("倒头肩底形态形成中")
+
+    # 5. Descending/Ascending Triangle
+    if len(ph) >= 3 and len(pl) >= 3:
+        # Descending triangle: lower highs + flat support
+        high_slope = (ph[-1][1] - ph[-3][1]) / max(ph[-1][0] - ph[-3][0], 1)
+        low_slope = (pl[-1][1] - pl[-3][1]) / max(pl[-1][0] - pl[-3][0], 1)
+        price_range = max(highs[-50:]) - min(lows[-50:])
+        if price_range > 0:
+            h_norm = high_slope / price_range * 50
+            l_norm = low_slope / price_range * 50
+            if h_norm < -0.02 and abs(l_norm) < 0.01:  # lower highs, flat lows
+                score += 20
+                direction_votes["short"] += 2
+                reasons.append("下降三角形")
+            elif l_norm > 0.02 and abs(h_norm) < 0.01:  # higher lows, flat highs
+                score += 20
+                direction_votes["long"] += 2
+                reasons.append("上升三角形")
+
+    # 6. Flag/Pennant: strong move + tight consolidation
+    if len(closes) >= 30:
+        impulse = (closes[-20] - closes[-30]) / closes[-30] if closes[-30] else 0
+        consol_range = (max(highs[-10:]) - min(lows[-10:])) / closes[-1] if closes[-1] else 0
+        if abs(impulse) > 0.05 and consol_range < 0.02:
+            score += 15
+            if impulse > 0:
+                direction_votes["long"] += 1
+                reasons.append("牛旗形态(强势回调整理)")
+            else:
+                direction_votes["short"] += 1
+                reasons.append("熊旗形态(弱势反弹整理)")
+
+    direction = "long" if direction_votes["long"] > direction_votes["short"] else (
+        "short" if direction_votes["short"] > direction_votes["long"] else "neutral")
+    return {"score": min(score, 100), "direction": direction, "reasons": reasons[:10]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUSION ENGINE (策略融合引擎) — 7 Strategies
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
-    """Run all 4 strategies on a symbol, fuse results, output final signal."""
+    """Run all 7 strategies on a symbol across multiple timeframes, fuse results."""
     if cfg is None:
         cfg = load_pro_config()
 
-    candles = await _fetch_okx(symbol, "1H", limit=100)
-    if len(candles) < 55:
+    # ── Multi-Timeframe Data Fetch (1H primary, 4H macro, 15m micro) ──
+    candles_1h = await _fetch_okx(symbol, "1H", limit=100)
+    if len(candles_1h) < 55:
         return None
-
-    # Also fetch 4H candles for short momentum strategy
     candles_4h = await _fetch_okx(symbol, "4H", limit=100)
+    candles_15m = await _fetch_okx(symbol, "15m", limit=100)
+    candles = candles_1h  # primary timeframe
 
-    # Run all strategies
+    # ── Run All 7 Strategies (across timeframes) ──
     sm_result = await _strategy_smart_money(symbol, candles, cfg)
     mr_result = _strategy_mean_reversion(candles, cfg)
     mo_result = _strategy_momentum(candles, cfg)
     sh_result = await _strategy_short_momentum(symbol, candles_4h if len(candles_4h) >= 25 else candles, cfg)
+    mm_result = await _strategy_market_maker(symbol, candles, cfg)
+    pd_result = _strategy_pump_dump(candles_15m if len(candles_15m) >= 30 else candles, cfg)
+    pt_result = _strategy_patterns(candles_4h if len(candles_4h) >= 50 else candles, cfg)
 
-    # Weight fusion (4 strategies)
-    w_sm = cfg.get("w_smart_money", 0.25)
-    w_mr = cfg.get("w_mean_revert", 0.20)
-    w_mo = cfg.get("w_momentum", 0.25)
-    w_sh = cfg.get("w_short_momentum", 0.30)  # highest weight — best backtested PF 1.89
+    # ── Weight Fusion (7 strategies, sum=1.0) ──
+    w_sm = cfg.get("w_smart_money", 0.15)
+    w_mr = cfg.get("w_mean_revert", 0.12)
+    w_mo = cfg.get("w_momentum", 0.15)
+    w_sh = cfg.get("w_short_momentum", 0.20)  # highest — best backtested PF 1.89
+    w_mm = cfg.get("w_market_maker", 0.13)
+    w_pd = cfg.get("w_pump_dump", 0.10)
+    w_pt = cfg.get("w_patterns", 0.15)
 
-    combined_score = (
-        sm_result["score"] * w_sm
-        + mr_result["score"] * w_mr
-        + mo_result["score"] * w_mo
-        + sh_result["score"] * w_sh
-    )
+    all_strats = [
+        (sm_result, w_sm), (mr_result, w_mr), (mo_result, w_mo),
+        (sh_result, w_sh), (mm_result, w_mm), (pd_result, w_pd), (pt_result, w_pt),
+    ]
+
+    # Adaptive scoring: only active strategies contribute to denominator
+    # Prevents inactive strategies (MM=0, PD=0) from diluting the score
+    active_weight = sum(w for r, w in all_strats if r["score"] > 0)
+    raw_score = sum(r["score"] * w for r, w in all_strats)
+    combined_score = (raw_score / active_weight * 1.0) if active_weight > 0.1 else 0
 
     # Direction voting (weighted)
     dir_scores = {"long": 0, "short": 0}
-    for result, weight in [(sm_result, w_sm), (mr_result, w_mr), (mo_result, w_mo), (sh_result, w_sh)]:
+    for result, weight in all_strats:
         if result["direction"] != "neutral":
             dir_scores[result["direction"]] += result["score"] * weight
 
@@ -802,11 +1112,13 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
     else:
         final_dir = "neutral"
 
-    # Check direction consensus — at least 2/4 strategies agree
-    dirs = [sm_result["direction"], mr_result["direction"], mo_result["direction"], sh_result["direction"]]
+    # Check direction consensus — at least 2 active strategies must agree
+    dirs = [r["direction"] for r, _ in all_strats]
+    active_dirs = [r["direction"] for r, _ in all_strats if r["score"] > 0]
     agree_count = sum(1 for d in dirs if d == final_dir)
-    if agree_count < 2 and final_dir != "neutral":
-        combined_score *= 0.85  # mild penalty for disagreement
+    active_agree = sum(1 for d in active_dirs if d == final_dir)
+    if active_agree < 2 and final_dir != "neutral":
+        combined_score *= 0.8  # penalty: not enough active strategies agree
 
     # Trend quality bonus: strong MACD + favorable RSI = add confidence
     d = _parse_candles(candles)
@@ -850,10 +1162,9 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
         elif adx_val_pre > 20:
             regime = "breakout"
             regime_mult = 2.0  # capitalize on breakout
-    # Check volatility regime
-    d_vol = _parse_candles(candles)
-    if len(d_vol["close"]) >= 20:
-        recent_vol = max(d_vol["close"][-20:]) / min(d_vol["close"][-20:]) - 1
+    # Check volatility regime (reuse already-parsed closes)
+    if len(closes) >= 20:
+        recent_vol = max(closes[-20:]) / min(closes[-20:]) - 1 if min(closes[-20:]) > 0 else 0
         if recent_vol > 0.15:  # >15% range in 20 bars = high vol
             regime = "high_vol"
             regime_mult = 0.8
@@ -897,10 +1208,12 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
     if combined_score < min_score or final_dir == "neutral":
         return None
 
+    combined_score = min(combined_score, 100)  # cap at 100
+
     # Calculate SL/TP
     price = closes[-1]
-    atr_val = _atr(candles)
-    adx_val = _adx(candles)
+    atr_val = atr_pre  # reuse from earlier computation
+    adx_val = adx_val_pre if adx_val_pre else None  # reuse from earlier
 
     sl_dist = atr_val * cfg.get("atr_sl_mult", 1.5) if atr_val else price * 0.02
     tp_dist = atr_val * cfg.get("atr_tp_mult", 3.0) if atr_val else price * 0.04
@@ -912,16 +1225,12 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
         sl = price + sl_dist
         tp = price - tp_dist
 
-    # Collect all reasons
-    all_reasons = []
-    if sm_result["reasons"]:
-        all_reasons.append(("聪明钱", sm_result))
-    if mr_result["reasons"]:
-        all_reasons.append(("均值回归", mr_result))
-    if mo_result["reasons"]:
-        all_reasons.append(("动量突破", mo_result))
-    if sh_result["reasons"]:
-        all_reasons.append(("做空动量", sh_result))
+    # Collect all reasons from all 7 strategies
+    strat_labels = [
+        ("聪明钱", sm_result), ("均值回归", mr_result), ("动量突破", mo_result),
+        ("做空动量", sh_result), ("做市商", mm_result), ("拉盘砸盘", pd_result), ("形态识别", pt_result),
+    ]
+    all_reasons = [(label, r) for label, r in strat_labels if r["reasons"]]
 
     return {
         "symbol": symbol,
@@ -936,13 +1245,12 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
         "regime": regime,
         "regime_mult": regime_mult,
         "strategies": {
-            "smart_money": sm_result,
-            "mean_reversion": mr_result,
-            "momentum": mo_result,
-            "short_momentum": sh_result,
+            "smart_money": sm_result, "mean_reversion": mr_result,
+            "momentum": mo_result, "short_momentum": sh_result,
+            "market_maker": mm_result, "pump_dump": pd_result, "patterns": pt_result,
         },
         "all_reasons": all_reasons,
-        "consensus": f"{agree_count}/4",
+        "consensus": f"{active_agree}/{len(active_dirs)}",
         "timestamp": time.time(),
     }
 
@@ -999,7 +1307,7 @@ def format_pro_signal(sig: dict) -> str:
     emoji = "\U0001f7e2" if sig.get("direction") == "long" else "\U0001f534"
     score = sig.get("combined_score", 0)
     score_bar = "\u2588" * int(score // 10) + "\u2591" * (10 - int(score // 10))
-    rr = sig.get("risk_reward", 0)
+    rr = sig.get("risk_reward") or 0
 
     lines = [
         f"{emoji} **{sig.get('symbol', '?')}** {sig.get('direction', '?').upper()}",
@@ -1014,20 +1322,19 @@ def format_pro_signal(sig: dict) -> str:
     if sig.get("adx"):
         lines.append(f"  ADX: {sig['adx']:.0f}  |  ATR: ${sig['atr']:.2f}" if sig.get("atr") else f"  ADX: {sig['adx']:.0f}")
 
-    # Strategy breakdown
+    # Strategy breakdown (7 strategies)
     strats = sig.get("strategies", {})
-    sm = strats.get("smart_money", {})
-    mr = strats.get("mean_reversion", {})
-    mo = strats.get("momentum", {})
-    sh = strats.get("short_momentum", {})
-    lines.append(f"  \u7b56\u7565: \u806a\u660e\u94b1={sm.get('score',0)} \u5747\u503c\u56de\u5f52={mr.get('score',0)} \u52a8\u91cf={mo.get('score',0)} \u505a\u7a7a={sh.get('score',0)}")
+    s = {k: strats.get(k, {}).get("score", 0) for k in
+         ["smart_money", "mean_reversion", "momentum", "short_momentum", "market_maker", "pump_dump", "patterns"]}
+    lines.append(f"  \u7b56\u7565: SM={s['smart_money']} MR={s['mean_reversion']} MO={s['momentum']} SH={s['short_momentum']}")
+    lines.append(f"        MM={s['market_maker']} PD={s['pump_dump']} PT={s['patterns']}")
 
-    # Top reasons (max 4)
+    # Top reasons (max 5)
     reason_lines = []
     for strat_name, result in sig.get("all_reasons", []):
         for r in result.get("reasons", [])[:2]:
-            reason_lines.append(f"  \u2022 {r}")
-    lines.extend(reason_lines[:4])
+            reason_lines.append(f"  \u2022 [{strat_name}] {r}")
+    lines.extend(reason_lines[:5])
 
     result = "\n".join(lines)
     if len(result) > 4000:

@@ -408,16 +408,16 @@ def execute_buy(token_info: dict, amount_sol: float, mode: str = "paper") -> Opt
             existing = p
             break
 
-    sol_price_est = 150.0  # Will fetch live later
-    tokens_bought = (amount_sol * sol_price_est) / price
+    sol_price_est = 150.0  # TODO: fetch live SOL price
+    tokens_bought = (amount_sol * sol_price_est) / price if price > 0 else 0
 
     if existing:
-        # Average into position
-        old_cost = existing.get("amount_sol", 0) * existing.get("entry_price", 0) * sol_price_est
-        new_cost = amount_sol * sol_price_est
+        # Average into position: cost-weighted average price in USD
+        old_cost_usd = existing.get("tokens", 0) * existing.get("entry_price", 0)
+        new_cost_usd = tokens_bought * price
         total_tokens = existing.get("tokens", 0) + tokens_bought
         total_sol = existing.get("amount_sol", 0) + amount_sol
-        avg_price = (old_cost + new_cost) / (total_tokens * sol_price_est) if total_tokens > 0 else price
+        avg_price = (old_cost_usd + new_cost_usd) / total_tokens if total_tokens > 0 else price
 
         existing["entry_price"] = avg_price
         existing["amount_sol"] = total_sol

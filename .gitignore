@@ -23,6 +23,12 @@ Thumbs.db
 .harness_state/
 .handoffs/
 
+# Wallet & live trading (NEVER commit)
+_wallet_encrypted.dat
+_live_positions.json
+_live_config.json
+_scheduler_state.json
+
 # Temp
 *.tmp
 *.log

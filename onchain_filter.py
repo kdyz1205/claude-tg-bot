@@ -167,8 +167,14 @@ def _save_alerted():
         except OSError:
             pass
 
+_alerted_loaded = False
+
 def _is_new_alert(symbol: str, cooldown: int = 900) -> bool:
     """Only alert once per symbol per cooldown (default 15 min)."""
+    global _alerted_loaded
+    if not _alerted_loaded:
+        _load_alerted()
+        _alerted_loaded = True
     now = time.time()
     last = _alerted.get(symbol, 0)
     if now - last < cooldown:
@@ -310,8 +316,8 @@ async def _scan_one(symbol: str, filters: dict) -> Optional[dict]:
         vol_5m = float(candles_5m[-2][5] or 0) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 5 else 0.0
 
         # USDT volume for display
-        vol_3m_usdt = float(candles_3m[-2][7]) if len(candles_3m) >= 2 and len(candles_3m[-2]) > 7 else 0.0
-        vol_5m_usdt = float(candles_5m[-2][7]) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 7 else 0.0
+        vol_3m_usdt = float(candles_3m[-2][7] or 0) if len(candles_3m) >= 2 and len(candles_3m[-2]) > 7 else 0.0
+        vol_5m_usdt = float(candles_5m[-2][7] or 0) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 7 else 0.0
 
         # Filter 1: 3m volume
         if vol_3m < filters.get("vol_3m_min", 0):
