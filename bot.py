@@ -88,6 +88,13 @@ except ImportError:
     _paper_trader_available = False
 
 try:
+    import dex_trader as _dex
+    _dex_available = True
+except ImportError:
+    _dex = None
+    _dex_available = False
+
+try:
     from alpha_engine import alpha_engine as _alpha_engine, scan_alpha as _scan_alpha
     from alpha_engine import format_alpha_report as _format_alpha_report
     from alpha_engine import format_alpha_stats as _format_alpha_stats
@@ -1972,6 +1979,279 @@ async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         report = _paper_trader.format_stats_full()
         await _safe_reply(update.message, report[:4096])
+
+
+# ── DEX Trading Commands ─────────────────────────────────────────────
+
+# Address cache for callback lookups (callback_data limited to 64 bytes)
+_recent_addresses: dict = {}
+
+def _cache_address(address: str):
+    """Cache full address keyed by prefix."""
+    _recent_addresses[address[:20]] = address
+    # Keep cache bounded
+    if len(_recent_addresses) > 200:
+        keys = list(_recent_addresses.keys())
+        for k in keys[:100]:
+            _recent_addresses.pop(k, None)
+
+def _find_full_address(prefix: str):
+    """Find full address from prefix."""
+    if prefix in _recent_addresses:
+        return _recent_addresses[prefix]
+    # Try positions
+    for p in _dex.get_positions() if _dex else []:
+        if p.get("address", "").startswith(prefix):
+            return p["address"]
+    return None
+
+
+async def handle_token_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detect pasted Solana token address and show token card with buy buttons."""
+    if not update.message or not update.message.text:
+        return
+    if not _dex_available:
+        return
+
+    text = update.message.text.strip()
+
+    # Detect Solana address (base58, 32-44 chars)
+    import re
+    if not re.match(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$', text):
+        return
+
+    await update.message.reply_text("🔍 Looking up token...")
+
+    info = await _dex.lookup_token(text)
+    if not info:
+        await _safe_reply(update.message, "❌ Token not found on DexScreener")
+        return
+
+    _cache_address(text)
+    card = _dex.format_token_card(info)
+
+    # Check if we already have a position
+    existing = _dex.get_position_by_address(text)
+
+    settings = _dex.get_settings()
+    buy_amounts = settings.get("buy_buttons", [0.1, 0.3, 0.5, 1.0])
+
+    if existing:
+        # Show sell buttons for existing position
+        pnl = existing.get("pnl_pct", 0)
+        card += f"\n📍 持仓中: {existing.get('amount_sol', 0):.2f} SOL | PnL: {pnl:+.1f}%"
+
+        keyboard = [
+            [
+                InlineKeyboardButton("Sell 25%", callback_data=f"dex_sell_{text[:20]}_25"),
+                InlineKeyboardButton("Sell 50%", callback_data=f"dex_sell_{text[:20]}_50"),
+                InlineKeyboardButton("Sell 100%", callback_data=f"dex_sell_{text[:20]}_100"),
+            ],
+            [
+                InlineKeyboardButton(f"Buy {buy_amounts[0]} SOL", callback_data=f"dex_buy_{text[:20]}_{buy_amounts[0]}"),
+                InlineKeyboardButton(f"Buy {buy_amounts[-1]} SOL", callback_data=f"dex_buy_{text[:20]}_{buy_amounts[-1]}"),
+            ],
+            [
+                InlineKeyboardButton("📊 Detail", callback_data=f"dex_detail_{text[:20]}"),
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"dex_refresh_{text[:20]}"),
+            ],
+        ]
+    else:
+        # Show buy buttons for new token
+        keyboard = [
+            [InlineKeyboardButton(f"{amt} SOL", callback_data=f"dex_buy_{text[:20]}_{amt}") for amt in buy_amounts],
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"dex_refresh_{text[:20]}"),
+                InlineKeyboardButton("📊 Chart", url=info.get("pair_url", "")),
+            ],
+        ]
+
+    await _safe_reply(update.message, card, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button presses for DEX trading."""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    if config.AUTHORIZED_USER_ID and query.from_user.id != config.AUTHORIZED_USER_ID:
+        return
+    await query.answer()
+
+    if not _dex_available:
+        return
+
+    data = query.data or ""
+
+    if data.startswith("dex_buy_"):
+        # Format: dex_buy_<addr_prefix>_<amount>
+        parts = data.split("_")
+        if len(parts) < 4:
+            return
+        addr_prefix = parts[2]
+        amount = float(parts[3])
+
+        full_addr = _find_full_address(addr_prefix)
+        if not full_addr:
+            await query.edit_message_text("❌ Token address expired. Paste the CA again.")
+            return
+
+        info = await _dex.lookup_token(full_addr)
+        if not info:
+            await query.edit_message_text("❌ Token not found")
+            return
+
+        pos = _dex.execute_buy(info, amount)
+        if pos:
+            msg = _dex.format_buy_result(pos, amount)
+            try:
+                await query.edit_message_text(msg)
+            except Exception:
+                await _safe_send(context.bot, query.from_user.id, msg)
+        else:
+            await query.edit_message_text("❌ Buy failed")
+
+    elif data.startswith("dex_sell_"):
+        parts = data.split("_")
+        if len(parts) < 4:
+            return
+        addr_prefix = parts[2]
+        pct = int(parts[3])
+
+        full_addr = _find_full_address(addr_prefix)
+        if not full_addr:
+            await query.edit_message_text("❌ Token address expired. Paste the CA again.")
+            return
+
+        await _dex.refresh_positions()
+
+        result = _dex.execute_sell(full_addr, pct)
+        if result:
+            msg = _dex.format_sell_result(result)
+            try:
+                await query.edit_message_text(msg)
+            except Exception:
+                await _safe_send(context.bot, query.from_user.id, msg)
+        else:
+            await query.edit_message_text("❌ No open position found")
+
+    elif data.startswith("dex_refresh_"):
+        addr_prefix = data.split("_")[2]
+        full_addr = _find_full_address(addr_prefix)
+        if not full_addr:
+            return
+
+        info = await _dex.lookup_token(full_addr)
+        if info:
+            card = _dex.format_token_card(info)
+            try:
+                await query.edit_message_text(card + "\n🔄 Updated")
+            except Exception:
+                pass
+
+    elif data.startswith("dex_detail_"):
+        addr_prefix = data.split("_")[2]
+        full_addr = _find_full_address(addr_prefix)
+        if not full_addr:
+            return
+        pos = _dex.get_position_by_address(full_addr)
+        if pos:
+            msg = _dex.format_position_detail(pos)
+            try:
+                await query.edit_message_text(msg)
+            except Exception:
+                pass
+
+
+async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all open positions."""
+    if not update.message:
+        return
+    if not _dex_available:
+        await _safe_reply(update.message, "DEX module not available")
+        return
+    await _dex.refresh_positions()
+    msg = _dex.format_positions()
+    await _safe_reply(update.message, msg[:4096])
+
+
+async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buy token. /buy <CA> [amount_sol]"""
+    if not update.message or not _dex_available:
+        return
+    args = context.args or []
+    if not args:
+        await _safe_reply(update.message, "Usage: /buy <token_address> [amount_sol]\nOr just paste a CA directly!")
+        return
+    address = args[0]
+    amount = float(args[1]) if len(args) > 1 else _dex.get_settings().get("auto_buy_sol", 0.5)
+
+    info = await _dex.lookup_token(address)
+    if not info:
+        await _safe_reply(update.message, "❌ Token not found")
+        return
+
+    _cache_address(address)
+    pos = _dex.execute_buy(info, amount)
+    if pos:
+        await _safe_reply(update.message, _dex.format_buy_result(pos, amount))
+    else:
+        await _safe_reply(update.message, "❌ Buy failed")
+
+
+async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sell token. /sell <CA> [pct]"""
+    if not update.message or not _dex_available:
+        return
+    args = context.args or []
+    if not args:
+        await _safe_reply(update.message, "Usage: /sell <token_address> [25|50|75|100]")
+        return
+    address = args[0]
+    pct = int(args[1]) if len(args) > 1 else 100
+
+    await _dex.refresh_positions()
+    result = _dex.execute_sell(address, pct)
+    if result:
+        await _safe_reply(update.message, _dex.format_sell_result(result))
+    else:
+        await _safe_reply(update.message, "❌ No open position for this token")
+
+
+async def trade_settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trading settings. /settings [key] [value]"""
+    if not update.message or not _dex_available:
+        return
+    args = context.args or []
+
+    if len(args) >= 2:
+        key = args[0]
+        value = args[1]
+        # Parse value
+        try:
+            if value.lower() in ("true", "on", "yes"): value = True
+            elif value.lower() in ("false", "off", "no"): value = False
+            elif "." in value: value = float(value)
+            else: value = int(value)
+        except ValueError:
+            pass
+
+        valid_keys = list(_dex.DEFAULT_SETTINGS.keys())
+        if key in valid_keys:
+            _dex.update_settings(**{key: value})
+            await _safe_reply(update.message, f"✅ {key} = {value}")
+        else:
+            await _safe_reply(update.message, f"Unknown setting. Valid: {', '.join(valid_keys)}")
+        return
+
+    await _safe_reply(update.message, _dex.format_settings())
+
+
+async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show PnL stats."""
+    if not update.message or not _dex_available:
+        return
+    await _safe_reply(update.message, _dex.format_trade_stats())
 
 
 async def arb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4352,6 +4632,13 @@ def main():
     app.add_handler(CommandHandler("alpha", alpha_command, filters=auth_filter))
     app.add_handler(CommandHandler("onchain", onchain_command, filters=auth_filter))
     app.add_handler(CommandHandler("paper", paper_command, filters=auth_filter))
+    # DEX trading commands
+    app.add_handler(CommandHandler("positions", positions_command, filters=auth_filter))
+    app.add_handler(CommandHandler("pos", positions_command, filters=auth_filter))
+    app.add_handler(CommandHandler("buy", buy_command, filters=auth_filter))
+    app.add_handler(CommandHandler("sell", sell_command, filters=auth_filter))
+    app.add_handler(CommandHandler("settings", trade_settings_command, filters=auth_filter))
+    app.add_handler(CommandHandler("pnl", pnl_command, filters=auth_filter))
     app.add_handler(CommandHandler("arb", arb_command, filters=auth_filter))
     app.add_handler(CommandHandler("search", search_command, filters=auth_filter))
     app.add_handler(CommandHandler("whales", whales_command, filters=auth_filter))
@@ -4388,11 +4675,18 @@ def main():
     app.add_handler(CommandHandler("codex", codex_command, filters=auth_filter))
     app.add_handler(CommandHandler("optimize", optimize_command, filters=auth_filter))
 
-    # Callbacks — panel first, then session control, then quick actions, then safety confirmations
+    # Callbacks — panel first, then DEX trading, then session control, then quick actions, then safety confirmations
     app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
+    app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern="^dex_"))
     app.add_handler(CallbackQueryHandler(handle_session_control_callback, pattern="^sc_"))
     app.add_handler(CallbackQueryHandler(handle_quick_action_callback, pattern="^qa_"))
     app.add_handler(CallbackQueryHandler(handle_confirmation_callback))
+
+    # Paste-to-buy: detect Solana CA pasted as plain text (group=1 so it doesn't block main handler)
+    app.add_handler(MessageHandler(
+        auth_filter & filters.TEXT & ~filters.COMMAND & filters.Regex(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$'),
+        handle_token_address,
+    ), group=1)
 
     # Messages
     app.add_handler(MessageHandler(auth_filter & filters.TEXT & ~filters.COMMAND, handle_message))
@@ -4460,31 +4754,18 @@ def main():
         # Register commands FIRST (before any background tasks that might fail)
         try:
             await application.bot.set_my_commands([
-                ("panel", "Command panel"),
-                ("start", "Start/help"),
-                ("clear", "Clear conversation"),
-                ("screenshot", "Screenshot"),
-                ("status", "Status + health"),
-                ("health", "Detailed health check"),
-                ("vital", "Vital signs (alive status)"),
-                ("model", "Switch model"),
-                ("bridge", "Switch mode"),
-                ("score", "Agent score"),
-                ("portfolio", "Portfolio"),
-                ("signal", "Signals"),
-                ("onchain", "Onchain filter scan"),
-                ("arb", "Cross-exchange arbitrage"),
-                ("risk", "Risk metrics"),
-                ("train", "Training"),
-                ("learn", "Session learning"),
-                ("sessions", "Claude sessions"),
-                ("kill", "Kill task"),
-                ("ping", "Ping"),
-                ("q", "Quick panel"),
-                ("quota", "Quota usage"),
-                ("monitor", "System monitor"),
-                ("proactive", "Proactive agent"),
-                ("market", "Market monitor"),
+                ("start", "🏠 Main Menu"),
+                ("positions", "📊 View Positions"),
+                ("buy", "💰 Buy Token"),
+                ("sell", "💸 Sell Token"),
+                ("pnl", "📈 PnL & Stats"),
+                ("paper", "📝 Paper Trading"),
+                ("settings", "⚙️ Trading Settings"),
+                ("onchain", "🔗 Onchain Scanner"),
+                ("alpha", "🔍 Alpha Signals"),
+                ("status", "🤖 Bot Status"),
+                ("vital", "💀 Vital Signs"),
+                ("help", "❓ All Commands"),
             ])
             logger.info("Bot commands registered with Telegram")
         except Exception as e:
