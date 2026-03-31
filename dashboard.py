@@ -400,4 +400,8 @@ def get_stats_text() -> str:
             icon = "✅" if msg["success"] else "❌"
             lines.append(f"  {icon} [{msg['ts']}] {msg['text'][:50]} ({msg['duration_ms']}ms)")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    # Truncate for Telegram's 4096 char limit
+    if len(result) > 4000:
+        result = result[:4000] + "\n... (truncated)"
+    return result

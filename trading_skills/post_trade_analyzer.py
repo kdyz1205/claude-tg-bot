@@ -123,15 +123,23 @@ class PostTradeAnalyzer:
         Number of bars to examine after the exit for optimal-exit calculation.
     """
 
+    _MAX_HISTORY: int = 5000
+
     def __init__(
         self,
         trade_history: list[dict] | None = None,
         lookforward_bars: int = _LOOKFORWARD_BARS,
     ) -> None:
         self._history: list[dict] = list(trade_history) if trade_history else []
-        if len(self._history) > 5000:
-            self._history = self._history[-5000:]
+        if len(self._history) > self._MAX_HISTORY:
+            self._history = self._history[-self._MAX_HISTORY:]
         self._lookforward: int = lookforward_bars
+
+    def add_trade(self, trade: dict) -> None:
+        """Append a trade to internal history with size cap enforcement."""
+        self._history.append(trade)
+        if len(self._history) > self._MAX_HISTORY:
+            self._history = self._history[-self._MAX_HISTORY:]
 
     # ------------------------------------------------------------------
     # Public API
@@ -392,7 +400,8 @@ class PostTradeAnalyzer:
             patterns.append(escalation)
 
         patterns.sort(key=lambda p: p.get("severity", 0), reverse=True)
-        return patterns
+        # Cap patterns list to prevent unbounded growth
+        return patterns[:50]
 
     def generate_report(self, trades: list[dict] | None = None) -> str:
         """Generate a human-readable performance report.
@@ -470,7 +479,12 @@ class PostTradeAnalyzer:
             lines.append("")
 
         lines.append("=" * 56)
-        return "\n".join(lines)
+        report = "\n".join(lines)
+        # Cap report length to prevent unbounded string growth
+        _MAX_REPORT_LEN = 10_000
+        if len(report) > _MAX_REPORT_LEN:
+            report = report[:_MAX_REPORT_LEN] + "\n... [report truncated]"
+        return report
 
     def suggest_improvements(
         self,
@@ -613,7 +627,8 @@ class PostTradeAnalyzer:
         suggestions.sort(
             key=lambda s: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(s["priority"], 3)
         )
-        return suggestions
+        # Cap suggestions list to prevent unbounded growth
+        return suggestions[:30]
 
     # ------------------------------------------------------------------
     # Internal: bar alignment and MAE / MFE
@@ -1021,6 +1036,10 @@ class PostTradeAnalyzer:
 
     def _compute_breakdowns(self, trades: list[dict]) -> dict:
         """Performance breakdowns by symbol, side, day, hour, exit reason."""
+        # Cap input to prevent unbounded memory usage in breakdown dicts
+        if len(trades) > self._MAX_HISTORY:
+            trades = trades[-self._MAX_HISTORY:]
+        _MAX_BREAKDOWN_KEYS = 500  # prevent unbounded dict key growth (e.g. daily keys)
         by_symbol: dict[str, list[float]] = {}
         by_side: dict[str, list[float]] = {}
         by_dow: dict[int, list[float]] = {}
@@ -1031,13 +1050,15 @@ class PostTradeAnalyzer:
             pnl = float(t.get("pnl_pct", 0.0))
 
             sym = t.get("symbol", "UNKNOWN")
-            by_symbol.setdefault(sym, []).append(pnl)
+            if len(by_symbol) < _MAX_BREAKDOWN_KEYS or sym in by_symbol:
+                by_symbol.setdefault(sym, []).append(pnl)
 
             side = _normalise_side(t.get("side", "unknown"))
             by_side.setdefault(side, []).append(pnl)
 
             reason = t.get("reason", "UNKNOWN")
-            by_reason.setdefault(reason, []).append(pnl)
+            if len(by_reason) < _MAX_BREAKDOWN_KEYS or reason in by_reason:
+                by_reason.setdefault(reason, []).append(pnl)
 
             try:
                 dt = _ts_to_dt(t["entry_time"])
@@ -1099,6 +1120,9 @@ class PostTradeAnalyzer:
 
     def _detect_overtrading(self, trades: list[dict]) -> dict | None:
         """More than threshold trades in a single day."""
+        # Only analyze recent trades to avoid unbounded dict growth
+        _MAX_TRADES_FOR_PATTERN = 2000
+        trades = trades[-_MAX_TRADES_FOR_PATTERN:] if len(trades) > _MAX_TRADES_FOR_PATTERN else trades
         daily_counts: dict[str, int] = {}
         for t in trades:
             try:
@@ -1214,6 +1238,9 @@ class PostTradeAnalyzer:
 
     def _detect_time_bias(self, trades: list[dict]) -> dict | None:
         """Significantly worse performance at certain hours."""
+        # Cap input to prevent unbounded memory usage
+        if len(trades) > 2000:
+            trades = trades[-2000:]
         hour_pnl: dict[int, list[float]] = {}
         for t in trades:
             try:
@@ -1266,6 +1293,9 @@ class PostTradeAnalyzer:
 
     def _detect_symbol_bias(self, trades: list[dict]) -> dict | None:
         """Consistently losing on specific symbols."""
+        # Cap input to prevent unbounded memory usage
+        if len(trades) > 2000:
+            trades = trades[-2000:]
         sym_pnl: dict[str, list[float]] = {}
         for t in trades:
             sym = t.get("symbol", "UNKNOWN")

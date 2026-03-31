@@ -115,7 +115,11 @@ def _save_json(path: str, data) -> None:
 
 
 def _load_signal_history() -> list:
-    return _load_json(SIGNAL_HISTORY_FILE, default=[])
+    data = _load_json(SIGNAL_HISTORY_FILE, default=[])
+    # Cap to last 5000 entries to prevent unbounded memory use
+    if len(data) > 5000:
+        data = data[-5000:]
+    return data
 
 
 def _load_performance_stats() -> dict:
@@ -776,7 +780,10 @@ def format_ga_result(result: dict) -> str:
             )
 
     lines.append("\n✅ 最优参数已写入 _signal_engine_config.json")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (截断)"
+    return result
 
 
 def get_ga_summary() -> str:
@@ -784,7 +791,10 @@ def get_ga_summary() -> str:
     entries = []
     try:
         with open(EVOLUTION_LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
+            # Read only last 500 lines to avoid loading huge file into memory
+            all_lines = f.readlines()
+            tail_lines = all_lines[-500:] if len(all_lines) > 500 else all_lines
+            for line in tail_lines:
                 line = line.strip()
                 if not line:
                     continue
@@ -1071,7 +1081,10 @@ def get_optimization_summary() -> str:
         lines.append(f"{status_emoji} {date} [{trigger}]{wr_str}")
         if n_changes:
             lines.append(f"   调整了 {n_changes} 个参数")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (截断)"
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1516,7 +1529,11 @@ def _p3_load_perf_signals() -> list:
     try:
         with open(PERF_FILE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("signals", [])
+        signals = data.get("signals", [])
+        # Cap to last 5000 to prevent unbounded memory use
+        if len(signals) > 5000:
+            signals = signals[-5000:]
+        return signals
     except Exception:
         return []
 
@@ -1693,8 +1710,11 @@ def record_ab_signal_p3(signal_id: str, outcome: Optional[str]) -> None:
         return
 
     rec = {"id": signal_id, "outcome": outcome, "ts": time.time()}
+    _MAX_AB_SIGNALS = P3_AB_SIGNALS_EACH * 3  # hard cap for safety
     if phase == "A":
         state["a_signals"].append(rec)
+        if len(state["a_signals"]) > _MAX_AB_SIGNALS:
+            state["a_signals"] = state["a_signals"][-_MAX_AB_SIGNALS:]
         # Transition to B after collecting enough
         resolved_a = [s for s in state["a_signals"] if s["outcome"] in ("win", "loss")]
         if len(resolved_a) >= P3_AB_SIGNALS_EACH:
@@ -1711,6 +1731,8 @@ def record_ab_signal_p3(signal_id: str, outcome: Optional[str]) -> None:
                 logger.error("P3 A/B: failed to apply B params: %s", e)
     else:  # phase == "B"
         state["b_signals"].append(rec)
+        if len(state["b_signals"]) > _MAX_AB_SIGNALS:
+            state["b_signals"] = state["b_signals"][-_MAX_AB_SIGNALS:]
         # Evaluate when B leg is complete
         resolved_b = [s for s in state["b_signals"] if s["outcome"] in ("win", "loss")]
         if len(resolved_b) >= P3_AB_SIGNALS_EACH:
@@ -1913,7 +1935,10 @@ def format_performance_report() -> str:
     remaining      = next_trigger - total_resolved
     lines.append(f"\n  下次优化: 再结算 {remaining} 条信号 (当前已结算 {total_resolved})")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (截断)"
+    return result
 
 
 def format_daily_performance_summary() -> str:
@@ -1966,7 +1991,10 @@ def format_daily_performance_summary() -> str:
     total_ab = len([e for e in optim_log if e.get("type") == "p3_ab_result"])
     lines.append(f"\n  贝叶斯优化 {total_ba} 轮  |  A/B测试 {total_ab} 次")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (截断)"
+    return result
 
 
 # ── PerformanceOptimizer background task ─────────────────────────────────────
@@ -2196,19 +2224,27 @@ def _ga24_load_fitness_data() -> list:
                    if s.get("outcome") in ("win", "loss")]
     except Exception:
         pass
-    # Supplement with any backtest experiments
+    # Supplement with any backtest experiments (cap to last 2000 lines)
     try:
         exp_path = os.path.join(BASE_DIR, ".experiments.jsonl")
         with open(exp_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+            all_lines = f.readlines()
+        tail_lines = all_lines[-2000:] if len(all_lines) > 2000 else all_lines
+        for line in tail_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
                 obj = json.loads(line)
                 if obj.get("type") == "backtest" and obj.get("outcome") in ("win", "loss"):
                     signals.append(obj)
+            except Exception:
+                continue
     except Exception:
         pass
+    # Hard cap to prevent unbounded memory
+    if len(signals) > 5000:
+        signals = signals[-5000:]
     return signals
 
 
@@ -2402,7 +2438,10 @@ def format_ga24_result(result: dict) -> str:
             lines.append(f"  {label}: {old_v} {arrow} {new_v}")
 
     lines.append("\n✅ 已写入 .optimized_params.json")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (截断)"
+    return result
 
 
 class GeneticOptimizer:

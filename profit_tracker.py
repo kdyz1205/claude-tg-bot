@@ -28,6 +28,7 @@ CHART_FILE = os.path.join(BASE_DIR, "_performance_chart.png")
 CHECK_INTERVALS_H = [1, 4, 24]
 # Maximum signals to keep
 MAX_SIGNALS = 500
+TG_MSG_LIMIT = 4096
 
 
 # ── File helpers ──────────────────────────────────────────────────────────────
@@ -113,7 +114,8 @@ def format_arb_stats(stats: dict = None) -> str:
     if best:
         ts_b = datetime.fromtimestamp(best.get("timestamp", 0)).strftime("%m-%d %H:%M")
         lines.append(f"最佳: {best.get('symbol', '?')} 入场${best.get('entry_price', 0):.4f} 收益{best.get('final_pnl_pct', 0):+.2f}% [{ts_b}]")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
 def record_signal(symbol: str, direction: str, signal_type: str, entry_price: float) -> str:
@@ -332,7 +334,8 @@ def format_report(stats: dict, title: str = "信号表现报告") -> str:
             wr = round(d["wins"] / d["total"] * 100, 1) if d["total"] else 0
             lines.append(f"  {st}: {d['wins']}/{d['total']} ({wr}%胜率  均{d['avg_pnl']:+.2f}%)")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
 def generate_chart() -> Optional[str]:

@@ -45,6 +45,8 @@ DAILY_ANALYSIS_HOUR  = 2    # 凌晨2点做日分析
 WEEKLY_REPORT_HOUR   = 9    # 周日9点发周报
 WEEKLY_REPORT_DOW    = 6    # 0=Monday … 6=Sunday
 AB_EVAL_INTERVAL_S   = 7 * 24 * 3600  # 7天评估一次A/B
+TG_MSG_LIMIT         = 4096           # Telegram message character limit
+MAX_BLACKLIST_PATTERNS = 200          # max entries in blacklist
 
 
 # ─── File helpers ─────────────────────────────────────────────────────────────
@@ -311,6 +313,9 @@ def inject_pattern_skills(analysis: dict) -> list:
             new_blacklisted.append(pat["key"])
 
     if new_blacklisted:
+        # Cap blacklist size
+        if len(blacklist["patterns"]) > MAX_BLACKLIST_PATTERNS:
+            blacklist["patterns"] = blacklist["patterns"][-MAX_BLACKLIST_PATTERNS:]
         blacklist["updated_at"] = now.isoformat()
         _save_json(SKILL_BLACKLIST_FILE, blacklist)
         _append_changelog({
@@ -651,7 +656,8 @@ def generate_weekly_report(analysis: dict, ab_eval: dict) -> str:
         f"  目标胜率: >{max(60.0, win_rate*100 + 2.0):.0f}%",
     ]
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
 # ─── Daily Analysis Job ───────────────────────────────────────────────────────
@@ -868,7 +874,8 @@ class MetaLearner:
             marker = "← 当前" if name == ab_state.get("current_variant") else ""
             lines.append(f"  变体{name}: 胜率{wr*100:.0f}% (n={total}) {marker}")
 
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
 # ─── Module-level singleton ───────────────────────────────────────────────────

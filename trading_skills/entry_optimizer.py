@@ -197,7 +197,7 @@ class EntryTimingOptimizer:
             )
 
         # -- Build limit recommendation -----------------------------------
-        reasoning_parts: List[str] = []
+        reasoning_parts: List[str] = []  # capped at join via truncation below
         reasoning_parts.append(
             f"{'LONG' if action == 'long' else 'SHORT'} limit at "
             f"{limit_price:.6g} (market {market_price:.6g})."
@@ -223,6 +223,11 @@ class EntryTimingOptimizer:
             reason="Fallback market order if limit expires unfilled.",
         )
 
+        reasoning_text = " ".join(reasoning_parts)
+        # Cap reasoning string length to prevent unbounded growth
+        if len(reasoning_text) > 2000:
+            reasoning_text = reasoning_text[:2000] + "..."
+
         return {
             "order_type": "limit",
             "limit_price": round(limit_price, 8),
@@ -230,7 +235,7 @@ class EntryTimingOptimizer:
             "expected_improvement_bps": round(improvement_bps, 2),
             "fill_probability": round(fill_prob, 4),
             "time_limit_bars": time_limit,
-            "reasoning": " ".join(reasoning_parts),
+            "reasoning": reasoning_text,
             "microstructure": micro,
             "alternative": alternative,
         }

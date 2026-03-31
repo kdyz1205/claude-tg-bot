@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 MEMORY_FILE = os.path.join(BOT_DIR, ".bot_memory.json")
 MAX_ENTRIES = 500
+TG_MSG_LIMIT = 4096
 
 _lock = threading.Lock()
 _memory: dict | None = None
@@ -294,7 +295,8 @@ def format_display() -> str:
         for s in summaries:
             lines.append(f"  [{s['date'][:10]}] {s['text'][:80]}...")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
 def format_stats_brief() -> str:

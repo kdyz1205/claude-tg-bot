@@ -1177,11 +1177,17 @@ async def execute_run_command(command: str, shell: str = "powershell",
             ),
         )
 
+        _MAX_CMD_OUTPUT = 50000  # 50KB cap to avoid huge outputs
         output = ""
         if result.stdout:
-            output += result.stdout
+            output += result.stdout[:_MAX_CMD_OUTPUT]
+            if len(result.stdout) > _MAX_CMD_OUTPUT:
+                output += f"\n... (stdout truncated, {len(result.stdout)} total chars)"
         if result.stderr:
-            output += f"\n[STDERR]: {result.stderr}"
+            stderr_text = result.stderr[:_MAX_CMD_OUTPUT]
+            output += f"\n[STDERR]: {stderr_text}"
+            if len(result.stderr) > _MAX_CMD_OUTPUT:
+                output += f"\n... (stderr truncated, {len(result.stderr)} total chars)"
         if result.returncode != 0:
             output += f"\n[Exit code: {result.returncode}]"
 
@@ -1273,7 +1279,7 @@ async def execute_list_windows() -> str:
     try:
         result = await execute_run_command(
             'Get-Process | Where-Object {$_.MainWindowTitle -ne ""} | '
-            'Select-Object Id, ProcessName, MainWindowTitle | '
+            'Select-Object -First 100 Id, ProcessName, MainWindowTitle | '
             'Format-Table -AutoSize | Out-String -Width 200'
         )
         return result
@@ -1625,6 +1631,9 @@ async def execute_get_clipboard() -> str:
     """Get clipboard content."""
     try:
         result = await execute_run_command("Get-Clipboard")
+        # Cap clipboard content to avoid huge returns
+        if len(result) > 10000:
+            result = result[:10000] + f"\n... (truncated, {len(result)} total chars)"
         return f"Clipboard content:\n{result}"
     except Exception as e:
         return f"Error getting clipboard: {e}"
@@ -1675,6 +1684,9 @@ def execute_list_files(directory: str, recursive: bool = False, pattern: str = N
                     entries.append(f"  {size:>10s}  {mtime}  {name}")
                 except Exception:
                     entries.append(f"{'':>10s}  {'':16s}  {name}")
+                if len(entries) >= 500:
+                    entries.append(f"\n... (truncated at 500 entries)")
+                    break
 
         if not entries:
             return "(empty directory or no matches)"
@@ -1831,7 +1843,9 @@ async def execute_search_files(directory: str, pattern: str,
                         for line_num, line in enumerate(f, 1):
                             if compiled.search(line):
                                 rel = os.path.relpath(fpath, directory)
-                                results.append(f"{rel}:{line_num}: {line.rstrip()}")
+                                # Cap individual line length to prevent huge results
+                                display_line = line.rstrip()[:500]
+                                results.append(f"{rel}:{line_num}: {display_line}")
                                 count += 1
                                 if count >= max_results:
                                     results.append(f"\n... (max {max_results} results reached)")
@@ -2009,6 +2023,8 @@ async def execute_web_search(query: str, max_results: int = 5) -> str:
             return resp.text
 
         html = await loop.run_in_executor(None, _fetch)
+        # Cap HTML to prevent huge memory usage from unexpected responses
+        html = html[:500000]
 
         # Parse results
         results = []
@@ -2103,7 +2119,7 @@ async def execute_list_windows_detailed() -> str:
         lines = [l.strip() for l in raw.strip().splitlines() if "|" in l]
         header = f"{'PID':>7s}  {'Process':<20s}  {'X':>5s} {'Y':>5s} {'W':>5s} {'H':>5s}  Title"
         output = [header, "-" * 90]
-        for line in lines:
+        for line in lines[:200]:  # Cap at 200 windows to prevent huge output
             parts = line.split("|", 6)
             if len(parts) < 7:
                 continue

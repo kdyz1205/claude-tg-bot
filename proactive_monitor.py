@@ -156,9 +156,10 @@ class MarketMonitor:
         # --- Update 1h price history ---
         history = self._price_history[symbol]
         history.append((now, last))
-        # Keep only entries within the last 70 minutes
+        # Keep only entries within the last 70 minutes, hard cap at 500
         cutoff = now - 4200
-        self._price_history[symbol] = [(t, p) for t, p in history if t >= cutoff]
+        filtered = [(t, p) for t, p in history if t >= cutoff]
+        self._price_history[symbol] = filtered[-500:] if len(filtered) > 500 else filtered
 
         # --- 1h momentum alert ---
         one_hour_ago = now - 3600
@@ -185,6 +186,8 @@ class MarketMonitor:
     # Alert helpers                                                        #
     # ------------------------------------------------------------------ #
 
+    _MAX_ALERT_KEYS = 100
+
     async def _maybe_alert(self, symbol: str, alert_type: str, message: str, now: float) -> None:
         """Send alert only if cooldown has elapsed for this (symbol, type) pair."""
         key = f"{symbol}:{alert_type}"
@@ -192,6 +195,11 @@ class MarketMonitor:
         if now - last_sent < ALERT_COOLDOWN:
             return
         self._last_alert[key] = now
+        # Evict stale entries to prevent unbounded growth
+        if len(self._last_alert) > self._MAX_ALERT_KEYS:
+            stale = [k for k, v in self._last_alert.items() if now - v > ALERT_COOLDOWN * 2]
+            for k in stale:
+                del self._last_alert[k]
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[市场预警 {ts}]\n{message}"
         await self._emit(full_msg)

@@ -24,6 +24,7 @@ LIFECYCLE_FILE = os.path.join(BASE_DIR, "_skill_lifecycle.json")
 OBSERVATION_LOG = os.path.join(BASE_DIR, "_skill_observations.jsonl")
 
 EXPLORE_EPSILON = 0.1  # 10% exploration rate for epsilon-greedy policy
+TG_MSG_LIMIT = 4096    # Telegram message character limit
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -546,6 +547,12 @@ def record_decision_outcome(task_type: str, decision: str, outcome_score: float)
     rec["avg"] = round(rec["total_score"] / rec["count"], 3)
     rec["last_ts"] = time.time()
 
+    # Cap decision_outcomes to 500 keys to prevent unbounded growth
+    if len(outcomes) > 500:
+        sorted_keys = sorted(outcomes.keys(), key=lambda k: outcomes[k].get("last_ts", 0))
+        for k in sorted_keys[:len(outcomes) - 400]:
+            del outcomes[k]
+
     _save_lifecycle_data(data)
 
 
@@ -690,4 +697,5 @@ def get_lifecycle_status() -> str:
     # Promotions / Demotions
     lines.append(f"\nPromotions: {len(promos)} | Demotions: {len(demos)}")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result

@@ -30,6 +30,7 @@ SIGNALS_FILE = os.path.join(BASE_DIR, ".whale_signals.json")
 ADDRESSES_FILE = os.path.join(BASE_DIR, ".whale_addresses.json")
 
 MIN_TRANSFER_USD = 100_000   # $100k threshold
+TG_MSG_LIMIT = 4096          # Telegram message character limit
 SCAN_INTERVAL = 600          # 10 minutes
 LOOKBACK_SECONDS = 700       # how far back to check per scan
 
@@ -89,6 +90,7 @@ def _load_whale_memory() -> dict:
 
 _PRICE_CACHE: dict = {}
 _PRICE_CACHE_TTL = 300  # 5 min
+_MAX_PRICE_CACHE_ENTRIES = 200
 
 
 async def _get_prices() -> dict:
@@ -103,6 +105,9 @@ async def _get_prices() -> dict:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
+        # Cap price cache size
+        if len(_PRICE_CACHE) > _MAX_PRICE_CACHE_ENTRIES:
+            _PRICE_CACHE.clear()
         _PRICE_CACHE.update({
             "ETH": data.get("ethereum", {}).get("usd", 3000),
             "BNB": data.get("binancecoin", {}).get("usd", 400),
@@ -347,6 +352,9 @@ class OnchainTracker:
     def _save_signals(self):
         cutoff = time.time() - 86400
         self._signals = [s for s in self._signals if s.get("timestamp", 0) >= cutoff]
+        # Cap at 500 signals even within 24h window
+        if len(self._signals) > 500:
+            self._signals = self._signals[-500:]
         try:
             _tmp = SIGNALS_FILE + ".tmp"
             with open(_tmp, "w", encoding="utf-8") as f:
@@ -547,17 +555,19 @@ class OnchainTracker:
             )
 
         lines.append(f"\n监控地址: {len(self._addresses)}个")
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
     def format_address_list(self) -> str:
         if not self._addresses:
             return "⚠️ 没有监控地址"
         lines = [f"👁 监控地址列表 ({len(self._addresses)})\n"]
-        for addr, meta in self._addresses.items():
+        for addr, meta in list(self._addresses.items())[:50]:
             lines.append(
                 f"  [{meta['network'].upper()}] {meta['label']}: {addr[:12]}..."
             )
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
     @property
     def running(self) -> bool:
@@ -730,6 +740,9 @@ class SmartMoneyTracker:
     def _prune_activity(self):
         cutoff = time.time() - 86400
         self._recent_activity = [a for a in self._recent_activity if a.get("timestamp", 0) >= cutoff]
+        # Cap activity list even within 24h window
+        if len(self._recent_activity) > 1000:
+            self._recent_activity = self._recent_activity[-1000:]
         if len(self._seen_hashes) > 5000:
             self._seen_hashes = set(list(self._seen_hashes)[-2500:])
         # Prune unbounded discovery/buy dicts
@@ -762,6 +775,9 @@ class SmartMoneyTracker:
                 # Keep only last 30 days
                 cutoff = time.time() - 30 * 86400
                 self._perf_records = [r for r in self._perf_records if r.get("timestamp", 0) >= cutoff]
+                # Hard cap at 500 records
+                if len(self._perf_records) > 500:
+                    self._perf_records = self._perf_records[-500:]
             except Exception:
                 self._perf_records = []
 
@@ -857,7 +873,8 @@ class SmartMoneyTracker:
                     f"入{r['entry_price']:.6g}→出{r.get('exit_price',0):.6g} "
                     f"{r['pnl_pct']:+.1f}% @{ts}"
                 )
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
     # ── v2: Cache load/save ──────────────────────────────────────────────
 
@@ -907,6 +924,15 @@ class SmartMoneyTracker:
             return cached.get("info", {})
         info = await _dexscreener_token_info(contract_address)
         if info:
+            # Cap token price cache to prevent unbounded growth
+            if len(self._token_price_cache) > 500:
+                # Evict oldest entries
+                sorted_keys = sorted(
+                    self._token_price_cache.keys(),
+                    key=lambda k: self._token_price_cache[k].get("ts", 0),
+                )
+                for k in sorted_keys[:200]:
+                    del self._token_price_cache[k]
             self._token_price_cache[contract_address] = {
                 "info": info, "ts": time.time(),
             }
@@ -1038,14 +1064,14 @@ class SmartMoneyTracker:
     def _format_consensus_signal(self, contract: str, token: str, buys: list) -> str:
         total_usd = sum(b.get("amount_usd", 0) for b in buys)
         wallet_lines = []
-        for b in buys:
+        for b in buys[:20]:  # Cap wallet lines
             score = self._get_wallet_score(b["wallet"])
             wallet_lines.append(
                 f"  • {b['label']} (评分{score}) ${b['amount_usd']:,.0f}"
             )
-        return "\n".join([
+        result = "\n".join([
             f"🔥🔥🔥 聪明钱共识买入信号",
-            f"代币: {token}",
+            f"代币: {token[:50]}",
             f"合约: {contract[:12]}...{contract[-6:]}",
             f"1h内 {len(buys)} 个高分钱包独立买入！",
             f"总金额: ${total_usd:,.0f}",
@@ -1054,6 +1080,7 @@ class SmartMoneyTracker:
             "",
             f"⚡ 强信号 — 多鲸鱼独立判断一致",
         ])
+        return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
     # ── v2: Whale alert (large SOL new position) ────────────────────────
 
@@ -1217,6 +1244,18 @@ class SmartMoneyTracker:
         if added:
             self._save_wallets()
             logger.info("Added %d wallets from Helius", added)
+
+        # Cap total wallets to prevent unbounded growth
+        if len(self._wallets) > 500:
+            # Remove lowest-score wallets that were auto-added
+            removable = [
+                (addr, meta) for addr, meta in self._wallets.items()
+                if meta.get("source") in ("helius", "auto_discovered")
+            ]
+            removable.sort(key=lambda x: x[1].get("score", 50))
+            for addr, _ in removable[:len(self._wallets) - 400]:
+                del self._wallets[addr]
+            self._save_wallets()
 
         # Auto-promote discovered wallets with good track records
         self._auto_promote_discovered_wallets()
@@ -1530,7 +1569,8 @@ class SmartMoneyTracker:
             lines.append(
                 f"{net_emoji} {meta.get('label', '?')}: {addr[:8]}...{addr[-4:]}{added}"
             )
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
     def format_recent_activity(self, hours: int = 24) -> str:
         activity = self.get_recent_activity(hours)
@@ -1542,7 +1582,8 @@ class SmartMoneyTracker:
             lines.append(
                 f"🟢 {sig.get('address_label', '?')}: 买{sig.get('token', '?')} ${sig.get('amount_usd', 0):,.0f} @{ts}"
             )
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
     @property
     def running(self) -> bool:

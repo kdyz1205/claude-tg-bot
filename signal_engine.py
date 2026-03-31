@@ -550,7 +550,13 @@ def _load_performance() -> dict:
     if os.path.exists(PERF_FILE):
         try:
             with open(PERF_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {"signals": [], "stats_24h": {}}
+            # Cap signals list on load to prevent unbounded growth
+            if len(data.get("signals", [])) > 500:
+                data["signals"] = data["signals"][-500:]
+            return data
         except Exception:
             pass
     return {"signals": [], "stats_24h": {}}
@@ -730,7 +736,10 @@ def format_signal_stats() -> str:
         acc_str = f"{hc_acc}%" if hc_acc is not None else "N/A"
         lines.append(f"  高置信度(≥80)信号: {stats['high_confidence_count']}个, 准确率: {acc_str}")
     lines.append("\n  _结算时间: 信号发出4小时后验证_")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (已截断)"
+    return result
 
 
 # ── Signal generation ─────────────────────────────────────────────────────────
@@ -1093,9 +1102,17 @@ class SignalEngine:
                 except Exception as e:
                     logger.debug("SignalEngine: outcome check: %s", e)
 
+                # Periodic cooldown cleanup (in case scan_symbol never triggers it)
+                if len(_signal_cooldowns) > _COOLDOWN_MAX_SIZE:
+                    _now = time.time()
+                    _cutoff = _now - COOLDOWN_SECONDS * 2
+                    _stale_keys = [k for k, v in _signal_cooldowns.items() if v < _cutoff]
+                    for k in _stale_keys:
+                        _signal_cooldowns.pop(k, None)
+
                 signals = await scan_all(cfg)
                 if signals:
-                    self._last_signals = signals
+                    self._last_signals = signals[:50]  # cap stored signals
                     for sig in signals:
                         try:
                             record_signal_performance(sig)
@@ -1170,4 +1187,4 @@ def get_combined_signals(technical_signals: list = None, top_arb: int = 5) -> li
         combined.append(entry)
 
     combined.sort(key=lambda x: x["unified_score"], reverse=True)
-    return combined
+    return combined[:100]  # cap combined signals list

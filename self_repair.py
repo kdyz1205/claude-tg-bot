@@ -529,6 +529,7 @@ _STAGING_DIR = BOT_DIR / "_patch_staging"
 _module_timings: dict[str, list[float]] = {}
 _module_errors: dict[str, int] = {}
 _timing_lock: asyncio.Lock | None = None  # created lazily in async context
+_MAX_MODULE_KEYS = 200  # cap distinct module names to prevent unbounded dict growth
 
 
 def record_module_timing(module: str, elapsed_s: float) -> None:
@@ -537,11 +538,25 @@ def record_module_timing(module: str, elapsed_s: float) -> None:
     bucket.append(elapsed_s)
     if len(bucket) > 500:
         bucket[:] = bucket[-500:]
+    # Cap total distinct modules
+    if len(_module_timings) > _MAX_MODULE_KEYS:
+        # Remove modules with fewest samples
+        by_size = sorted(_module_timings, key=lambda k: len(_module_timings[k]))
+        for k in by_size[:len(_module_timings) - _MAX_MODULE_KEYS]:
+            del _module_timings[k]
 
 
 def record_module_error(module: str) -> None:
     """Call from any module to report an error."""
     _module_errors[module] = _module_errors.get(module, 0) + 1
+    # Cap total distinct modules
+    if len(_module_errors) > _MAX_MODULE_KEYS:
+        by_count = sorted(_module_errors, key=_module_errors.get)
+        for k in by_count[:len(_module_errors) - _MAX_MODULE_KEYS]:
+            del _module_errors[k]
+
+
+_MAX_EVO_LOG_LINES = 2000
 
 
 def _append_evo_log(record: dict) -> None:
@@ -549,6 +564,15 @@ def _append_evo_log(record: dict) -> None:
         _EVO_LOG.parent.mkdir(exist_ok=True)
         with _EVO_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        # Truncate if too many lines
+        try:
+            with _EVO_LOG.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > _MAX_EVO_LOG_LINES:
+                with _EVO_LOG.open("w", encoding="utf-8") as f:
+                    f.writelines(lines[-_MAX_EVO_LOG_LINES:])
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning("evo_log write failed: %s", exc)
 
@@ -762,12 +786,14 @@ class CodeEvolutionEngine:
     PROFILE_INTERVAL = 3600  # seconds between evolution runs
     MONITOR_PERIOD = 600     # seconds to watch after applying a patch
 
+    _MAX_PATCH_TRACKING = 100
+
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
         self._running = False
         self._notify_fn = None
-        # Track error baselines per module (at patch time)
+        # Track error baselines per module (at patch time), capped
         self._patch_baselines: dict[str, int] = {}
         self._patch_backups: dict[str, str] = {}  # module -> backup path
 
@@ -900,6 +926,12 @@ class CodeEvolutionEngine:
 
         self._patch_backups[target["module"]] = backup_path
         self._patch_baselines[target["module"]] = _module_errors.get(target["module"], 0)
+        # Cap tracking dicts to prevent unbounded growth
+        for d in (self._patch_backups, self._patch_baselines):
+            if len(d) > self._MAX_PATCH_TRACKING:
+                oldest_keys = list(d.keys())[:len(d) - self._MAX_PATCH_TRACKING]
+                for k in oldest_keys:
+                    del d[k]
 
         tmp = target["path"] + ".evotmp"
         try:
@@ -1064,7 +1096,11 @@ def format_evostatus() -> str:
     else:
         lines.append("\n📋 本周暂无进化记录")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    # Truncate for Telegram's 4096 char limit
+    if len(result) > 4000:
+        result = result[:4000] + "\n... (truncated)"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1132,7 +1168,11 @@ def format_repair_status(n_recent: int = 8) -> str:
             extra = f" [{skip}]" if skip else f" conf={conf:.0%}"
             lines.append(f"  {ok_sym} `{ts}` `{fname}` {etype}{extra}")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    # Truncate for Telegram's 4096 char limit
+    if len(result) > 4000:
+        result = result[:4000] + "\n... (truncated)"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1446,7 +1486,11 @@ def format_code_health() -> str:
             except Exception:
                 pass
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    # Truncate for Telegram's 4096 char limit
+    if len(result) > 4000:
+        result = result[:4000] + "\n... (truncated)"
+    return result
 
 
 class CodeQualityScheduler:

@@ -132,6 +132,7 @@ class DrawdownGuardian:
 
         # --- per-position peak PnL tracking ---
         self._position_peak_pnl: Dict[str, float] = {}
+        self._max_tracked_positions: int = 200  # prevent unbounded growth
 
         logger.info(
             "DrawdownGuardian initialised  base_max_dd=%.2f%%  lookback=%d  vol_scale=%s",
@@ -221,9 +222,13 @@ class DrawdownGuardian:
             else:
                 unrealised = position.unrealized_pnl
 
-            # Update peak PnL tracker
+            # Update peak PnL tracker (with size guard)
             prev_peak = self._position_peak_pnl.get(sym, unrealised)
             peak = max(prev_peak, unrealised)
+            if sym not in self._position_peak_pnl and len(self._position_peak_pnl) >= self._max_tracked_positions:
+                # Evict oldest entry to prevent unbounded dict growth
+                oldest_key = next(iter(self._position_peak_pnl))
+                del self._position_peak_pnl[oldest_key]
             self._position_peak_pnl[sym] = peak
 
             # Compute drawdown from peak PnL

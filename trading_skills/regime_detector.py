@@ -219,7 +219,7 @@ class MarketRegimeDetector:
                 + " [regime: volatile, confidence reduced 25%, use smaller size]"
             )
             signal.setdefault("warnings", [])
-            if isinstance(signal["warnings"], list):
+            if isinstance(signal["warnings"], list) and len(signal["warnings"]) < 50:
                 signal["warnings"].append(
                     "High volatility regime — consider reducing position size by 50%."
                 )

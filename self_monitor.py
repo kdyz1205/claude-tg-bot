@@ -272,8 +272,9 @@ class SelfMonitor:
         self._last_alert_times: dict[str, float] = {}
         self._repair_log_handler: logging.Handler | None = None
 
-        # Service health tracking — tracks each backend independently
+        # Service health tracking — tracks each backend independently (capped at 50 services)
         self._service_health: dict[str, dict] = {}  # service -> {failures, last_success, last_failure, state}
+        self._MAX_SERVICES = 50
         self._overall_state: str = self.STATE_HEALTHY
         self._consecutive_msg_failures: int = 0
         self._silence_alerted: bool = False  # Only alert once per silence period
@@ -346,6 +347,15 @@ class SelfMonitor:
             logger.info("Bot recovered to HEALTHY state")
             self._overall_state = self.STATE_HEALTHY
 
+    def _ensure_service_cap(self) -> None:
+        """Evict oldest services if dict exceeds cap."""
+        if len(self._service_health) > self._MAX_SERVICES:
+            # Remove entries with oldest last_success
+            items = sorted(self._service_health.items(),
+                           key=lambda x: x[1].get("last_success", 0))
+            for k, _ in items[:len(self._service_health) - self._MAX_SERVICES]:
+                del self._service_health[k]
+
     def record_service_success(self, service: str) -> None:
         """Call when a specific service (cli/api/webai) succeeds."""
         info = self._service_health.setdefault(service, {
@@ -354,6 +364,7 @@ class SelfMonitor:
         info["failures"] = 0
         info["last_success"] = time.time()
         info["state"] = self.STATE_HEALTHY
+        self._ensure_service_cap()
 
     def record_service_failure(self, service: str, error: str = "") -> None:
         """Call when a specific service fails."""
@@ -369,6 +380,7 @@ class SelfMonitor:
             info["state"] = self.STATE_BROKEN
         elif info["failures"] >= 3:
             info["state"] = self.STATE_DEGRADED
+        self._ensure_service_cap()
 
     def record_message_failure(self) -> None:
         """Call when message processing fails (after all fallbacks)."""
@@ -662,10 +674,16 @@ class SelfMonitor:
 
     # ── alerts ───────────────────────────────────────────────────────────
 
+    _MAX_ALERT_HANDLERS = 20
+
     def register_alert_handler(self, handler: Callable) -> None:
         """Register a callback ``async def handler(anomalies: list[dict])``.
         Prevents duplicate registrations to avoid handler accumulation on restarts."""
         if handler not in self._alert_handlers:
+            if len(self._alert_handlers) >= self._MAX_ALERT_HANDLERS:
+                logger.warning("SelfMonitor: alert handler limit reached (%d), dropping oldest",
+                               self._MAX_ALERT_HANDLERS)
+                self._alert_handlers.pop(0)
             self._alert_handlers.append(handler)
 
     _ALERT_DEDUP_SECONDS = 1800  # Don't resend same alert type within 30 min
@@ -753,7 +771,11 @@ class SelfMonitor:
         er = h.get("checks", {}).get("error_rate_1h", 0)
         lines.append(f"Errors (1h): {er}")
 
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        # Truncate for Telegram's 4096 char limit
+        if len(result) > 4000:
+            result = result[:4000] + "\n... (truncated)"
+        return result
 
     # ── internal helpers ─────────────────────────────────────────────────
 
@@ -817,7 +839,9 @@ class CodeSelfRepair:
         self._repair_task: asyncio.Task | None = None
         self._running = False
         # Cooldown: don't re-repair the same file within 5 min
+        # Capped to prevent unbounded growth from many distinct files
         self._recently_repaired: dict[str, float] = {}
+        self._MAX_RECENTLY_REPAIRED = 200
         # Dedup: don't process identical error text twice
         self._seen_errors: deque[str] = deque(maxlen=100)
 
@@ -961,6 +985,11 @@ class CodeSelfRepair:
 
         if success:
             self._recently_repaired[filepath] = now
+            # Cap recently_repaired to prevent unbounded growth
+            if len(self._recently_repaired) > self._MAX_RECENTLY_REPAIRED:
+                oldest = sorted(self._recently_repaired, key=self._recently_repaired.get)
+                for k in oldest[:len(self._recently_repaired) - self._MAX_RECENTLY_REPAIRED]:
+                    del self._recently_repaired[k]
             logger.info(
                 "CodeSelfRepair: repaired %s:%d (%s, confidence=%.2f)",
                 os.path.basename(filepath), lineno, error_type, confidence,
@@ -1113,6 +1142,8 @@ class CodeSelfRepair:
             logger.warning("CodeSelfRepair: _apply_fix error for %s: %s", filepath, exc)
             return False, diff, backed_up
 
+    _MAX_REPAIR_LOG_LINES = 5000
+
     def _record_repair(
         self, *, filepath: str, lineno: int, error_type: str, error_msg: str,
         confidence: float, diff: str, success: bool, backed_up: bool,
@@ -1131,6 +1162,15 @@ class CodeSelfRepair:
         try:
             with open(self.REPAIR_LOG, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # Truncate repair log if too many lines
+            try:
+                with open(self.REPAIR_LOG, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                if len(lines) > self._MAX_REPAIR_LOG_LINES:
+                    with open(self.REPAIR_LOG, "w", encoding="utf-8") as f:
+                        f.writelines(lines[-self._MAX_REPAIR_LOG_LINES:])
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning("CodeSelfRepair: failed to write repair log: %s", exc)
 

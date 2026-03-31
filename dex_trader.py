@@ -345,7 +345,10 @@ def format_positions() -> str:
             f"{p.get('amount_sol', 0):.2f} SOL | {age_str}"
         )
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (truncated)"
+    return result
 
 
 def format_position_detail(pos: dict) -> str:
@@ -606,7 +609,7 @@ def format_trade_stats() -> str:
         return "\U0001f4c8 No closed trades yet\nPaste a token CA to start!"
 
     em = "\U0001f7e2" if s["total_pnl_sol"] >= 0 else "\U0001f534"
-    return (
+    result = (
         f"\U0001f4c8 Trading Stats\n"
         f"{'─' * 28}\n"
         f"Trades: {s['total']} ({s['open']} open)\n"
@@ -615,3 +618,6 @@ def format_trade_stats() -> str:
         f"Avg PnL: {s['avg_pnl_pct']:+.1f}%\n"
         f"Best: {s['best_pct']:+.1f}% | Worst: {s['worst_pct']:+.1f}%\n"
     )
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (truncated)"
+    return result

@@ -173,7 +173,7 @@ class SignalConfidenceScorer:
             "confidence": round(total / 100.0, 4),
             "grade": grade,
             "recommendation": _recommendation(grade, side),
-            "flags": flags,
+            "flags": flags[:50],  # cap flags to prevent unbounded growth
         }
 
     # ------------------------------------------------------------------

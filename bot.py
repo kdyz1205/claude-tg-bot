@@ -200,7 +200,12 @@ def _is_authorized(user_id: int) -> bool:
 
 def _track_task(bot_data: dict, task: asyncio.Task) -> None:
     """Register a background task with proper exception logging on completion."""
-    bot_data.setdefault("_background_tasks", set()).add(task)
+    tasks = bot_data.setdefault("_background_tasks", set())
+    # Cap background tasks - prune completed ones if too many
+    if len(tasks) > 100:
+        done = {t for t in tasks if t.done()}
+        tasks -= done
+    tasks.add(task)
     def _on_done(t):
         try:
             if not t.cancelled():
@@ -593,7 +598,7 @@ async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if claude_agent.is_rate_limited():
             remaining = max(0, int(claude_agent._rate_limited_until - time.time()))
             rate_info = f"\n⚠️ Claude CLI 限速中 (还剩 {remaining}s)\n"
-        await update.message.reply_text(f"📊 AI 平台用量\n{rate_info}\n{report}")
+        await update.message.reply_text(f"📊 AI 平台用量\n{rate_info}\n{report}"[:4096])
     except Exception as e:
         rate_info = ""
         if claude_agent.is_rate_limited():
@@ -657,14 +662,14 @@ async def _sessions_command_impl(update: Update, context: ContextTypes.DEFAULT_T
                 task = s.get("task_summary", "")[:60]
                 lines.append(f"  {sid}... | {proj} | {msgs} msgs | {task}")
 
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines)[:4096])
         return
 
     action = args[0].lower()
 
     if action == "ask" and len(args) >= 3:
-        session_name = args[1]
-        question = " ".join(args[2:])
+        session_name = args[1][:100]
+        question = " ".join(args[2:])[:2000]  # cap user input length
         msg = await update.message.reply_text(f"Asking session '{session_name}'...")
         try:
             response = await learner.ask_session(session_name, question)
@@ -676,8 +681,8 @@ async def _sessions_command_impl(update: Update, context: ContextTypes.DEFAULT_T
             await msg.edit_text(f"Error asking session: {e}")
 
     elif action == "delegate" and len(args) >= 3:
-        session_name = args[1]
-        task = " ".join(args[2:])
+        session_name = args[1][:100]
+        task = " ".join(args[2:])[:2000]  # cap user input length
         msg = await update.message.reply_text(f"Delegating to session '{session_name}'...")
         try:
             result = await learner.delegate_task(session_name, task)
@@ -761,7 +766,7 @@ async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
             await msg.edit_text(summary_text[:4096])
         except Exception as e:
             logger.error(f"Learn command failed: {e}", exc_info=True)
-            await msg.edit_text(f"Learning failed: {e}")
+            await msg.edit_text(f"Learning failed: {str(e)[:300]}")
         return
 
     action = args[0].lower()
@@ -779,7 +784,7 @@ async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
             cwd_short = os.path.basename(cwd) if cwd else "?"
             kind = s.get("kind", "")
             lines.append(f"  PID {pid} | {sid}... | {cwd_short} | {kind}")
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines)[:4096])
 
     elif action == "from" and len(args) >= 2:
         session_id = args[1]
@@ -806,13 +811,14 @@ async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             summary = learner.get_session_summary()
             # Split if too long for one message
+            summary = summary[:12000]  # cap at 3 messages
             if len(summary) <= 4096:
                 await update.message.reply_text(summary)
             else:
                 for i in range(0, len(summary), 4000):
                     await update.message.reply_text(summary[i:i+4000])
         except Exception as e:
-            await update.message.reply_text(f"Report error: {e}")
+            await update.message.reply_text(f"Report error: {str(e)[:300]}")
 
     elif action == "gaps":
         try:
@@ -821,7 +827,7 @@ async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("No skill gaps identified. Run /learn first to analyze sessions.")
                 return
             lines = ["Skill Gaps & Training Curriculum\n"]
-            for item in curriculum:
+            for item in curriculum[:20]:  # cap items to prevent oversized message
                 priority = item.get("priority", "?").upper()
                 skill = item.get("skill", "?")
                 gap = item.get("gap_description", "")
@@ -861,7 +867,8 @@ async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         avg = sum(s.get("overall", 0) for s in scores) / len(scores)
         flags_all = []
         for s in scores:
-            flags_all.extend(s.get("flags", []))
+            flags_all.extend(s.get("flags", [])[:20])  # cap flags per score
+        flags_all = flags_all[:200]  # cap total flags
         top_flags = {}
         for f in flags_all:
             top_flags[f] = top_flags.get(f, 0) + 1
@@ -896,14 +903,15 @@ async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += "\n" + h_stats
         except Exception:
             pass
-        # Telegram message limit: split if >4096 chars
+        # Telegram message limit: split if >4096 chars, cap at 3 messages max
+        text = text[:12000]
         if len(text) <= 4096:
             await update.message.reply_text(text)
         else:
-            for i in range(0, len(text), 4000):
+            for i in range(0, min(len(text), 12000), 4000):
                 await update.message.reply_text(text[i:i+4000])
     except Exception as e:
-        await update.message.reply_text(f"📊 评分错误: {e}")
+        await update.message.reply_text(f"📊 评分错误: {str(e)[:300]}")
 
 
 async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1330,25 +1338,23 @@ async def _send_status_impl(context, chat_id):
                 health_str += f"\nLast success: {ago // 3600}h {(ago % 3600) // 60}m ago"
             elif ago > 60:
                 health_str += f"\nLast success: {ago // 60}m ago"
-        for svc, info in health.get("services", {}).items():
+        for svc, info in list(health.get("services", {}).items())[:20]:
             if info.get("failures", 0) > 0:
-                health_str += f"\n  {svc}: {state_emoji.get(info['state'], '?')} {info['failures']} failures"
+                health_str += f"\n  {svc[:30]}: {state_emoji.get(info['state'], '?')} {info['failures']} failures"
     except Exception:
         pass
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"📊 Status\n\n"
-            f"Mode: {mode_str}\n"
-            f"Model: {config.CLAUDE_MODEL}\n"
-            f"Session: {session_id}\n"
-            f"Queue: {queue_size} pending\n"
-            f"Busy: {'Yes' if is_busy else 'No'}\n"
-            f"Uptime: {uptime_str}"
-            f"{rate_info}{health_str}{sys_info}"
-        ),
+    status_text = (
+        f"📊 Status\n\n"
+        f"Mode: {mode_str}\n"
+        f"Model: {config.CLAUDE_MODEL}\n"
+        f"Session: {session_id}\n"
+        f"Queue: {queue_size} pending\n"
+        f"Busy: {'Yes' if is_busy else 'No'}\n"
+        f"Uptime: {uptime_str}"
+        f"{rate_info}{health_str}{sys_info}"
     )
+    await context.bot.send_message(chat_id=chat_id, text=status_text[:4096])
 
 
 async def _send_health(context, chat_id):
@@ -1424,7 +1430,7 @@ async def _send_health(context, chat_id):
     except Exception:
         lines.append("  Claude CLI: ❓ Unknown")
 
-    text = "\n".join(lines)
+    text = "\n".join(lines)[:12000]  # cap at 3 messages max
     if len(text) <= 4096:
         await context.bot.send_message(chat_id=chat_id, text=text)
     else:
@@ -1446,7 +1452,7 @@ async def _send_memory_info(context, chat_id):
         text += f"\nSessions: {len(claude_agent._claude_sessions)} active"
         await _safe_send(context.bot, chat_id, text, parse_mode="Markdown")
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"🧠 Memory error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"🧠 Memory error: {str(e)[:300]}")
 
 
 async def _send_scan(context, chat_id):
@@ -1498,7 +1504,7 @@ async def _send_score_brief(context, chat_id):
             ),
         )
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"📊 Score error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"📊 Score error: {str(e)[:300]}")
 
 
 async def _send_signals(context, chat_id):
@@ -1507,10 +1513,12 @@ async def _send_signals(context, chat_id):
     try:
         # Try loading from a signals file/module if it exists
         signals_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_signals.json")
-        if os.path.exists(signals_file):
+        if os.path.exists(signals_file) and os.path.getsize(signals_file) < 5 * 1024 * 1024:
             import json
             with open(signals_file, "r", encoding="utf-8") as f:
                 signals = json.load(f)
+            if not isinstance(signals, list):
+                signals = []
             for s in signals[-5:]:
                 lines.append(f"  {s.get('symbol', '?')} {s.get('direction', '?')} @ {s.get('price', '?')} ({s.get('time', '?')})")
         else:
@@ -1530,7 +1538,7 @@ async def _send_vol_filter(context, chat_id):
         text = format_filtered(results)
         await _safe_send(context.bot, chat_id, text, parse_mode="Markdown")
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"筛选失败: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"筛选失败: {str(e)[:300]}")
 
 
 async def _send_profit_report(context, chat_id):
@@ -1538,6 +1546,7 @@ async def _send_profit_report(context, chat_id):
     try:
         await context.bot.send_message(chat_id=chat_id, text="📊 生成收益报告中...")
         text, chart_path = await _profit_tracker.profit_tracker.get_report_and_chart()
+        text = text[:12000]  # cap at 3 messages max
         if len(text) <= 4096:
             await context.bot.send_message(chat_id=chat_id, text=text)
         else:
@@ -1556,11 +1565,11 @@ async def _send_portfolio(context, chat_id):
     lines = ["💼 Portfolio\n"]
     try:
         portfolio_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_portfolio.json")
-        if os.path.exists(portfolio_file):
+        if os.path.exists(portfolio_file) and os.path.getsize(portfolio_file) < 5 * 1024 * 1024:
             import json
             with open(portfolio_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for pos in data.get("positions", []):
+            for pos in data.get("positions", [])[:50]:
                 pnl = float(pos.get("pnl", 0) or 0)
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 lines.append(
@@ -1582,7 +1591,7 @@ async def _send_risk(context, chat_id):
     lines = ["⚠️ Risk Metrics\n"]
     try:
         risk_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_risk.json")
-        if os.path.exists(risk_file):
+        if os.path.exists(risk_file) and os.path.getsize(risk_file) < 5 * 1024 * 1024:
             import json
             with open(risk_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1635,7 +1644,7 @@ async def _send_learn_brief(context, chat_id):
         )
         await context.bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"🧠 Learning error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"🧠 Learning error: {str(e)[:300]}")
 
 
 async def _send_learn_report(context, chat_id):
@@ -1645,14 +1654,14 @@ async def _send_learn_report(context, chat_id):
         return
     try:
         learner = _sl.get_learner()
-        summary = learner.get_session_summary()
+        summary = learner.get_session_summary()[:12000]  # cap at 3 messages
         if len(summary) <= 4096:
             await context.bot.send_message(chat_id=chat_id, text=summary)
         else:
             for i in range(0, len(summary), 4000):
                 await context.bot.send_message(chat_id=chat_id, text=summary[i:i+4000])
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"Report error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"Report error: {str(e)[:300]}")
 
 
 async def _send_learn_gaps(context, chat_id):
@@ -1674,7 +1683,7 @@ async def _send_learn_gaps(context, chat_id):
             lines.append(f"[{priority}] {skill}: {gap}")
         await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"Gaps error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"Gaps error: {str(e)[:300]}")
 
 
 async def _send_cc_sessions(context, chat_id):
@@ -1695,9 +1704,9 @@ async def _send_cc_sessions(context, chat_id):
             cwd_short = os.path.basename(s.get("cwd", "")) or "?"
             lines.append(f"  PID {pid} | {sid}... | {cwd_short}")
         lines.append(f"\nUse /sessions ask/delegate for interaction.")
-        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"Sessions error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"Sessions error: {str(e)[:300]}")
 
 
 async def _send_okx_top30(context, chat_id):
@@ -1731,7 +1740,7 @@ async def _send_okx_top30(context, chat_id):
 
         await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"OKX Top 30 error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"OKX Top 30 error: {str(e)[:300]}")
 
 
 async def _send_session_control(context, chat_id):
@@ -1815,7 +1824,7 @@ async def vital_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import vital_signs
         text = vital_signs.get_status_text()
-        await update.message.reply_text(text)
+        await update.message.reply_text(text[:4096])
     except Exception as e:
         logger.error(f"Vital command error: {e}", exc_info=True)
         try:
@@ -1860,9 +1869,9 @@ async def signal_stats_command(update: Update, context: ContextTypes.DEFAULT_TYP
         from signal_engine import format_signal_stats
         text = format_signal_stats()
         try:
-            await update.message.reply_text(text, parse_mode="Markdown")
+            await update.message.reply_text(text[:4096], parse_mode="Markdown")
         except Exception:
-            await update.message.reply_text(text)
+            await update.message.reply_text(text[:4096])
     except Exception as e:
         logger.error(f"signal_stats command error: {e}", exc_info=True)
         try:
@@ -1884,9 +1893,9 @@ async def alpha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args or []
         if args and args[0].lower() in ("stats", "统计", "stat"):
             try:
-                await update.message.reply_text(_format_alpha_stats(), parse_mode="Markdown")
+                await update.message.reply_text(_format_alpha_stats()[:4096], parse_mode="Markdown")
             except Exception:
-                await update.message.reply_text(_format_alpha_stats())
+                await update.message.reply_text(_format_alpha_stats()[:4096])
             return
 
         # Live scan
@@ -1965,12 +1974,12 @@ async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif subcmd in ("close", "closeall"):
         # Close all open positions at current price
         trades = _paper_trader._load_trades()
-        open_trades = [t for t in trades if t.get("status") == "open"]
+        open_trades = [t for t in trades[-500:] if t.get("status") == "open"]
         if not open_trades:
             await _safe_reply(update.message, "没有持仓需要平仓")
             return
         closed = 0
-        for t in open_trades:
+        for t in open_trades[:100]:  # cap to avoid excessive API calls
             price = await _paper_trader._fetch_current_price(t.get("address", ""))
             if price and price > 0:
                 _paper_trader.close_paper_trade(t["id"], price, "manual")
@@ -2105,9 +2114,9 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if pos:
             msg = _dex.format_buy_result(pos, amount)
             try:
-                await query.edit_message_text(msg)
+                await query.edit_message_text(msg[:4096])
             except Exception:
-                await _safe_send(context.bot, query.from_user.id, msg)
+                await _safe_send(context.bot, query.from_user.id, msg[:4096])
         else:
             await query.edit_message_text("❌ Buy failed")
 
@@ -2129,9 +2138,9 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if result:
             msg = _dex.format_sell_result(result)
             try:
-                await query.edit_message_text(msg)
+                await query.edit_message_text(msg[:4096])
             except Exception:
-                await _safe_send(context.bot, query.from_user.id, msg)
+                await _safe_send(context.bot, query.from_user.id, msg[:4096])
         else:
             await query.edit_message_text("❌ No open position found")
 
@@ -2145,7 +2154,7 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if info:
             card = _dex.format_token_card(info)
             try:
-                await query.edit_message_text(card + "\n🔄 Updated")
+                await query.edit_message_text((card + "\n🔄 Updated")[:4096])
             except Exception:
                 pass
 
@@ -2158,7 +2167,7 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if pos:
             msg = _dex.format_position_detail(pos)
             try:
-                await query.edit_message_text(msg)
+                await query.edit_message_text(msg[:4096])
             except Exception:
                 pass
 
@@ -2313,7 +2322,7 @@ async def _build_trading_dashboard() -> str:
         try:
             cfg = _paper_trader._load_config()
             enabled = cfg.get("enabled", False)
-            trades = _paper_trader._load_trades()
+            trades = _paper_trader._load_trades()[-1000:]  # cap trades loaded
             open_trades = [t for t in trades if t.get("status") == "open"]
             closed_trades = [t for t in trades if t.get("status") == "closed"]
             paper_status = "\U0001f7e2 ON" if enabled else "\U0001f534 OFF"
@@ -2491,7 +2500,7 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
         rows.append([InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")])
 
         try:
-            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(rows))
+            await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup(rows))
         except Exception:
             pass
         return
@@ -2504,7 +2513,7 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
              InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
         ])
         try:
-            await query.edit_message_text(msg, reply_markup=kb)
+            await query.edit_message_text(msg[:4096], reply_markup=kb)
         except Exception:
             pass
         return
@@ -2524,7 +2533,7 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
         try:
             cfg = _paper_trader._load_config()
             enabled = cfg.get("enabled", False)
-            trades = _paper_trader._load_trades()
+            trades = _paper_trader._load_trades()[-1000:]  # cap trades loaded
             open_t = [t for t in trades if t.get("status") == "open"]
             closed_t = [t for t in trades if t.get("status") == "closed"]
 
@@ -2569,7 +2578,7 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
             ],
         ])
         try:
-            await query.edit_message_text(msg, reply_markup=kb)
+            await query.edit_message_text(msg[:4096], reply_markup=kb)
         except Exception:
             pass
         return
@@ -2650,7 +2659,7 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
             [InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
         ])
         try:
-            await query.edit_message_text(msg, reply_markup=kb)
+            await query.edit_message_text(msg[:4096], reply_markup=kb)
         except Exception:
             pass
         return
@@ -2739,7 +2748,7 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
              InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
         ])
         try:
-            await query.edit_message_text(msg, reply_markup=kb)
+            await query.edit_message_text(msg[:4096], reply_markup=kb)
         except Exception:
             pass
         return
@@ -2770,7 +2779,7 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
              InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
         ])
         try:
-            await query.edit_message_text(msg, reply_markup=kb)
+            await query.edit_message_text(msg[:4096], reply_markup=kb)
         except Exception:
             pass
         return
@@ -2811,7 +2820,7 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
              InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
         ])
         try:
-            await query.edit_message_text(msg, reply_markup=kb)
+            await query.edit_message_text(msg[:4096], reply_markup=kb)
         except Exception:
             pass
         return
@@ -3204,6 +3213,8 @@ async def selfcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(error_log):
             size = os.path.getsize(error_log)
             with open(error_log, "r", encoding="utf-8", errors="replace") as f:
+                # Read only last 8KB to avoid loading huge error logs into memory
+                f.seek(max(0, size - 8192))
                 last_lines = f.readlines()[-3:]
             last = "".join(last_lines).strip()[:200]
             lines.append(f"\n📋 `_error_log.txt` ({size//1024}KB)\nLast entry: `{last}`")
@@ -3215,7 +3226,7 @@ async def selfcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Selfcheck error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ selfcheck error: {e}")
+            await update.message.reply_text(f"❌ selfcheck error: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -3254,7 +3265,7 @@ async def repairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"repairs_command error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ repairs error: {e}")
+            await update.message.reply_text(f"❌ repairs error: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -3277,7 +3288,7 @@ async def repair_status_command(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"repair_status_command error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ repair_status error: {e}")
+            await update.message.reply_text(f"❌ repair_status error: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -3311,7 +3322,7 @@ async def evostatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"evostatus_command error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ evostatus error: {e}")
+            await update.message.reply_text(f"❌ evostatus error: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -3339,7 +3350,7 @@ async def code_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"code_health_command error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ code_health error: {e}")
+            await update.message.reply_text(f"❌ code_health error: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -3380,7 +3391,7 @@ async def selfrepair_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"selfrepair_command error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ selfrepair error: {e}")
+            await update.message.reply_text(f"❌ selfrepair error: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -3497,7 +3508,7 @@ async def okx_backtest_command(update: Update, context: ContextTypes.DEFAULT_TYP
             if result.returncode != 0:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"OKX Backtest failed (rc={result.returncode}):\n{stderr[:2000]}"
+                    text=f"OKX Backtest failed (rc={result.returncode}):\n{stderr[:3500]}"[:4096]
                 )
                 return
 
@@ -3644,7 +3655,7 @@ async def ma_ribbon_screener_command(update: Update, context: ContextTypes.DEFAU
             if result.returncode != 0:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"MA Ribbon Screener failed (rc={result.returncode}):\n{stderr[:2000]}"
+                    text=f"MA Ribbon Screener failed (rc={result.returncode}):\n{stderr[:3500]}"[:4096]
                 )
                 return
 
@@ -3957,7 +3968,7 @@ async def autonomy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id = update.effective_chat.id
             async def _send_status(msg):
                 try:
-                    await context.bot.send_message(chat_id=chat_id, text=msg)
+                    await context.bot.send_message(chat_id=chat_id, text=msg[:4096])
                 except Exception:
                     pass
             engine.start(send_fn=_send_status, interval=15.0)
@@ -3985,7 +3996,7 @@ async def autonomy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += "\nActive goals:\n"
                 for g in active[:5]:
                     text += f"  • {g.description[:80]} ({g.attempts}/{g.max_attempts})\n"
-            await update.message.reply_text(text)
+            await update.message.reply_text(text[:4096])
         else:
             await update.message.reply_text("Usage: /autonomy [start|stop|status|goal <text>]")
     except Exception as e:
@@ -4150,7 +4161,7 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         logger.error(f"memory_command error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Memory error: {str(e)[:3000]}")
+        await update.message.reply_text(f"❌ Memory error: {str(e)[:300]}")
 
 
 async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4206,10 +4217,10 @@ async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines.append(f"...还有{len(entries)-15}个")
                 msg = "\n".join(lines)
 
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg[:4096])
     except Exception as e:
         logger.error(f"skills_command error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Skills error: {str(e)[:3000]}")
+        await update.message.reply_text(f"❌ Skills error: {str(e)[:300]}")
 
 
 async def multi_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4395,7 +4406,7 @@ async def handle_session_control_callback(update, context):
             await query.edit_message_text("All sessions killed, queues cleared.")
     except Exception as e:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"Session control error: {e}")
+            await context.bot.send_message(chat_id=chat_id, text=f"Session control error: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -4496,7 +4507,7 @@ async def handle_quick_action_callback(update, context):
             )
 
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ {str(e)[:3000]}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ {str(e)[:300]}")
 
 
 # ─── Session Learning Background ─────────────────────────────────────────────
@@ -4782,7 +4793,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Photo handling error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ 图片处理失败: {e}")
+            await update.message.reply_text(f"❌ 图片处理失败: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -4873,7 +4884,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Voice handling error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ 语音处理失败: {e}")
+            await update.message.reply_text(f"❌ 语音处理失败: {str(e)[:300]}")
         except Exception:
             pass
     finally:
@@ -4932,7 +4943,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Document handling error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ 文件处理失败: {e}")
+            await update.message.reply_text(f"❌ 文件处理失败: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -4969,7 +4980,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Video handling error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ 视频处理失败: {e}")
+            await update.message.reply_text(f"❌ 视频处理失败: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -5362,7 +5373,7 @@ def main():
                     return
                 try:
                     await application.bot.send_message(
-                        chat_id=config.AUTHORIZED_USER_ID, text=text,
+                        chat_id=config.AUTHORIZED_USER_ID, text=text[:4096],
                     )
                 except Exception:
                     pass
@@ -5383,12 +5394,12 @@ def main():
                     if not anomalies or config.AUTHORIZED_USER_ID is None:
                         return
                     lines = ["Self-Monitor Alert\n"]
-                    for a in anomalies:
-                        lines.append(f"  [{a.get('severity', '?')}] {a.get('type', '?')}: {a.get('message', '')}")
+                    for a in anomalies[:20]:
+                        lines.append(f"  [{a.get('severity', '?')}] {a.get('type', '?')}: {a.get('message', '')[:200]}")
                     try:
                         await application.bot.send_message(
                             chat_id=config.AUTHORIZED_USER_ID,
-                            text="\n".join(lines),
+                            text="\n".join(lines)[:4096],
                         )
                     except Exception:
                         pass

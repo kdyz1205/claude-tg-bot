@@ -550,6 +550,17 @@ def _periodic_state_cleanup():
     for cid in empty_queues:
         _pending_messages.pop(cid, None)
 
+    # Prune completed chat workers
+    done_workers = [cid for cid, t in _chat_workers.items() if t.done()]
+    for cid in done_workers:
+        _chat_workers.pop(cid, None)
+
+    # Prune stale running tasks (stuck for >30min)
+    stale_tasks = [cid for cid, info in _running_tasks.items()
+                   if now - info.get("start_time", 0) > 1800]
+    for cid in stale_tasks:
+        _running_tasks.pop(cid, None)
+
     if stale_chats or stale_locks:
         logger.info(
             f"State cleanup: pruned {len(stale_chats)} stale sessions, "
@@ -1080,8 +1091,8 @@ async def _run_claude_cli(
 
             # Enhanced: also extract tool use summaries from conversation turns
             # Claude CLI --output-format json may include conversation messages
-            tool_summaries = []
-            _all_tool_output_parts = []  # Collect ALL tool output for media path scanning
+            tool_summaries = []  # capped below
+            _all_tool_output_parts = []  # Collect ALL tool output for media path scanning (capped below)
             messages = data.get("messages", [])
             if not messages and isinstance(data.get("content"), list):
                 # Some CLI versions put content blocks at top level
@@ -1102,11 +1113,12 @@ async def _run_claude_cli(
                         tool_input = block.get("input", {})
                         if tool_name == "Bash" or tool_name == "bash":
                             cmd = tool_input.get("command", "")
-                            if cmd:
+                            if cmd and len(tool_summaries) < 50:
                                 tool_summaries.append(f"[Ran: {cmd[:120]}]")
                         elif tool_name in ("Edit", "Write", "Read"):
                             path = tool_input.get("file_path", "")
-                            tool_summaries.append(f"[{tool_name}: {path}]")
+                            if len(tool_summaries) < 50:
+                                tool_summaries.append(f"[{tool_name}: {path}]")
                     # Tool result blocks (in user messages) — collect outputs
                     elif block_type == "tool_result":
                         content_val = block.get("content", "")
@@ -1117,14 +1129,15 @@ async def _run_claude_cli(
                                 if isinstance(b, dict) and b.get("type") == "text"
                             )
                         if isinstance(content_val, str) and content_val.strip():
-                            # Collect all tool output for media scanning
-                            _all_tool_output_parts.append(content_val.strip())
+                            # Collect all tool output for media scanning (cap total size)
+                            if len(_all_tool_output_parts) < 100:
+                                _all_tool_output_parts.append(content_val.strip()[:2000])
                             # Keep short tool results (errors, confirmations)
-                            if len(content_val) < 500:
+                            if len(content_val) < 500 and len(tool_summaries) < 50:
                                 tool_summaries.append(content_val.strip())
 
-            # Store tool output for media extraction by _send_extracted_media
-            _tool_output_text = "\n".join(_all_tool_output_parts)
+            # Store tool output for media extraction by _send_extracted_media (cap at 100KB)
+            _tool_output_text = "\n".join(_all_tool_output_parts)[:100_000]
 
             # If we have tool summaries but no text response, build one
             if tool_summaries and not response:
@@ -1741,8 +1754,8 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         _wants_screenshot = any(k in user_message.lower() for k in
                                 ["screenshot", "截图", "截屏", "屏幕", "看看屏幕", "screen"])
         await _forward_new_screenshots(chat_id, context, user_requested=_wants_screenshot)
-        # Scan both the text response and raw tool outputs for media file paths
-        _media_scan_text = response + "\n" + tool_output_text
+        # Scan both the text response and raw tool outputs for media file paths (cap scan size)
+        _media_scan_text = (response[:50_000] + "\n" + tool_output_text[:50_000])
         await _send_extracted_media(chat_id, context, _media_scan_text)
 
         # Record CLI success for service health tracking
@@ -1891,7 +1904,7 @@ _CONTEXT_TTL = 3600 * 2  # 2 hours idle → reset context
 
 
 def _cleanup_chat_contexts() -> None:
-    """Remove stale entries when dict exceeds 100 entries."""
+    """Remove stale entries when dict exceeds 100 entries. Hard cap at 500."""
     if len(_chat_contexts) <= 100:
         return
     now = time.time()
@@ -1899,6 +1912,12 @@ def _cleanup_chat_contexts() -> None:
              if now - ctx.get("last_updated", 0) > _CONTEXT_TTL]
     for cid in stale:
         del _chat_contexts[cid]
+    # Hard cap: if still too large, drop oldest
+    if len(_chat_contexts) > 500:
+        sorted_items = sorted(_chat_contexts.items(),
+                              key=lambda x: x[1].get("last_updated", 0))
+        for cid, _ in sorted_items[:len(_chat_contexts) - 200]:
+            _chat_contexts.pop(cid, None)
 
 
 def _get_chat_context(chat_id: int) -> dict:
@@ -2088,7 +2107,7 @@ _PROACTIVE_COOLDOWN_SECS = 300  # 5 min between suggestions per chat
 
 
 def _cleanup_proactive_cooldown() -> None:
-    """Remove stale entries when dict exceeds 20 entries."""
+    """Remove stale entries when dict exceeds 20 entries. Hard cap at 200."""
     if len(_proactive_cooldown) <= 20:
         return
     now = time.time()
@@ -2096,6 +2115,11 @@ def _cleanup_proactive_cooldown() -> None:
              if now - ts > _PROACTIVE_COOLDOWN_SECS * 2]
     for cid in stale:
         del _proactive_cooldown[cid]
+    # Hard cap: if still too large after stale cleanup, drop oldest
+    if len(_proactive_cooldown) > 200:
+        sorted_items = sorted(_proactive_cooldown.items(), key=lambda x: x[1])
+        for cid, _ in sorted_items[:len(_proactive_cooldown) - 100]:
+            _proactive_cooldown.pop(cid, None)
 
 
 def _get_proactive_suggestion(message: str, response: str, chat_id: int) -> str | None:

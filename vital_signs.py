@@ -229,11 +229,13 @@ def record_task(success: bool, duration_ms: float = 0):
         else:
             _state["failed_tasks"] = _state.get("failed_tasks", 0) + 1
 
-        # Rolling window: tasks in last hour
+        # Rolling window: tasks in last hour (hard cap at 5000 to prevent unbounded growth)
         tasks_lh = _state.get("tasks_last_hour", [])
         tasks_lh.append(now)
         cutoff = now - 3600
         tasks_lh = [t for t in tasks_lh if t > cutoff]
+        if len(tasks_lh) > 5000:
+            tasks_lh = tasks_lh[-5000:]
         _state["tasks_last_hour"] = tasks_lh
         _state["task_throughput_per_hour"] = len(tasks_lh)
 
@@ -241,6 +243,8 @@ def record_task(success: bool, duration_ms: float = 0):
             errors_lh = _state.get("errors_last_hour", [])
             errors_lh.append(now)
             errors_lh = [t for t in errors_lh if t > cutoff]
+            if len(errors_lh) > 5000:
+                errors_lh = errors_lh[-5000:]
             _state["errors_last_hour"] = errors_lh
 
         _state["last_heartbeat"] = now
@@ -411,7 +415,7 @@ def get_status_text() -> str:
 
     alive_emoji = "🫀" if inv["ALIVE"] else "💀"
 
-    return (
+    text = (
         f"{alive_emoji} Vital Signs — {state_emoji.get(vs['lifecycle'], '?')} {vs['lifecycle'].upper()}\n"
         f"⏱ Uptime: {vs['uptime_hours']:.1f}h\n"
         f"\n"
@@ -431,6 +435,10 @@ def get_status_text() -> str:
         f"| Skills: {vs['skills_created']} "
         f"| Self-heals: {vs['self_heal_successes']}/{vs['self_heals']}"
     )
+    # Truncate for Telegram's 4096 char limit
+    if len(text) > 4000:
+        text = text[:4000] + "\n... (truncated)"
+    return text
 
 
 def _calc_uptime_hours() -> float:

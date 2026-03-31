@@ -131,11 +131,14 @@ class CorrelationHedgeMonitor:
 
         # {symbol: np.ndarray of close prices}
         self._prices: Dict[str, np.ndarray] = {}
+        self._max_symbols: int = 50  # prevent unbounded symbol accumulation
+        self._max_price_bars: int = max(lookback * 3, 500)  # trim stored prices
         # Cached correlation matrix {(sym_a, sym_b): float}
         self._corr_matrix: Dict[Tuple[str, str], float] = {}
         # Historical correlation snapshots for regime-shift detection
         # {(sym_a, sym_b): list[float]}  — most recent appended last
         self._corr_history: Dict[Tuple[str, str], List[float]] = {}
+        self._max_corr_pairs: int = 200  # prevent unbounded pair accumulation
 
     # ------------------------------------------------------------------
     # Price ingestion
@@ -158,6 +161,16 @@ class CorrelationHedgeMonitor:
                 "update_prices: %s received only %d price(s) — need >= 2",
                 symbol,
                 len(prices),
+            )
+            return
+        # Trim stored prices to prevent unbounded memory growth
+        if len(prices) > self._max_price_bars:
+            prices = prices[-self._max_price_bars:]
+        # Prevent unbounded symbol accumulation
+        if symbol not in self._prices and len(self._prices) >= self._max_symbols:
+            logger.warning(
+                "update_prices: symbol limit (%d) reached, ignoring %s",
+                self._max_symbols, symbol,
             )
             return
         self._prices[symbol] = prices
@@ -213,6 +226,10 @@ class CorrelationHedgeMonitor:
                 key = (sym_a, sym_b)
                 matrix[key] = corr
                 # Store history for regime-shift detection (bounded to prevent memory leak)
+                if key not in self._corr_history and len(self._corr_history) >= self._max_corr_pairs:
+                    # Evict oldest pair history to prevent unbounded dict growth
+                    oldest_key = next(iter(self._corr_history))
+                    del self._corr_history[oldest_key]
                 hist = self._corr_history.setdefault(key, [])
                 hist.append(corr)
                 if len(hist) > 500:

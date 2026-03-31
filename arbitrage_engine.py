@@ -48,6 +48,7 @@ ALERT_COOLDOWN   = 600            # 10-min cooldown per pair+exchange combo
 HISTORY_FILE     = ".arbitrage_history.json"
 ARB_SIGNALS_FILE = ".arbitrage_log.jsonl"        # JSONL log of all arb signals (Phase3 Task26)
 MAX_HISTORY_DAYS = 30             # days of history to retain
+TG_MSG_LIMIT = 4096              # Telegram message character limit
 SMART_WALLETS_FILE = ".smart_wallets.json"
 MAX_WALLETS_ARB_SIGNALS = 50      # max arb signals kept in .smart_wallets.json
 
@@ -86,7 +87,7 @@ class ArbEngine:
         self._signals: list[dict] = []                    # live WS signals cache
         self._alert_cooldown: dict[str, float] = {}       # cooldown_key → last_ts
         self._history: list[dict] = []                    # all recorded opportunities
-        self._scan_stats = {"scanned": 0, "qualified": 0, "alerted": 0}
+        self._scan_stats = {"scanned": 0, "qualified": 0, "alerted": 0, "reset_ts": time.time()}
         self._wallets_lock = __import__('threading').Lock()
         self._load_history()
 
@@ -130,6 +131,11 @@ class ArbEngine:
 
     def _update_price(self, pair: str, exchange: str, price: float) -> None:
         if pair not in self._prices:
+            # Cap prices dict to prevent unbounded growth from REST scan
+            if len(self._prices) > 200:
+                # Keep only pairs that are in SYMBOLS or recently active
+                keep = set(SYMBOLS)
+                self._prices = {k: v for k, v in self._prices.items() if k in keep}
             self._prices[pair] = {}
         self._prices[pair][exchange] = price
         self._evaluate_arb(pair)
@@ -239,7 +245,9 @@ class ArbEngine:
                     logger.warning("ArbEngine REST scan: OKX returned no tickers")
                     return
 
-                # 2. Volume filter + update cache
+                # 2. Volume filter + update cache (cap to prevent unbounded growth)
+                if len(self._volumes) > 500:
+                    self._volumes.clear()
                 self._volumes.update({p: d["vol_usdt"] for p, d in okx_tickers.items()})
                 qualified = {
                     p: d for p, d in okx_tickers.items()
@@ -252,6 +260,9 @@ class ArbEngine:
                 )[:50]
 
                 self._scan_stats["scanned"] += len(top50)
+                # Reset counters daily to prevent integer overflow
+                if time.time() - self._scan_stats.get("reset_ts", 0) > 86400:
+                    self._scan_stats = {"scanned": len(top50), "qualified": 0, "alerted": 0, "reset_ts": time.time()}
                 if not top50:
                     return
 
@@ -775,7 +786,8 @@ def format_arb_top5(signals: list[dict]) -> str:
     lines = [f"🔀 实时套利信号 Top {len(signals)}\n"]
     for i, sig in enumerate(signals, 1):
         lines.append(f"{i}. {format_arb_signal(sig)}")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
 def format_arb_top10(signals: list[dict]) -> str:
@@ -784,7 +796,8 @@ def format_arb_top10(signals: list[dict]) -> str:
     lines = [f"🔀 实时套利信号 Top {len(signals)}\n"]
     for i, sig in enumerate(signals, 1):
         lines.append(f"{i}. {format_arb_signal(sig)}")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
 def format_arb_today(summary: dict) -> str:
@@ -815,7 +828,8 @@ def format_arb_today(summary: dict) -> str:
             f" | 价差{opp['spread_pct']:.3f}% | 净{opp.get('net_profit_pct', 0):.3f}%"
             f"{vol_str} [{t}]"
         )
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────

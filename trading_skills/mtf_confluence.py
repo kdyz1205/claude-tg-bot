@@ -345,8 +345,9 @@ class MultiTimeframeConfluence:
                 # Active disagreement – penalise proportionally
                 weighted_score -= weight * 0.5
 
-            # Key-level proximity flags
-            self._check_key_level_flags(tf, detail, price, flags)
+            # Key-level proximity flags (cap to prevent unbounded growth)
+            if len(flags) < 50:
+                self._check_key_level_flags(tf, detail, price, flags)
 
         total_timeframes = len(tf_details)
         if total_timeframes == 0:

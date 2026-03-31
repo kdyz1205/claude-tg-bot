@@ -10,7 +10,7 @@ import logging
 import os
 import tempfile
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any, Callable, Coroutine
 
@@ -247,8 +247,8 @@ class ProactiveAgent:
 
     async def _health_watchdog_loop(self) -> None:
         """Every 15 minutes, check system vitals and alert if critical."""
-        # Keep a short history for trend detection
-        mem_history: list[float] = []
+        # Keep a short history for trend detection (capped with maxlen)
+        mem_history: deque[float] = deque(maxlen=60)
 
         while self._running:
             try:
@@ -273,8 +273,6 @@ class ProactiveAgent:
 
                 # Memory trend: track slow climb
                 mem_history.append(health["mem"])
-                if len(mem_history) > 60:
-                    mem_history.pop(0)
                 if len(mem_history) >= 12:
                     # Compare first quarter vs last quarter
                     q = max(1, len(mem_history) // 4)

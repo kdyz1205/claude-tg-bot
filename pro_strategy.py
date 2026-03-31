@@ -450,7 +450,7 @@ async def _strategy_smart_money(symbol: str, candles: list, cfg: dict) -> dict:
     direction = "long" if direction_votes["long"] > direction_votes["short"] else (
         "short" if direction_votes["short"] > direction_votes["long"] else "neutral"
     )
-    return {"score": min(score, 100), "direction": direction, "reasons": reasons}
+    return {"score": min(score, 100), "direction": direction, "reasons": reasons[:10]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -538,7 +538,7 @@ def _strategy_mean_reversion(candles: list, cfg: dict) -> dict:
     direction = "long" if direction_votes["long"] > direction_votes["short"] else (
         "short" if direction_votes["short"] > direction_votes["long"] else "neutral"
     )
-    return {"score": min(score, 100), "direction": direction, "reasons": reasons}
+    return {"score": min(score, 100), "direction": direction, "reasons": reasons[:10]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -631,7 +631,7 @@ def _strategy_momentum(candles: list, cfg: dict) -> dict:
     direction = "long" if direction_votes["long"] > direction_votes["short"] else (
         "short" if direction_votes["short"] > direction_votes["long"] else "neutral"
     )
-    return {"score": min(score, 100), "direction": direction, "reasons": reasons}
+    return {"score": min(score, 100), "direction": direction, "reasons": reasons[:10]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -785,7 +785,10 @@ def format_pro_signal(sig: dict) -> str:
             reason_lines.append(f"  \u2022 {r}")
     lines.extend(reason_lines[:4])
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (截断)"
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -794,6 +797,8 @@ def format_pro_signal(sig: dict) -> str:
 
 class ProStrategyEngine:
     """Background scanner: runs pro strategy on interval."""
+
+    _MAX_LAST_SIGNALS = 50
 
     def __init__(self, send_func=None):
         self._send = send_func
@@ -832,7 +837,7 @@ class ProStrategyEngine:
                 cfg = load_pro_config()
                 signals = await scan_all_pro(cfg)
                 if signals:
-                    self._last_signals = signals
+                    self._last_signals = signals[:self._MAX_LAST_SIGNALS]
                     min_score = cfg.get("min_combined_score", 60)
                     # Record and send top signals (double-check score threshold)
                     for sig in signals[:3]:

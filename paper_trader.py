@@ -555,7 +555,10 @@ def format_stats_full() -> str:
             else:
                 lines.append(f"  \u23f3 {t.get('symbol', '?')}: \u7b49\u5f85\u4ef7\u683c\u66f4\u65b0 | {age_h:.1f}h")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:3950] + "\n\n... (截断，内容过长)"
+    return result
 
 
 # ─── Signal Integration ───

@@ -696,6 +696,12 @@ async def detect_and_fill_knowledge_gap(user_message: str) -> str | None:
 
         # Knowledge gap detected! Trigger background learning
         # Don't block the user — learn async and have it ready for next time
+        # Cap background tasks to prevent unbounded growth
+        if len(_background_tasks) >= 20:
+            # Clean up completed tasks
+            _background_tasks.difference_update({t for t in _background_tasks if t.done()})
+        if len(_background_tasks) >= 20:
+            return None  # Too many pending tasks, skip
         task = asyncio.create_task(_learn_domain(domains, data.get("doc_urls", [])))
         _background_tasks.add(task)
         def _on_learn_done(t, _discard=_background_tasks.discard):
@@ -752,8 +758,31 @@ async def _learn_domain(domains: list, doc_urls: list):
 简洁实用，不超过800字。只输出Markdown。"""
 
         try:
+            # Cap knowledge files count to prevent unbounded directory growth
+            try:
+                kb_files = [f for f in os.listdir(KNOWLEDGE_DIR) if f.endswith(".md")]
+                if len(kb_files) > 100:
+                    # Delete oldest files by mtime
+                    kb_with_mtime = []
+                    for f in kb_files:
+                        fp = os.path.join(KNOWLEDGE_DIR, f)
+                        try:
+                            kb_with_mtime.append((os.path.getmtime(fp), fp))
+                        except OSError:
+                            pass
+                    kb_with_mtime.sort()
+                    for _, fp in kb_with_mtime[:len(kb_with_mtime) - 100]:
+                        try:
+                            os.unlink(fp)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
             raw = await _run_claude_raw(prompt=prompt, model="claude-haiku-4-5-20251001", timeout=20)
             if raw and len(raw) > 100:
+                # Cap individual knowledge file size
+                raw = raw[:10000]
                 tmp_kb = kb_file + ".tmp"
                 Path(tmp_kb).write_text(raw, encoding="utf-8")
                 with open(tmp_kb, "rb+") as _fh:
@@ -944,6 +973,11 @@ def _update_meta(experiment: dict, result: dict):
     type_stats[exp_type]["attempts"] += 1
     if result.get("success"):
         type_stats[exp_type]["successes"] += 1
+    # Cap experiment type tracking to prevent unbounded dict growth
+    if len(type_stats) > 50:
+        # Keep the 50 types with most attempts
+        sorted_types = sorted(type_stats.items(), key=lambda x: x[1].get("attempts", 0), reverse=True)
+        type_stats = dict(sorted_types[:50])
     meta["experiment_types_success"] = type_stats
 
     # Adjust learning rate: if experiments keep failing, slow down

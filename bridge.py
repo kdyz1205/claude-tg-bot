@@ -41,10 +41,18 @@ def _read_json(path: Path):
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         logger.warning(f"Corrupted JSON in {path.name}, resetting: {e}")
-        # Back up corrupt file for diagnosis, then reset
+        # Back up corrupt file for diagnosis, then reset (keep max 5 backups)
         try:
             backup = path.with_suffix(f".corrupt.{int(time.time())}.json")
             shutil.copy2(str(path), str(backup))
+            # Clean up old corrupt backups to prevent unbounded accumulation
+            import glob as _glob
+            corrupt_files = sorted(_glob.glob(str(path.with_suffix(".corrupt.*.json"))))
+            for old in corrupt_files[:-5]:
+                try:
+                    os.unlink(old)
+                except OSError:
+                    pass
         except Exception:
             pass
         return []
@@ -91,6 +99,8 @@ def write_to_inbox(chat_id: int, user_message: str) -> int:
         return _write_to_inbox_locked(chat_id, user_message)
 
 
+_MAX_INBOX_MESSAGES = 200
+
 def _write_to_inbox_locked(chat_id: int, user_message: str) -> int:
     messages = _read_json(INBOX)
     # Use max existing ID + 1 to avoid collisions after clear()
@@ -98,10 +108,13 @@ def _write_to_inbox_locked(chat_id: int, user_message: str) -> int:
     messages.append({
         "id": msg_id,
         "chat_id": chat_id,
-        "message": user_message,
+        "message": user_message[:50000],  # Cap message size
         "timestamp": datetime.now().isoformat(),
         "read": False,
     })
+    # Trim old messages to prevent unbounded growth
+    if len(messages) > _MAX_INBOX_MESSAGES:
+        messages = messages[-_MAX_INBOX_MESSAGES:]
     _write_json(INBOX, messages)
     return msg_id
 
@@ -157,6 +170,8 @@ def check_inbox() -> list[dict]:
         return unread
 
 
+_MAX_OUTBOX_MESSAGES = 200
+
 def send_response(message_id: int, chat_id: int, response: str):
     """Write a response for the bot to send back to Telegram."""
     with _bridge_lock:
@@ -164,10 +179,16 @@ def send_response(message_id: int, chat_id: int, response: str):
         responses.append({
             "reply_to_id": message_id,
             "chat_id": chat_id,
-            "response": response,
+            "response": response[:100000],  # Cap response size
             "timestamp": datetime.now().isoformat(),
             "sent": False,
         })
+        # Trim old sent responses to prevent unbounded growth
+        if len(responses) > _MAX_OUTBOX_MESSAGES:
+            # Keep unsent messages + most recent sent ones
+            unsent = [r for r in responses if not r.get("sent")]
+            sent = [r for r in responses if r.get("sent")]
+            responses = sent[-(max(0, _MAX_OUTBOX_MESSAGES - len(unsent))):] + unsent
         _write_json(OUTBOX, responses)
 
 
@@ -192,7 +213,10 @@ if __name__ == "__main__":
                 if msg_id is not None and msg_id not in seen:
                     seen.add(msg_id)
                     print(f"\n📩 [{msg_id}] {msg.get('timestamp', '?')}")
-                    print(f"   {msg.get('message', '')}")
+                    print(f"   {msg.get('message', '')[:500]}")
+            # Prevent seen set from growing unbounded
+            if len(seen) > 10000:
+                seen = set(sorted(seen)[-5000:])
             time.sleep(2)
     elif len(sys.argv) > 1 and sys.argv[1] == "clear":
         clear_bridge()

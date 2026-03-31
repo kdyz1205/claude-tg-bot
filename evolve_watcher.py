@@ -15,6 +15,7 @@ import os
 import json
 import sys
 import logging
+import logging.handlers
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -35,7 +36,9 @@ TARGET_CWD = r"C:\Users\alexl\Desktop\claude tg bot"
 SESSIONS_DIR = Path.home() / ".claude" / "projects"
 
 _logger = logging.getLogger("evolve_watcher")
-_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE, encoding="utf-8", maxBytes=5_000_000, backupCount=2  # 5 MB cap with 2 backups
+)
 _handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
 _logger.addHandler(_handler)
 _logger.setLevel(logging.INFO)
@@ -96,7 +99,11 @@ def advance_queue(q, completed_task_name):
     if idx < len(tasks):
         tasks[idx]["status"] = "completed"
         tasks[idx]["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        q.setdefault("completed_tasks", []).append(tasks[idx]["name"])
+        completed = q.setdefault("completed_tasks", [])
+    completed.append(tasks[idx]["name"])
+    # Cap completed_tasks to prevent unbounded list growth
+    if len(completed) > 200:
+        q["completed_tasks"] = completed[-200:]
     q["current_task_index"] = idx + 1
 
     # If all done, loop back
