@@ -215,6 +215,7 @@ def open_paper_trade(token: dict, cfg: dict = None) -> Optional[dict]:
         "price_history": [],
         "peak_pnl_pct": 0.0,
         "trough_pnl_pct": 0.0,
+        "direction": token.get("direction", "long"),  # "long" or "short"
         "alpha_score": token.get("score", 0),
         "signal_source": token.get("source", "onchain_filter"),
     }
@@ -309,7 +310,11 @@ async def check_and_update_trades(send_func=None) -> dict:
         if entry <= 0:
             continue
 
-        pnl_pct = ((price - entry) / entry) * 100
+        direction = trade.get("direction", "long")
+        if direction == "short":
+            pnl_pct = ((entry - price) / entry) * 100  # shorts profit when price drops
+        else:
+            pnl_pct = ((price - entry) / entry) * 100
         age_hours = (now - trade.get("entry_time", now)) / 3600
 
         # Update price history (keep last 100 entries per trade)

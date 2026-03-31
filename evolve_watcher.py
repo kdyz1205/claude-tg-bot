@@ -96,11 +96,11 @@ def advance_queue(q, completed_task_name):
     """Mark current task done, move to next."""
     idx = q.get("current_task_index", 0)
     tasks = q.get("tasks", [])
+    completed = q.setdefault("completed_tasks", [])
     if idx < len(tasks):
         tasks[idx]["status"] = "completed"
         tasks[idx]["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        completed = q.setdefault("completed_tasks", [])
-    completed.append(tasks[idx].get("name", "unknown"))
+        completed.append(tasks[idx].get("name", "unknown"))
     # Cap completed_tasks to prevent unbounded list growth
     if len(completed) > 200:
         q["completed_tasks"] = completed[-200:]
@@ -455,7 +455,7 @@ def run_loop(interval=180):
                     if q:
                         task = get_current_task(q)
                         if task:
-                            notify_tg(f"🚀 开始任务{task['id']}/7: {task['name']}")
+                            notify_tg(f"🚀 开始任务{task.get('id', '?')}/7: {task.get('name', '?')}")
                     save_state(state)
                     continue
 
