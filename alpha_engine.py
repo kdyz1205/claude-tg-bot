@@ -1018,6 +1018,15 @@ class AlphaEngine:
                     await self._send(report)
                     record_push(tokens)
 
+                # Auto-open paper trades for alpha tokens
+                if tokens:
+                    try:
+                        import paper_trader as _pt
+                        if hasattr(_pt, 'on_signal_detected'):
+                            await _pt.on_signal_detected(tokens)
+                    except Exception:
+                        pass
+
                 # Onchain filter scan — only push NEW tokens (no duplicates)
                 try:
                     oc_tokens = await scan_onchain_filter()
@@ -1025,6 +1034,14 @@ class AlphaEngine:
                     if new_oc and self._send:
                         oc_report = format_onchain_filter_report(new_oc)
                         await self._send(oc_report)
+                    # Auto-open paper trades for onchain filter tokens
+                    if new_oc:
+                        try:
+                            import paper_trader as _pt
+                            if hasattr(_pt, 'on_signal_detected'):
+                                await _pt.on_signal_detected(new_oc)
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.debug("AlphaEngine: onchain filter error: %s", e)
 

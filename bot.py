@@ -81,6 +81,13 @@ except ImportError:
     _optimizer_available = False
 
 try:
+    import paper_trader as _paper_trader
+    _paper_trader_available = True
+except ImportError:
+    _paper_trader = None
+    _paper_trader_available = False
+
+try:
     from alpha_engine import alpha_engine as _alpha_engine, scan_alpha as _scan_alpha
     from alpha_engine import format_alpha_report as _format_alpha_report
     from alpha_engine import format_alpha_stats as _format_alpha_stats
@@ -1915,9 +1922,56 @@ async def onchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(report[:4000])
         except Exception:
             await update.message.reply_text(report[:4000])
+        # Auto-open paper trades for qualifying tokens
+        if tokens and _paper_trader_available and _paper_trader is not None and hasattr(_paper_trader, 'on_signal_detected'):
+            try:
+                opened = await _paper_trader.on_signal_detected(tokens)
+                if opened:
+                    await _safe_reply(update.message, f"📝 自动开启 {len(opened)} 笔 Paper Trade")
+            except Exception as e:
+                logger.debug(f"Paper trade auto-open error: {e}")
     except Exception as e:
         logger.error(f"Onchain filter error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Onchain扫描失败: {str(e)[:300]}")
+
+
+async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paper trading status and control. /paper [on|off|stats|close]"""
+    if not update.message:
+        return
+    if not _paper_trader_available or _paper_trader is None:
+        await _safe_reply(update.message, "❌ Paper Trading 模块不可用")
+        return
+    args = context.args or []
+    subcmd = args[0].lower() if args else "stats"
+
+    if subcmd == "on":
+        cfg = _paper_trader._load_config()
+        cfg["enabled"] = True
+        _paper_trader._save_config(cfg)
+        await _safe_reply(update.message, "✅ Paper Trading 已开启")
+    elif subcmd == "off":
+        cfg = _paper_trader._load_config()
+        cfg["enabled"] = False
+        _paper_trader._save_config(cfg)
+        await _safe_reply(update.message, "⏸ Paper Trading 已暂停")
+    elif subcmd in ("close", "closeall"):
+        # Close all open positions at current price
+        trades = _paper_trader._load_trades()
+        open_trades = [t for t in trades if t.get("status") == "open"]
+        if not open_trades:
+            await _safe_reply(update.message, "没有持仓需要平仓")
+            return
+        closed = 0
+        for t in open_trades:
+            price = await _paper_trader._fetch_current_price(t.get("address", ""))
+            if price and price > 0:
+                _paper_trader.close_paper_trade(t["id"], price, "manual")
+                closed += 1
+        await _safe_reply(update.message, f"✅ 已手动平仓 {closed}/{len(open_trades)} 笔")
+    else:
+        report = _paper_trader.format_stats_full()
+        await _safe_reply(update.message, report[:4096])
 
 
 async def arb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4297,6 +4351,7 @@ def main():
     app.add_handler(CommandHandler("signal_stats", signal_stats_command, filters=auth_filter))
     app.add_handler(CommandHandler("alpha", alpha_command, filters=auth_filter))
     app.add_handler(CommandHandler("onchain", onchain_command, filters=auth_filter))
+    app.add_handler(CommandHandler("paper", paper_command, filters=auth_filter))
     app.add_handler(CommandHandler("arb", arb_command, filters=auth_filter))
     app.add_handler(CommandHandler("search", search_command, filters=auth_filter))
     app.add_handler(CommandHandler("whales", whales_command, filters=auth_filter))
@@ -4732,6 +4787,25 @@ def main():
         except Exception as e:
             logger.warning(f"AlphaEngine failed to start: {e}")
 
+        # ─── PaperTrader: background paper trading monitor ──────────────────
+        try:
+            if _paper_trader_available and _paper_trader is not None:
+                async def _paper_send(text):
+                    if config.AUTHORIZED_USER_ID is None:
+                        return
+                    try:
+                        await application.bot.send_message(
+                            chat_id=config.AUTHORIZED_USER_ID,
+                            text=text[:4096],
+                        )
+                    except Exception:
+                        pass
+                _paper_trader.paper_trader._send = _paper_send
+                await _paper_trader.paper_trader.start(_paper_send)
+                logger.info("PaperTrader background monitor started")
+        except Exception as e:
+            logger.warning(f"PaperTrader failed to start: {e}")
+
         # ─── Pro Strategy Engine: multi-strategy fusion scanner ─────────────
         try:
             from pro_strategy import pro_engine as _pro_engine
@@ -4946,6 +5020,12 @@ def main():
         try:
             if _profit_tracker.profit_tracker.running:
                 await _profit_tracker.profit_tracker.stop()
+        except Exception:
+            pass
+        # Stop PaperTrader
+        try:
+            if _paper_trader_available and _paper_trader is not None and _paper_trader.paper_trader.running:
+                await _paper_trader.paper_trader.stop()
         except Exception:
             pass
         # Stop EvolveWatcher subprocess
