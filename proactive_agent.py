@@ -282,7 +282,7 @@ class ProactiveAgent:
                     if climb > 10:
                         alerts.append(
                             f"Memory trending up: {first_avg:.1f}% -> {last_avg:.1f}% "
-                            f"(+{climb:.1f}% over {len(mem_history) * 5}min)"
+                            f"(+{climb:.1f}% over {len(mem_history) * 15}min)"
                         )
 
                 if alerts:
@@ -419,6 +419,8 @@ class ProactiveAgent:
 
                 # Drawdown warnings
                 for pos_name, pos in positions.items():
+                    if not isinstance(pos, dict):
+                        continue
                     pnl_pct = pos.get("pnl_pct", 0)
                     if pnl_pct < -5:
                         alerts.append(
@@ -1007,7 +1009,7 @@ class ProactiveAgent:
             positions = state.get("positions", {})
             if not positions:
                 return "Trading active, no open positions"
-            total_pnl = sum(p.get("pnl_pct", 0) for p in positions.values())
+            total_pnl = sum(p.get("pnl_pct", 0) for p in positions.values() if isinstance(p, dict))
             return (
                 f"{len(positions)} open position(s), "
                 f"total PnL: {total_pnl:+.2f}%"

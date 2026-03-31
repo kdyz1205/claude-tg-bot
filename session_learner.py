@@ -714,7 +714,7 @@ class SessionLearner:
                 # Start new exchange
                 if current:
                     exchanges.append(current)
-                content = message.get("content", "")
+                content = message.get("content", "") if isinstance(message, dict) else str(message)
                 if isinstance(content, list):
                     text_parts = [
                         b.get("text", "") for b in content
@@ -730,6 +730,8 @@ class SessionLearner:
                 }
 
             elif msg_type == "assistant" and current is not None:
+                if not isinstance(message, dict):
+                    continue
                 content = message.get("content", [])
                 if isinstance(content, list):
                     had_error_this_turn = False
@@ -880,6 +882,10 @@ class SessionLearner:
         for e in entries:
             if e.get("type") == "user":
                 msg = e.get("message", {})
+                if not isinstance(msg, dict):
+                    if isinstance(msg, str) and msg.strip():
+                        user_msgs.append(msg[:500])
+                    continue
                 content = msg.get("content", "")
                 if isinstance(content, str) and content.strip():
                     user_msgs.append(content[:500])
@@ -933,8 +939,8 @@ class SessionLearner:
 
         for p in patterns:
             self._knowledge["patterns"].append(p)
-        if len(self._knowledge["patterns"]) > 2000:
-            self._knowledge["patterns"] = self._knowledge["patterns"][-2000:]
+        if len(self._knowledge["patterns"]) > self._MAX_PATTERNS:
+            self._knowledge["patterns"] = self._knowledge["patterns"][-self._MAX_PATTERNS:]
 
         self._knowledge["stats"]["patterns_extracted"] = len(self._knowledge["patterns"])
         self._save_knowledge()

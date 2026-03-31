@@ -137,7 +137,7 @@ async def _etherscan_txlist(address: str, api_key: str, base_url: str) -> list:
         if data.get("status") == "1":
             min_ts = int(time.time()) - LOOKBACK_SECONDS
             return [tx for tx in data.get("result", [])
-                    if int(tx.get("timeStamp", 0)) >= min_ts]
+                    if int(tx.get("timeStamp") or 0) >= min_ts]
     except Exception as e:
         logger.debug("txlist %s: %s", address[:8], e)
     return []
@@ -157,7 +157,7 @@ async def _etherscan_tokentx(address: str, api_key: str, base_url: str) -> list:
         if data.get("status") == "1":
             min_ts = int(time.time()) - LOOKBACK_SECONDS
             return [tx for tx in data.get("result", [])
-                    if int(tx.get("timeStamp", 0)) >= min_ts]
+                    if int(tx.get("timeStamp") or 0) >= min_ts]
     except Exception as e:
         logger.debug("tokentx %s: %s", address[:8], e)
     return []
@@ -185,7 +185,7 @@ _STABLECOINS = {"USDT", "USDC", "DAI", "BUSD", "TUSD", "FRAX", "LUSD", "USDD"}
 
 
 def _classify_native(tx: dict, address: str, prices: dict, network: str) -> Optional[dict]:
-    value_wei = int(tx.get("value", "0"))
+    value_wei = int(tx.get("value") or "0")
     if value_wei == 0:
         return None
     symbol = "ETH" if network == "eth" else "BNB"
@@ -197,7 +197,7 @@ def _classify_native(tx: dict, address: str, prices: dict, network: str) -> Opti
     return {
         "token": symbol, "amount_usd": round(amount_usd),
         "action": action, "tx_hash": tx.get("hash", ""),
-        "timestamp": int(tx.get("timeStamp", time.time())),
+        "timestamp": int(tx.get("timeStamp") or time.time()),
     }
 
 
@@ -207,7 +207,7 @@ def _classify_erc20(tx: dict, address: str) -> Optional[dict]:
         return None  # no free per-token price source; skip
     try:
         decimals = max(0, min(int(tx.get("tokenDecimal", 18)), 18))
-        amount_usd = int(tx.get("value", "0")) / (10 ** decimals)
+        amount_usd = int(tx.get("value") or "0") / (10 ** decimals)
     except Exception:
         return None
     if amount_usd < MIN_TRANSFER_USD:
@@ -217,7 +217,7 @@ def _classify_erc20(tx: dict, address: str) -> Optional[dict]:
     return {
         "token": token, "amount_usd": round(amount_usd),
         "action": action, "tx_hash": tx.get("hash", ""),
-        "timestamp": int(tx.get("timeStamp", time.time())),
+        "timestamp": int(tx.get("timeStamp") or time.time()),
     }
 
 
@@ -564,7 +564,7 @@ class OnchainTracker:
         lines = [f"👁 监控地址列表 ({len(self._addresses)})\n"]
         for addr, meta in list(self._addresses.items())[:50]:
             lines.append(
-                f"  [{meta['network'].upper()}] {meta['label']}: {addr[:12]}..."
+                f"  [{meta.get('network', 'eth').upper()}] {meta.get('label', '?')}: {addr[:12]}..."
             )
         result = "\n".join(lines)
         return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
@@ -744,7 +744,9 @@ class SmartMoneyTracker:
         if len(self._recent_activity) > 1000:
             self._recent_activity = self._recent_activity[-1000:]
         if len(self._seen_hashes) > 5000:
-            self._seen_hashes = set(list(self._seen_hashes)[-2500:])
+            # Note: set→list ordering is arbitrary, but pruning to reduce size is still useful
+            oldest = sorted(self._seen_hashes)[:len(self._seen_hashes) - 2500]
+            self._seen_hashes -= set(oldest)
         # Prune unbounded discovery/buy dicts
         if len(self._new_token_discoveries) > 200:
             cutoff_disc = time.time() - 3600
@@ -884,9 +886,17 @@ class SmartMoneyTracker:
                 with open(SMART_CACHE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self._token_price_cache = data.get("token_prices", {})
+                # Prune stale price cache entries on load
+                now = time.time()
+                self._token_price_cache = {
+                    k: v for k, v in self._token_price_cache.items()
+                    if isinstance(v, dict) and now - v.get("ts", 0) < 3600
+                } if len(self._token_price_cache) > 500 else self._token_price_cache
                 self._new_token_discoveries = data.get("new_token_discoveries", {})
-                # Rebuild emitted_consensus from saved set
-                self._emitted_consensus = set(data.get("emitted_consensus", []))
+                # Rebuild emitted_consensus from saved set, prune old hour-buckets
+                current_hour = datetime.now().strftime("%Y%m%d%H")
+                raw_consensus = data.get("emitted_consensus", [])
+                self._emitted_consensus = {k for k in raw_consensus if k >= current_hour[:8]} if raw_consensus else set()
                 logger.info("SmartMoney v2 cache loaded")
             except Exception as e:
                 logger.debug("v2 cache load failed: %s", e)
@@ -1065,9 +1075,9 @@ class SmartMoneyTracker:
         total_usd = sum(b.get("amount_usd", 0) for b in buys)
         wallet_lines = []
         for b in buys[:20]:  # Cap wallet lines
-            score = self._get_wallet_score(b["wallet"])
+            score = self._get_wallet_score(b.get("wallet", ""))
             wallet_lines.append(
-                f"  • {b['label']} (评分{score}) ${b['amount_usd']:,.0f}"
+                f"  • {b.get('label', '?')} (评分{score}) ${b.get('amount_usd', 0):,.0f}"
             )
         result = "\n".join([
             f"🔥🔥🔥 聪明钱共识买入信号",
@@ -1429,8 +1439,8 @@ class SmartMoneyTracker:
             token_symbol = tx.get("tokenSymbol", "UNKNOWN")
             token_name = tx.get("tokenName", token_symbol)
             contract_addr = tx.get("contractAddress", "")
-            decimals = int(tx.get("tokenDecimal", 18))
-            token_amount = int(tx.get("value", "0")) / (10 ** decimals)
+            decimals = max(0, min(int(tx.get("tokenDecimal", 18) or 18), 18))
+            token_amount = int(tx.get("value") or "0") / (10 ** decimals)
 
             amount_usd = 0.0
             current_price = 0.0
@@ -1466,7 +1476,7 @@ class SmartMoneyTracker:
                 "entry_price": current_price,
                 "action": "buy",
                 "tx_hash": tx.get("hash", ""),
-                "timestamp": int(tx.get("timeStamp", time.time())),
+                "timestamp": int(tx.get("timeStamp") or time.time()),
                 "network": network,
             }
         except Exception as e:
@@ -1487,7 +1497,7 @@ class SmartMoneyTracker:
             if not change_amount or int(change_amount) <= 0:
                 return None
 
-            decimals = int(tx.get("decimals") or 9)
+            decimals = max(0, min(int(tx.get("decimals") or 9), 18))
             token_amount = abs(int(change_amount)) / (10 ** decimals)
             token_symbol = tx.get("tokenSymbol") or tx.get("symbol") or "UNKNOWN"
             token_name = tx.get("tokenName") or token_symbol
@@ -1565,7 +1575,7 @@ class SmartMoneyTracker:
             net_emoji = {"eth": "🔷", "bsc": "🟡", "sol": "☀️"}.get(meta.get("network", ""), "🔗")
             added = ""
             if meta.get("added_at"):
-                added = f" (added {datetime.fromtimestamp(meta['added_at']).strftime('%m/%d')})"
+                added = f" (added {datetime.fromtimestamp(meta.get('added_at', 0)).strftime('%m/%d')})"
             lines.append(
                 f"{net_emoji} {meta.get('label', '?')}: {addr[:8]}...{addr[-4:]}{added}"
             )

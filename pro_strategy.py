@@ -201,16 +201,17 @@ async def _fetch_long_short_ratio(symbol: str) -> Optional[float]:
 
 def _parse_candles(candles: list) -> dict:
     """Parse OKX candles into OHLCV lists."""
-    o = [float(c[1]) for c in candles]
-    h = [float(c[2]) for c in candles]
-    l = [float(c[3]) for c in candles]
-    cl = [float(c[4]) for c in candles]
-    v = [float(c[5]) for c in candles]
+    valid = [c for c in candles if len(c) >= 6]
+    o = [float(c[1]) for c in valid]
+    h = [float(c[2]) for c in valid]
+    l = [float(c[3]) for c in valid]
+    cl = [float(c[4]) for c in valid]
+    v = [float(c[5]) for c in valid]
     return {"open": o, "high": h, "low": l, "close": cl, "volume": v}
 
 
 def _ema(values: list, period: int) -> list:
-    if len(values) < period:
+    if period <= 0 or len(values) < period:
         return [None] * len(values)
     k = 2 / (period + 1)
     result = [None] * (period - 1)
@@ -223,6 +224,8 @@ def _ema(values: list, period: int) -> list:
 
 
 def _sma(values: list, period: int) -> list:
+    if period <= 0:
+        return [None] * len(values)
     result = [None] * (period - 1)
     for i in range(period - 1, len(values)):
         result.append(sum(values[i - period + 1:i + 1]) / period)
@@ -247,6 +250,8 @@ def _rsi(closes: list, period: int = 14) -> Optional[float]:
 
 
 def _rsi_series(closes: list, period: int = 14) -> list:
+    if period <= 0:
+        return [None] * len(closes)
     result = [None] * period
     if len(closes) < period + 1:
         return [None] * len(closes)
@@ -276,7 +281,7 @@ def _bollinger(closes: list, period: int = 20, std_mult: float = 2.0) -> dict:
     lower = mid - std_mult * std
     price = closes[-1]
     pct_b = (price - lower) / (upper - lower) if upper != lower else 0.5
-    return {"upper": upper, "mid": mid, "lower": lower, "pct_b": pct_b, "bandwidth": (upper - lower) / mid * 100}
+    return {"upper": upper, "mid": mid, "lower": lower, "pct_b": pct_b, "bandwidth": (upper - lower) / mid * 100 if mid != 0 else 0}
 
 
 def _atr(candles: list, period: int = 14) -> Optional[float]:
@@ -516,7 +521,8 @@ def _strategy_mean_reversion(candles: list, cfg: dict) -> dict:
     if len(closes) >= 20 and len(rsi_arr) >= 20:
         if (rsi_arr[-1] is not None and rsi_arr[-10] is not None
                 and closes[-1] < min(closes[-10:-5])
-                and rsi_arr[-1] > min(r for r in rsi_arr[-10:-5] if r is not None)):
+                and (valid_rsi := [r for r in rsi_arr[-10:-5] if r is not None])
+                and rsi_arr[-1] > min(valid_rsi)):
             score += 20
             direction_votes["long"] += 1
             reasons.append("RSI看涨背离")
@@ -741,7 +747,7 @@ async def scan_all_pro(cfg: dict = None) -> list:
     async with httpx.AsyncClient(timeout=12) as client:
         _pro_client = client
         try:
-            tasks = [analyze_symbol(sym, cfg) for sym in cfg["symbols"]]
+            tasks = [analyze_symbol(sym, cfg) for sym in cfg.get("symbols", [])]
             results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             _pro_client = None
@@ -849,7 +855,7 @@ class ProStrategyEngine:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("ProStrategyEngine error: %s", e)
+                logger.error("ProStrategyEngine error: %s", str(e)[:300])
             try:
                 cfg = load_pro_config()
                 await asyncio.sleep(cfg.get("scan_interval", 900))

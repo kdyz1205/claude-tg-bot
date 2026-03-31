@@ -680,7 +680,7 @@ async def _sessions_command_impl(update: Update, context: ContextTypes.DEFAULT_T
             else:
                 await msg.edit_text(f"No response from session '{session_name}'. It may not be reachable.")
         except Exception as e:
-            await msg.edit_text(f"Error asking session: {e}")
+            await msg.edit_text(f"Error asking session: {str(e)[:300]}")
 
     elif action == "delegate" and len(args) >= 3:
         session_name = args[1][:100]
@@ -698,10 +698,10 @@ async def _sessions_command_impl(update: Update, context: ContextTypes.DEFAULT_T
             if resp:
                 text += f"\nResponse:\n{resp[:3000]}"
             if result.get("error"):
-                text += f"\nError: {result['error']}"
+                text += f"\nError: {str(result.get('error', ''))[:300]}"
             await msg.edit_text(text[:4000])
         except Exception as e:
-            await msg.edit_text(f"Error delegating: {e}")
+            await msg.edit_text(f"Error delegating: {str(e)[:300]}")
 
     else:
         await update.message.reply_text(
@@ -753,10 +753,10 @@ async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
             result = learner.learn_from_all_recent(max_sessions=20)
             summary_text = (
                 f"Session Learning Complete\n\n"
-                f"Sessions scanned: {result['sessions_scanned']}\n"
-                f"Sessions learned: {result['sessions_learned']}\n"
-                f"Errors: {result['errors']}\n"
-                f"Curriculum items: {result['curriculum_items']}\n"
+                f"Sessions scanned: {result.get('sessions_scanned', 0)}\n"
+                f"Sessions learned: {result.get('sessions_learned', 0)}\n"
+                f"Errors: {result.get('errors', 0)}\n"
+                f"Curriculum items: {result.get('curriculum_items', 0)}\n"
             )
             knowledge_summary = result.get("knowledge_summary", "")
             if knowledge_summary:
@@ -807,7 +807,7 @@ async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             await msg.edit_text(text[:4096])
         except Exception as e:
-            await msg.edit_text(f"Error: {e}")
+            await msg.edit_text(f"Error: {str(e)[:300]}")
 
     elif action == "report":
         try:
@@ -1342,7 +1342,7 @@ async def _send_status_impl(context, chat_id):
                 health_str += f"\nLast success: {ago // 60}m ago"
         for svc, info in list(health.get("services", {}).items())[:20]:
             if info.get("failures", 0) > 0:
-                health_str += f"\n  {svc[:30]}: {state_emoji.get(info['state'], '?')} {info['failures']} failures"
+                health_str += f"\n  {svc[:30]}: {state_emoji.get(info.get('state', '?'), '?')} {info.get('failures', 0)} failures"
     except Exception:
         pass
 
@@ -1388,7 +1388,7 @@ async def _send_health(context, chat_id):
         lines.append(f"Bot Uptime: {bot_h}h {bot_m}m {bot_s}s")
         lines.append(f"Processes: {len(psutil.pids())}")
     except Exception as e:
-        lines.append(f"System info error: {e}")
+        lines.append(f"System info error: {str(e)[:200]}")
 
     # Network info
     lines.append("")
@@ -1482,7 +1482,7 @@ async def _send_scan(context, chat_id):
         except (psutil.AccessDenied, PermissionError):
             lines.append("\nNetwork: access denied (run as admin)")
     except Exception as e:
-        lines.append(f"Scan error: {e}")
+        lines.append(f"Scan error: {str(e)[:200]}")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
 
 
@@ -1527,7 +1527,7 @@ async def _send_signals(context, chat_id):
             lines.append("No signal data available.")
             lines.append("Send a request like \"analyze BTC signals\" to generate.")
     except Exception as e:
-        lines.append(f"Error: {e}")
+        lines.append(f"Error: {str(e)[:200]}")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
 
 
@@ -1579,12 +1579,12 @@ async def _send_portfolio(context, chat_id):
                     f"@ {pos.get('entry', '?')} | PnL: {pnl:+.2f}"
                 )
             if "total_value" in data:
-                lines.append(f"\nTotal value: ${data['total_value']:,.2f}")
+                lines.append(f"\nTotal value: ${float(data.get('total_value', 0)):,.2f}")
         else:
             lines.append("No portfolio data.")
             lines.append("Ask me to check your exchange positions.")
     except Exception as e:
-        lines.append(f"Error: {e}")
+        lines.append(f"Error: {str(e)[:200]}")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
 
 
@@ -1607,7 +1607,7 @@ async def _send_risk(context, chat_id):
             lines.append("No risk data available.")
             lines.append("Ask me to calculate risk metrics for your portfolio.")
     except Exception as e:
-        lines.append(f"Error: {e}")
+        lines.append(f"Error: {str(e)[:200]}")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
 
 
@@ -2100,7 +2100,11 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(parts) < 4:
             return
         addr_prefix = parts[2]
-        amount = float(parts[3])
+        try:
+            amount = float(parts[3])
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Invalid amount")
+            return
 
         full_addr = _find_full_address(addr_prefix)
         if not full_addr:
@@ -2127,7 +2131,11 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(parts) < 4:
             return
         addr_prefix = parts[2]
-        pct = int(parts[3])
+        try:
+            pct = int(parts[3])
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Invalid percentage")
+            return
 
         full_addr = _find_full_address(addr_prefix)
         if not full_addr:
@@ -2147,7 +2155,10 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_text("❌ No open position found")
 
     elif data.startswith("dex_refresh_"):
-        addr_prefix = data.split("_")[2]
+        parts = data.split("_")
+        if len(parts) < 3:
+            return
+        addr_prefix = parts[2]
         full_addr = _find_full_address(addr_prefix)
         if not full_addr:
             return
@@ -2161,7 +2172,10 @@ async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pass
 
     elif data.startswith("dex_detail_"):
-        addr_prefix = data.split("_")[2]
+        parts = data.split("_")
+        if len(parts) < 3:
+            return
+        addr_prefix = parts[2]
         full_addr = _find_full_address(addr_prefix)
         if not full_addr:
             return
@@ -2195,7 +2209,11 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update.message, "Usage: /buy <token_address> [amount_sol]\nOr just paste a CA directly!")
         return
     address = args[0]
-    amount = float(args[1]) if len(args) > 1 else _dex.get_settings().get("auto_buy_sol", 0.5)
+    try:
+        amount = float(args[1]) if len(args) > 1 else _dex.get_settings().get("auto_buy_sol", 0.5)
+    except (ValueError, TypeError):
+        await _safe_reply(update.message, "❌ Invalid amount. Usage: /buy <CA> [amount_sol]")
+        return
 
     info = await _dex.lookup_token(address)
     if not info:
@@ -2219,7 +2237,11 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update.message, "Usage: /sell <token_address> [25|50|75|100]")
         return
     address = args[0]
-    pct = int(args[1]) if len(args) > 1 else 100
+    try:
+        pct = int(args[1]) if len(args) > 1 else 100
+    except (ValueError, TypeError):
+        await _safe_reply(update.message, "❌ Invalid percentage. Usage: /sell <CA> [25|50|75|100]")
+        return
 
     await _dex.refresh_positions()
     result = _dex.execute_sell(address, pct)
@@ -2937,8 +2959,9 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = " ".join(args[1:]) if len(args) > 1 else ""
         added = _whale_tracker.add_address(address, label)
         if added:
-            net = _whale_tracker._addresses[address]["network"].upper()
-            lbl = _whale_tracker._addresses[address]["label"]
+            addr_data = _whale_tracker._addresses.get(address, {})
+            net = addr_data.get("network", "eth").upper()
+            lbl = addr_data.get("label", "")
             await update.message.reply_text(
                 f"✅ 已添加监控地址\n"
                 f"  网络: {net}\n"
@@ -2995,11 +3018,11 @@ async def addwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         added = _smart_tracker.add_wallet(address, label)
         if added:
             wallets = _smart_tracker.get_wallets()
-            meta = wallets[address]
+            meta = wallets.get(address, {})
             await update.message.reply_text(
                 f"✅ 已添加聪明钱地址\n"
-                f"标签: {meta['label']}\n"
-                f"网络: {meta['network'].upper()}\n"
+                f"标签: {meta.get('label', '')}\n"
+                f"网络: {meta.get('network', 'eth').upper()}\n"
                 f"地址: {address[:8]}...{address[-4:]}\n"
                 f"当前跟踪: {len(wallets)}个"
             )
@@ -3096,15 +3119,15 @@ async def codex_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 charger.run_task("Say exactly: ✅任务完成 — this is a connection test"),
                 timeout=120,
             )
-            if result["success"]:
+            if result.get("success"):
                 await update.message.reply_text(
                     f"✅ Codex连接成功！\n"
-                    f"耗时: {result['duration']:.1f}s\n"
-                    f"响应预览: {result['output'][:200]}"
+                    f"耗时: {result.get('duration', 0):.1f}s\n"
+                    f"响应预览: {str(result.get('output', ''))[:200]}"
                 )
             else:
                 await update.message.reply_text(
-                    f"❌ Codex连接失败\n错误: {result['error'][:300]}"
+                    f"❌ Codex连接失败\n错误: {str(result.get('error', ''))[:300]}"
                 )
 
         elif sub == "cli":
@@ -3306,7 +3329,7 @@ async def evostatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         run_now = context.args and context.args[0].lower() in ("run", "now", "go")
         if run_now:
             await update.message.reply_text("🧬 正在运行自进化周期...")
-            result = await code_evolution_engine.run_now()
+            result = (await code_evolution_engine.run_now()) or {}
             status = result.get("status", "unknown")
             target = result.get("target", "N/A")
             applied = result.get("applied", False)
@@ -3437,7 +3460,7 @@ async def token_analyze_command(update: Update, context: ContextTypes.DEFAULT_TY
             data = resp.json()
 
         if "error" in data:
-            await msg.edit_text(f"Token Analysis Error:\n{data['error']}")
+            await msg.edit_text(f"Token Analysis Error:\n{str(data.get('error', 'Unknown'))[:300]}")
             return
 
         # Format results for Telegram
@@ -3574,7 +3597,7 @@ async def ma_ribbon_backtest_command(update: Update, context: ContextTypes.DEFAU
             data = resp.json()
 
         if "error" in data:
-            await msg.edit_text(f"Backtest Error:\n{data['error']}")
+            await msg.edit_text(f"Backtest Error:\n{str(data.get('error', 'Unknown'))[:300]}")
             return
 
         lines = [f"MA Ribbon Backtest: {symbol} ({anchor_tf})\n"]
@@ -3677,7 +3700,7 @@ async def ma_ribbon_screener_command(update: Update, context: ContextTypes.DEFAU
             )
         except Exception as e:
             await context.bot.send_message(
-                chat_id=chat_id, text=f"Screener error: {str(e)[:500]}"
+                chat_id=chat_id, text=f"Screener error: {str(e)[:300]}"
             )
 
     task = asyncio.create_task(_run_screener())
@@ -4022,7 +4045,7 @@ async def consciousness_command(update: Update, context: ContextTypes.DEFAULT_TY
         desc = awareness.get_self_description()
 
         text = f"🧠 Self-Awareness Report\n\n{desc}\n\n"
-        text += f"Performance trend: {report['performance_trend']}\n"
+        text += f"Performance trend: {report.get('performance_trend', 'unknown')}\n"
 
         gaps = report.get("top_capability_gaps", [])
         if gaps:
@@ -4370,6 +4393,8 @@ async def handle_session_control_callback(update, context):
     if not query.data.startswith("sc_"):
         return
     await query.answer()
+    if not query.message:
+        return
     chat_id = query.message.chat_id
     action = query.data[3:]  # strip "sc_"
 
@@ -4426,6 +4451,8 @@ async def handle_quick_action_callback(update, context):
         return
 
     await query.answer()
+    if not query.message:
+        return
     action = query.data
     chat_id = query.message.chat_id
 
@@ -4753,11 +4780,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if config.ENABLE_VISION and not config.BRIDGE_MODE and not config.HARNESS_MODE:
             try:
                 import base64
+                def _read_b64(path):
+                    with open(path, "rb") as fh:
+                        return base64.b64encode(fh.read()).decode("utf-8")
                 loop = asyncio.get_running_loop()
-                image_data = await loop.run_in_executor(
-                    None,
-                    lambda: base64.b64encode(open(save_path, "rb").read()).decode("utf-8")
-                )
+                image_data = await loop.run_in_executor(None, _read_b64, save_path)
             except Exception as e:
                 logger.warning(f"Failed to read image as base64: {e}")
 
@@ -5362,7 +5389,7 @@ def main():
         try:
             import vital_signs
             vital_signs.boot()
-            logger.info(f"VitalSigns booted: lifecycle={vital_signs.get_vital_signs()['lifecycle']}")
+            logger.info(f"VitalSigns booted: lifecycle={vital_signs.get_vital_signs().get('lifecycle', 'unknown')}")
         except Exception as e:
             logger.warning(f"VitalSigns failed to boot: {e}")
 

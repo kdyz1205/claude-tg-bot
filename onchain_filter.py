@@ -71,7 +71,7 @@ async def _get_volume(symbol: str, bar: str, num_bars: int = 1) -> float:
         return 0.0
     # Use completed candles only (skip the latest which may be incomplete)
     completed = candles[-(num_bars + 1):-1] if len(candles) > num_bars else candles[:-1]
-    total_vol = sum(float(c[5]) for c in completed)
+    total_vol = sum(float(c[5]) for c in completed if len(c) > 5)
     return total_vol
 
 
@@ -89,6 +89,7 @@ async def _get_volume_usdt(symbol: str, bar: str, num_bars: int = 1) -> float:
 # ── Market cap via CoinGecko (free, no key) ─────────────────────────────────
 _mcap_cache: dict = {}  # symbol -> (mcap, timestamp)
 _MCAP_CACHE_TTL = 600   # 10 min cache
+_MCAP_CACHE_MAX = 500
 
 # OKX symbol -> CoinGecko ID mapping
 _GECKO_IDS = {
@@ -123,6 +124,12 @@ async def _fetch_mcap(symbol: str) -> Optional[float]:
             mcap = data.get(gecko_id, {}).get("usd_market_cap")
             if mcap is not None:
                 _mcap_cache[base] = (mcap, time.time())
+                # Evict stale entries when cache is too large
+                if len(_mcap_cache) > _MCAP_CACHE_MAX:
+                    now = time.time()
+                    stale = [k for k, (_, ts) in _mcap_cache.items() if now - ts > _MCAP_CACHE_TTL]
+                    for k in stale:
+                        del _mcap_cache[k]
                 return mcap
     except Exception as e:
         logger.debug("onchain_filter: mcap fetch %s: %s", symbol, e)
@@ -143,6 +150,11 @@ def _load_alerted():
 
 def _save_alerted():
     try:
+        # Prune entries older than 24h
+        now = time.time()
+        stale = [k for k, ts in _alerted.items() if now - ts > 86400]
+        for k in stale:
+            del _alerted[k]
         tmp = str(ALERTED_FILE) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_alerted, f)
@@ -257,7 +269,7 @@ def _quick_score(closes: list) -> tuple:
     # Price momentum (last 5 vs last 20 average)
     avg5 = sum(closes[-5:]) / 5
     avg20 = sum(closes[-20:]) / 20
-    mom = (avg5 - avg20) / avg20 * 100
+    mom = (avg5 - avg20) / avg20 * 100 if avg20 != 0 else 0
     if abs(mom) > 2:
         score += 10
         if mom > 0:
@@ -290,19 +302,19 @@ async def _scan_one(symbol: str, filters: dict) -> Optional[dict]:
         )
 
         # Volume check: latest completed 3m candle
-        vol_3m = float(candles_3m[-2][5]) if len(candles_3m) >= 2 else 0.0
-        vol_5m = float(candles_5m[-2][5]) if len(candles_5m) >= 2 else 0.0
+        vol_3m = float(candles_3m[-2][5] or 0) if len(candles_3m) >= 2 and len(candles_3m[-2]) > 5 else 0.0
+        vol_5m = float(candles_5m[-2][5] or 0) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 5 else 0.0
 
         # USDT volume for display
         vol_3m_usdt = float(candles_3m[-2][7]) if len(candles_3m) >= 2 and len(candles_3m[-2]) > 7 else 0.0
         vol_5m_usdt = float(candles_5m[-2][7]) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 7 else 0.0
 
         # Filter 1: 3m volume
-        if vol_3m < filters["vol_3m_min"]:
+        if vol_3m < filters.get("vol_3m_min", 0):
             return None
 
         # Filter 2: 5m volume
-        if vol_5m < filters["vol_5m_min"]:
+        if vol_5m < filters.get("vol_5m_min", 0):
             return None
 
         # Filter 3: market cap (skip if unavailable — CoinGecko rate limit)
@@ -316,7 +328,7 @@ async def _scan_one(symbol: str, filters: dict) -> Optional[dict]:
         direction, score = _quick_score(closes_1h)
 
         # Filter 4: minimum score
-        if score < filters["min_score"]:
+        if score < filters.get("min_score", 0):
             return None
 
         # Filter 5: direction (None = both)

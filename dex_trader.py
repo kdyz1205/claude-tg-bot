@@ -55,7 +55,8 @@ def _load_json(filepath: str, default=None):
     """Safe JSON load."""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return data if data is not None else (default if default is not None else {})
     except (FileNotFoundError, json.JSONDecodeError):
         return default if default is not None else {}
 
@@ -393,6 +394,8 @@ def execute_buy(token_info: dict, amount_sol: float, mode: str = "paper") -> Opt
         logger.warning("Live trading not yet implemented")
         return None
 
+    if not token_info.get("address"):
+        return None
     price = token_info.get("price_usd", 0)
     if price <= 0:
         return None
@@ -450,8 +453,12 @@ def execute_buy(token_info: dict, amount_sol: float, mode: str = "paper") -> Opt
     }
 
     positions.append(pos)
+    # Prune: keep last 500 total, remove oldest closed first
     if len(positions) > 500:
-        positions = positions[-500:]
+        closed = [p for p in positions if p.get("status") != "open"]
+        open_pos = [p for p in positions if p.get("status") == "open"]
+        keep_closed = closed[-(500 - len(open_pos)):] if len(open_pos) < 500 else []
+        positions = open_pos + keep_closed
     save_positions(positions)
 
     logger.info(f"BUY {pos['symbol']} | {amount_sol} SOL @ ${price}")
@@ -477,6 +484,10 @@ def execute_sell(address: str, pct: int = 100, mode: str = "paper") -> Optional[
     if not pos:
         return None
 
+    try:
+        pct = int(pct)
+    except (ValueError, TypeError):
+        pct = 100
     pct = max(1, min(100, pct))
     sell_sol = pos.get("amount_sol", 0) * (pct / 100)
     sell_tokens = pos.get("tokens", 0) * (pct / 100)
@@ -499,7 +510,7 @@ def execute_sell(address: str, pct: int = 100, mode: str = "paper") -> Optional[
 
     save_positions(positions)
 
-    logger.info(f"SELL {pct}% {pos['symbol']} | PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)")
+    logger.info(f"SELL {pct}% {pos.get('symbol', '?')} | PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)")
     return {
         "position": pos,
         "sold_pct": pct,
