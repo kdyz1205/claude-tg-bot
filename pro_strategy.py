@@ -1,12 +1,17 @@
 """
-pro_strategy.py — 专业级多策略融合交易引擎
+pro_strategy.py — 专业级多策略融合交易引擎 (Paper-Enhanced v2)
 
-3大核心策略:
-  1. Smart Money (聪明钱跟踪) — 大单资金流 + 订单簿失衡 + 突破确认
-  2. Mean Reversion (均值回归) — Bollinger Band + RSI超卖反弹
-  3. Momentum Breakout (动量突破) — 区间突破 + 量能确认 + 趋势跟随
+4大核心策略 + 论文增强:
+  1. Smart Money — 大单资金流 + 订单簿失衡 + 突破确认
+  2. Mean Reversion — Bollinger Band + RSI超卖 + Z-Score (FinAgent 20/60)
+  3. Momentum Breakout — 区间突破 + 多时间框架动量 (40/40/20权重)
+  4. Short Momentum — 做空趋势 + EMA20/50确认
 
-融合引擎: 多策略投票 → 信号强度叠加 → 动态仓位 → 风控止损
+论文增强 (from FinAgent, WebCryptoAgent, LLM+RL):
+  - Regime-specific position sizing (1.8x trend, 2.5x breakout, 0.7x sideways)
+  - Hysteresis thresholds (prevent signal oscillation)
+  - ATR-volatility confidence scaling
+  - Drawdown-aware signal gating
 """
 
 import asyncio
@@ -834,6 +839,60 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
             elif final_dir == "short":
                 combined_score *= 0.85
 
+    # ── Paper Enhancement: Regime-Specific Position Sizing (FinAgent) ──
+    # Detect regime: strong_trend / breakout / sideways / high_vol
+    regime = "sideways"
+    regime_mult = 0.7  # default: conservative in sideways
+    if adx_val_pre := _adx(candles):
+        if adx_val_pre > 30:
+            regime = "strong_trend"
+            regime_mult = 1.8  # emphasize momentum
+        elif adx_val_pre > 20:
+            regime = "breakout"
+            regime_mult = 2.0  # capitalize on breakout
+    # Check volatility regime
+    d_vol = _parse_candles(candles)
+    if len(d_vol["close"]) >= 20:
+        recent_vol = max(d_vol["close"][-20:]) / min(d_vol["close"][-20:]) - 1
+        if recent_vol > 0.15:  # >15% range in 20 bars = high vol
+            regime = "high_vol"
+            regime_mult = 0.8
+
+    # ── Paper Enhancement: Multi-Timeframe Momentum Z-Score (FinAgent) ──
+    # Short(5)/Medium(20)/Long(60) momentum weighted 40/40/20
+    mtf_bonus = 0
+    if len(closes) >= 60:
+        ret_5 = (closes[-1] - closes[-5]) / closes[-5] if closes[-5] else 0
+        ret_20 = (closes[-1] - closes[-20]) / closes[-20] if closes[-20] else 0
+        ret_60 = (closes[-1] - closes[-60]) / closes[-60] if closes[-60] else 0
+        mtf_signal = ret_5 * 0.4 + ret_20 * 0.4 + ret_60 * 0.2
+        if final_dir == "short" and mtf_signal < -0.02:
+            mtf_bonus = 8  # multi-TF confirms short
+        elif final_dir == "long" and mtf_signal > 0.02:
+            mtf_bonus = 8  # multi-TF confirms long
+        elif final_dir == "short" and mtf_signal > 0.03:
+            mtf_bonus = -5  # MTF contradicts short
+        elif final_dir == "long" and mtf_signal < -0.03:
+            mtf_bonus = -5  # MTF contradicts long
+    combined_score += mtf_bonus
+
+    # ── Paper Enhancement: Volatility-Confidence Scaling (WebCryptoAgent) ──
+    # ATR relative to price = volatility measure; higher vol = less confidence
+    atr_pre = _atr(candles)
+    if atr_pre and closes[-1] > 0:
+        vol_ratio = atr_pre / closes[-1]
+        if vol_ratio > 0.04:  # very high volatility
+            combined_score *= 0.85
+        elif vol_ratio < 0.01:  # very low volatility (less opportunity)
+            combined_score *= 0.9
+
+    # ── Paper Enhancement: Cost Gating (WebCryptoAgent) ──
+    # Only trade if expected move > estimated friction (spread + slippage ~0.1%)
+    if atr_pre and closes[-1] > 0:
+        expected_move_pct = (atr_pre / closes[-1]) * 100
+        if expected_move_pct < 0.3:  # ATR < 0.3% = not enough edge
+            combined_score *= 0.5
+
     min_score = cfg.get("min_combined_score", 35)
     if combined_score < min_score or final_dir == "neutral":
         return None
@@ -874,6 +933,8 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
         "risk_reward": round(tp_dist / sl_dist, 2) if sl_dist > 0 else None,
         "atr": round(atr_val, 4) if atr_val else None,
         "adx": adx_val,
+        "regime": regime,
+        "regime_mult": regime_mult,
         "strategies": {
             "smart_money": sm_result,
             "mean_reversion": mr_result,
@@ -886,12 +947,16 @@ async def analyze_symbol(symbol: str, cfg: dict = None) -> Optional[dict]:
     }
 
 
+# ── Signal Hysteresis (WebCryptoAgent) ──
+# Signals must persist across 2 scans to be emitted, preventing whipsaw trades
+_prev_signals: dict = {}  # symbol -> {"direction": str, "count": int, "score": float}
+
+
 async def scan_all_pro(cfg: dict = None) -> list:
     """Scan all symbols with pro strategies, return ranked signals."""
-    global _pro_client
+    global _pro_client, _prev_signals
     if cfg is None:
         cfg = load_pro_config()
-    # Share one HTTP client across all symbol scans (reduces 60+ connections to 1)
     async with httpx.AsyncClient(timeout=12) as client:
         _pro_client = client
         try:
@@ -899,10 +964,32 @@ async def scan_all_pro(cfg: dict = None) -> list:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             _pro_client = None
+
+    # Apply hysteresis: signal must appear in 2 consecutive scans
     signals = []
+    current_signals = {}
     for r in results:
-        if isinstance(r, dict):
+        if not isinstance(r, dict):
+            continue
+        sym = r.get("symbol", "")
+        direction = r.get("direction", "neutral")
+        current_signals[sym] = direction
+
+        prev = _prev_signals.get(sym)
+        if prev and prev["direction"] == direction:
+            # Same direction as last scan — confirmed signal
+            r["hysteresis_confirmed"] = True
             signals.append(r)
+        else:
+            # First appearance — record but don't emit yet
+            # Exception: very high score signals (>50) bypass hysteresis
+            if r.get("combined_score", 0) >= 50:
+                r["hysteresis_confirmed"] = False
+                signals.append(r)
+
+    # Update previous signals for next scan
+    _prev_signals = {sym: {"direction": d, "count": 1} for sym, d in current_signals.items()}
+
     signals.sort(key=lambda x: x.get("combined_score", 0), reverse=True)
     return signals
 
@@ -922,6 +1009,8 @@ def format_pro_signal(sig: dict) -> str:
         f"  \u98ce\u62a5\u6bd4: 1:{rr:.1f}  |  \u5171\u8bc6: {sig.get('consensus', '?')}",
     ]
 
+    if sig.get("regime"):
+        lines.append(f"  Regime: {sig['regime']} (x{sig.get('regime_mult', 1.0):.1f})")
     if sig.get("adx"):
         lines.append(f"  ADX: {sig['adx']:.0f}  |  ATR: ${sig['atr']:.2f}" if sig.get("atr") else f"  ADX: {sig['adx']:.0f}")
 

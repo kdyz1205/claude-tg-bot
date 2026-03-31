@@ -7,7 +7,7 @@ Phase 1 of the auto-trading pipeline:
 3. Track price at intervals (5m, 15m, 1h, 4h, 24h)
 4. Auto-close: take profit +50%, stop loss -20%, time stop 24h
 5. Calculate real win rate, avg return, max drawdown
-6. Only graduate to real trading when win rate > 55% over 50+ trades
+6. Only graduate to real trading when win rate > 55% over 100+ trades
 
 Data file: _paper_trades.json
 """
@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
     "min_mcap": 15000,
     "max_mcap": 8000000,
     "min_alpha_score": 70,     # Min score from alpha engine
-    "graduation_trades": 50,   # Need 50+ trades before live
+    "graduation_trades": 100,   # Need 100+ trades before live
     "graduation_winrate": 55,  # Need 55%+ win rate before live
     "check_interval": 60,      # Check prices every 60 seconds
 }
@@ -138,12 +138,20 @@ def can_open_trade(token: dict, cfg: dict = None) -> tuple:
     if total_exposure >= cfg.get("max_total_sol", 2.0):
         return False, f"max exposure reached ({total_exposure:.2f} SOL)"
 
-    # Check daily loss limit
+    # ── Drawdown Circuit Breakers (FinAgent) ──
+    # Progressive position reduction based on cumulative drawdown
     today_start = (time.time() // 86400) * 86400
     today_closed = [t for t in trades
                     if t.get("status") == "closed"
                     and t.get("close_time", 0) >= today_start]
     daily_loss = sum(t.get("pnl_sol", 0) for t in today_closed if t.get("pnl_sol", 0) < 0)
+    daily_loss_pct = abs(daily_loss) / max(cfg.get("max_total_sol", 2.0), 0.01) * 100
+    if daily_loss_pct >= 3.0:
+        return False, f"circuit breaker: 3% daily drawdown ({daily_loss:.3f} SOL) — halted"
+    if daily_loss_pct >= 2.0:
+        # Allow only 50% of normal positions
+        if len(open_trades) >= 1:
+            return False, f"circuit breaker: 2% DD — max 1 position ({daily_loss:.3f} SOL)"
     if abs(daily_loss) >= cfg.get("daily_loss_limit_sol", 0.3):
         return False, f"daily loss limit hit ({daily_loss:.3f} SOL)"
 
@@ -189,8 +197,16 @@ def open_paper_trade(token: dict, cfg: dict = None) -> Optional[dict]:
         logger.warning(f"Invalid price for {token.get('symbol', '?')}: {price}")
         return None
 
-    position_sol = cfg.get("max_position_sol", 0.5)
-    # Estimate SOL price (~$150, will be fetched live in future)
+    # ── ATR-Kelly Position Sizing (WebCryptoAgent + FinAgent) ──
+    base_sol = cfg.get("max_position_sol", 0.5)
+    # Regime multiplier from pro_strategy signal
+    regime_mult = token.get("regime_mult", 1.0)
+    # Score-based confidence: higher score = bigger position
+    score = token.get("score", 0) or token.get("combined_score", 0) or 50
+    confidence_scale = min(score / 100, 1.0)  # 0.0 to 1.0
+    # Fractional Kelly: f* = edge/odds, but simplified as confidence * base
+    position_sol = base_sol * regime_mult * (0.5 + 0.5 * confidence_scale)
+    position_sol = min(position_sol, cfg.get("max_total_sol", 2.0) * 0.5)  # never >50% of total
     sol_price_est = 150.0
     position_usd = position_sol * sol_price_est
     position_tokens = position_usd / price
@@ -359,10 +375,16 @@ async def check_and_update_trades(send_func=None) -> dict:
         trade["peak_pnl_pct"] = max(trade.get("peak_pnl_pct", 0), pnl_pct)
         trade["trough_pnl_pct"] = min(trade.get("trough_pnl_pct", 0), pnl_pct)
 
-        # Check take profit
-        tp = cfg.get("take_profit_pct", 50.0)
-        sl = cfg.get("stop_loss_pct", -20.0)
-        ts = cfg.get("time_stop_hours", 24)
+        # Check take profit — CEX futures use tighter stops (FinAgent paper)
+        is_cex = "-USDT" in trade.get("symbol", "") or trade.get("signal_source") == "pro_strategy"
+        if is_cex:
+            tp = cfg.get("cex_tp_pct", 4.0)   # 4% TP for futures
+            sl = cfg.get("cex_sl_pct", -2.0)   # 2% SL for futures (R:R = 2:1)
+            ts = cfg.get("cex_time_stop_hours", 48)
+        else:
+            tp = cfg.get("take_profit_pct", 50.0)
+            sl = cfg.get("stop_loss_pct", -20.0)
+            ts = cfg.get("time_stop_hours", 24)
 
         close_reason = None
         if pnl_pct >= tp:
@@ -371,6 +393,11 @@ async def check_and_update_trades(send_func=None) -> dict:
             close_reason = "stop_loss"
         elif age_hours >= ts:
             close_reason = "time_stop"
+        # ── Trailing stop (FinAgent): if peak was >2% but now dropped >50% from peak
+        elif is_cex and trade.get("peak_pnl_pct", 0) >= 2.0:
+            drawback = trade["peak_pnl_pct"] - pnl_pct
+            if drawback >= trade["peak_pnl_pct"] * 0.5:
+                close_reason = "trailing_stop"
 
         if close_reason:
             # Close in-memory (NOT via close_paper_trade which reloads from disk
@@ -440,7 +467,7 @@ def compute_stats() -> dict:
             "by_reason": {},
             "by_source": {},
             "ready_for_live": False,
-            "graduation_progress": "0/50 trades",
+            "graduation_progress": "0/100 trades",
         }
 
     wins = [t for t in closed if (t.get("pnl_pct") or 0) > 0]
@@ -486,7 +513,7 @@ def compute_stats() -> dict:
     total = len(closed)
     wr = (len(wins) / total * 100) if total > 0 else 0
     cfg = _load_config()
-    grad_trades = cfg.get("graduation_trades", 50)
+    grad_trades = cfg.get("graduation_trades", 100)
     grad_wr = cfg.get("graduation_winrate", 55)
     ready = total >= grad_trades and wr >= grad_wr
 
