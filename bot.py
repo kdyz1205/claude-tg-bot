@@ -2254,6 +2254,579 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_reply(update.message, _dex.format_trade_stats())
 
 
+# ── Trading Dashboard Panel ──────────────────────────────────────────
+
+async def _build_trading_dashboard() -> str:
+    """Build the rich trading dashboard text."""
+    lines = []
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("      💹 TRADING DASHBOARD")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
+
+    # ── Portfolio Summary ──
+    if _dex_available:
+        try:
+            await _dex.refresh_positions()
+        except Exception:
+            pass
+        positions = _dex.get_open_positions() if _dex else []
+        total_invested = sum(p.get("amount_sol", 0) for p in positions)
+        total_value = sum(p.get("current_value_sol", p.get("amount_sol", 0)) for p in positions)
+        total_pnl = total_value - total_invested
+        pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+        pnl_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+
+        lines.append("\U0001f4bc PORTFOLIO")
+        lines.append(f"  Positions: {len(positions)}")
+        lines.append(f"  Invested:  {total_invested:.3f} SOL")
+        lines.append(f"  Value:     {total_value:.3f} SOL")
+        lines.append(f"  {pnl_emoji} PnL:      {total_pnl:+.4f} SOL ({pnl_pct:+.1f}%)")
+        lines.append("")
+
+        # Top positions (up to 3)
+        if positions:
+            sorted_pos = sorted(positions, key=lambda p: abs(p.get("pnl_pct", 0)), reverse=True)[:3]
+            for p in sorted_pos:
+                pnl = p.get("pnl_pct", 0)
+                em = "\U0001f7e2" if pnl > 0 else "\U0001f534" if pnl < 0 else "\u26aa"
+                lines.append(f"  {em} {p.get('symbol', '?'):8s} {pnl:+6.1f}%  {p.get('amount_sol', 0):.2f} SOL")
+            lines.append("")
+    else:
+        lines.append("\U0001f4bc PORTFOLIO: DEX module not loaded")
+        lines.append("")
+
+    # ── Trading Stats ──
+    if _dex_available:
+        stats = _dex.get_trade_stats()
+        lines.append("\U0001f4c8 STATS")
+        lines.append(f"  Trades: {stats.get('total', 0)}  |  Open: {stats.get('open', 0)}")
+        wr = stats.get("win_rate", 0)
+        wr_bar = "\U0001f7e9" * int(wr // 10) + "\u2b1c" * (10 - int(wr // 10))
+        lines.append(f"  WinRate: {wr:.0f}% {wr_bar}")
+        lines.append(f"  Total PnL: {stats.get('total_pnl_sol', 0):+.4f} SOL")
+        lines.append(f"  Best: {stats.get('best_pct', 0):+.1f}%  Worst: {stats.get('worst_pct', 0):+.1f}%")
+        lines.append("")
+
+    # ── Paper Trading Status ──
+    if _paper_trader_available and _paper_trader:
+        try:
+            cfg = _paper_trader._load_config()
+            enabled = cfg.get("enabled", False)
+            trades = _paper_trader._load_trades()
+            open_trades = [t for t in trades if t.get("status") == "open"]
+            closed_trades = [t for t in trades if t.get("status") == "closed"]
+            paper_status = "\U0001f7e2 ON" if enabled else "\U0001f534 OFF"
+            lines.append(f"\U0001f4dd PAPER MODE: {paper_status}")
+            lines.append(f"  Open: {len(open_trades)}  |  Closed: {len(closed_trades)}")
+            if closed_trades:
+                wins = sum(1 for t in closed_trades if (t.get("pnl_pct") or 0) > 0)
+                wr = wins / len(closed_trades) * 100 if closed_trades else 0
+                lines.append(f"  Win Rate: {wr:.0f}%  ({wins}W/{len(closed_trades)-wins}L)")
+        except Exception:
+            lines.append("\U0001f4dd PAPER MODE: Error loading")
+    else:
+        lines.append("\U0001f4dd PAPER MODE: Not available")
+    lines.append("")
+
+    # ── Trading Settings Quick View ──
+    if _dex_available:
+        s = _dex.get_settings()
+        mev = "\U0001f6e1" if s.get("mev_protection") else "\u274c"
+        lines.append("\u2699\ufe0f SETTINGS")
+        lines.append(f"  Buy Slip: {s.get('buy_slippage_pct', 15)}%  |  Sell Slip: {s.get('sell_slippage_pct', 20)}%")
+        lines.append(f"  Default Buy: {s.get('auto_buy_sol', 0.5)} SOL  |  MEV: {mev}")
+        lines.append(f"  TP: +{s.get('default_tp_pct', 100)}%  |  SL: {s.get('default_sl_pct', -30)}%")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("  Paste a Solana CA to trade")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    return "\n".join(lines)
+
+
+def _build_dashboard_keyboard() -> InlineKeyboardMarkup:
+    """Build the inline keyboard for the trading dashboard."""
+    return InlineKeyboardMarkup([
+        # Row 1: Core trading
+        [
+            InlineKeyboardButton("\U0001f4ca Positions", callback_data="td_positions"),
+            InlineKeyboardButton("\U0001f4b0 Buy", callback_data="td_buy_menu"),
+            InlineKeyboardButton("\U0001f4b8 Sell", callback_data="td_sell_menu"),
+        ],
+        # Row 2: Analysis
+        [
+            InlineKeyboardButton("\U0001f4c8 PnL", callback_data="td_pnl"),
+            InlineKeyboardButton("\U0001f4dd Paper", callback_data="td_paper_menu"),
+            InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="td_settings"),
+        ],
+        # Row 3: Signals
+        [
+            InlineKeyboardButton("\U0001f50d Alpha", callback_data="td_alpha"),
+            InlineKeyboardButton("\U0001f517 Onchain", callback_data="td_onchain"),
+            InlineKeyboardButton("\U0001f40b Whales", callback_data="td_whales"),
+        ],
+        # Row 4: Refresh
+        [
+            InlineKeyboardButton("\U0001f504 Refresh Dashboard", callback_data="td_refresh"),
+        ],
+    ])
+
+
+async def trade_dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the main trading dashboard with visual panel and inline commands."""
+    if not update.message:
+        return
+    text = await _build_trading_dashboard()
+    kb = _build_dashboard_keyboard()
+    await _safe_reply(update.message, text, reply_markup=kb)
+
+
+async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all trading dashboard inline button presses."""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    if config.AUTHORIZED_USER_ID and query.from_user.id != config.AUTHORIZED_USER_ID:
+        return
+    await query.answer()
+    data = query.data or ""
+    chat_id = query.from_user.id
+
+    # ── Refresh Dashboard ──
+    if data == "td_refresh":
+        text = await _build_trading_dashboard()
+        kb = _build_dashboard_keyboard()
+        try:
+            await query.edit_message_text(text, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    # ── Positions ──
+    if data == "td_positions":
+        if not _dex_available:
+            try:
+                await query.edit_message_text("DEX module not available")
+            except Exception:
+                pass
+            return
+        await _dex.refresh_positions()
+        positions = _dex.get_open_positions()
+        msg = _dex.format_positions()
+
+        rows = []
+        # Add per-position buttons
+        for p in positions[:5]:
+            addr = p.get("address", "")
+            sym = p.get("symbol", "?")[:6]
+            pnl = p.get("pnl_pct", 0)
+            _cache_address(addr)
+            rows.append([
+                InlineKeyboardButton(f"{sym} {pnl:+.1f}%", callback_data=f"dex_detail_{addr[:20]}"),
+                InlineKeyboardButton("Sell 50%", callback_data=f"dex_sell_{addr[:20]}_50"),
+                InlineKeyboardButton("Sell 100%", callback_data=f"dex_sell_{addr[:20]}_100"),
+            ])
+        rows.append([InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")])
+
+        try:
+            await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            await _safe_send(context.bot, chat_id, msg[:4096])
+        return
+
+    # ── Buy Menu ──
+    if data == "td_buy_menu":
+        settings = _dex.get_settings() if _dex_available else {}
+        buy_amounts = settings.get("buy_buttons", [0.1, 0.3, 0.5, 1.0])
+
+        msg = (
+            "\U0001f4b0 BUY TOKEN\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Paste a Solana token address (CA)\n"
+            "to get a token card with buy buttons.\n\n"
+            f"Quick buy presets: {buy_amounts}\n"
+            f"Default amount: {settings.get('auto_buy_sol', 0.5)} SOL\n\n"
+            "Or use command:\n"
+            "/buy <CA> [amount_sol]"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+        ])
+        try:
+            await query.edit_message_text(msg, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    # ── Sell Menu ──
+    if data == "td_sell_menu":
+        if not _dex_available:
+            return
+        positions = _dex.get_open_positions()
+        if not positions:
+            msg = "\U0001f4b8 No open positions to sell\n\nBuy a token first!"
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")]])
+            try:
+                await query.edit_message_text(msg, reply_markup=kb)
+            except Exception:
+                pass
+            return
+
+        msg = "\U0001f4b8 SELL — Choose position:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        rows = []
+        for p in positions[:8]:
+            addr = p.get("address", "")
+            sym = p.get("symbol", "?")[:6]
+            pnl = p.get("pnl_pct", 0)
+            em = "\U0001f7e2" if pnl > 0 else "\U0001f534"
+            _cache_address(addr)
+            msg += f"\n{em} {sym}: {pnl:+.1f}% | {p.get('amount_sol', 0):.2f} SOL"
+            rows.append([
+                InlineKeyboardButton(f"{sym} 25%", callback_data=f"dex_sell_{addr[:20]}_25"),
+                InlineKeyboardButton("50%", callback_data=f"dex_sell_{addr[:20]}_50"),
+                InlineKeyboardButton("100%", callback_data=f"dex_sell_{addr[:20]}_100"),
+            ])
+        rows.append([InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")])
+
+        try:
+            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            pass
+        return
+
+    # ── PnL Stats ──
+    if data == "td_pnl":
+        msg = _dex.format_trade_stats() if _dex_available else "DEX not available"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f504 Refresh", callback_data="td_pnl"),
+             InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+        ])
+        try:
+            await query.edit_message_text(msg, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    # ── Paper Trading Menu ──
+    if data == "td_paper_menu":
+        if not _paper_trader_available or not _paper_trader:
+            try:
+                await query.edit_message_text(
+                    "Paper Trading not available",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")]]),
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            cfg = _paper_trader._load_config()
+            enabled = cfg.get("enabled", False)
+            trades = _paper_trader._load_trades()
+            open_t = [t for t in trades if t.get("status") == "open"]
+            closed_t = [t for t in trades if t.get("status") == "closed"]
+
+            status_em = "\U0001f7e2" if enabled else "\U0001f534"
+            msg = (
+                f"\U0001f4dd PAPER TRADING\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Status: {status_em} {'ACTIVE' if enabled else 'PAUSED'}\n"
+                f"Open trades: {len(open_t)}\n"
+                f"Closed trades: {len(closed_t)}\n"
+            )
+
+            if closed_t:
+                wins = sum(1 for t in closed_t if (t.get("pnl_pct") or 0) > 0)
+                total_pnl = sum(t.get("pnl_sol", 0) or 0 for t in closed_t)
+                wr = wins / len(closed_t) * 100
+                msg += (
+                    f"\nWin Rate: {wr:.0f}% ({wins}W/{len(closed_t)-wins}L)\n"
+                    f"Total PnL: {total_pnl:+.4f} SOL\n"
+                )
+
+            # Graduation check
+            if len(closed_t) >= 50 and (sum(1 for t in closed_t if (t.get("pnl_pct") or 0) > 0) / len(closed_t)) >= 0.55:
+                msg += "\n\U0001f393 READY FOR LIVE TRADING!"
+            elif closed_t:
+                needed = max(0, 50 - len(closed_t))
+                msg += f"\n\U0001f393 Graduation: {len(closed_t)}/50 trades"
+        except Exception:
+            msg = "Paper Trading: Error loading data"
+
+        toggle_text = "\u23f8 Pause" if enabled else "\u25b6\ufe0f Start"
+        toggle_data = "td_paper_off" if enabled else "td_paper_on"
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(toggle_text, callback_data=toggle_data),
+                InlineKeyboardButton("\U0001f4ca Stats", callback_data="td_paper_stats"),
+            ],
+            [
+                InlineKeyboardButton("\u274c Close All", callback_data="td_paper_closeall"),
+                InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back"),
+            ],
+        ])
+        try:
+            await query.edit_message_text(msg, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    # ── Paper on/off/closeall/stats ──
+    if data == "td_paper_on" and _paper_trader:
+        try:
+            cfg = _paper_trader._load_config()
+            cfg["enabled"] = True
+            _paper_trader._save_config(cfg)
+            await query.edit_message_text(
+                "\u25b6\ufe0f Paper Trading STARTED\n\nBot will auto-trade on signals.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")]]),
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "td_paper_off" and _paper_trader:
+        try:
+            cfg = _paper_trader._load_config()
+            cfg["enabled"] = False
+            _paper_trader._save_config(cfg)
+            await query.edit_message_text(
+                "\u23f8 Paper Trading PAUSED",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")]]),
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "td_paper_closeall" and _paper_trader:
+        try:
+            trades = _paper_trader._load_trades()
+            open_trades = [t for t in trades if t.get("status") == "open"]
+            closed = 0
+            for t in open_trades:
+                price = await _paper_trader._fetch_current_price(t.get("address", ""))
+                if price and price > 0:
+                    _paper_trader.close_paper_trade(t["id"], price, "manual")
+                    closed += 1
+            await query.edit_message_text(
+                f"\u274c Closed {closed}/{len(open_trades)} paper positions",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")]]),
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "td_paper_stats" and _paper_trader:
+        try:
+            report = _paper_trader.format_stats_full()
+            await query.edit_message_text(
+                report[:4096],
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f504 Refresh", callback_data="td_paper_stats"),
+                     InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+                ]),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Settings ──
+    if data == "td_settings":
+        msg = _dex.format_settings() if _dex_available else "DEX not available"
+        msg += "\n\nUse /settings <key> <value> to change"
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("MEV: Toggle", callback_data="td_set_mev"),
+                InlineKeyboardButton("Auto: Toggle", callback_data="td_set_auto"),
+            ],
+            [
+                InlineKeyboardButton("Slip +5", callback_data="td_set_slip_up"),
+                InlineKeyboardButton("Slip -5", callback_data="td_set_slip_down"),
+            ],
+            [InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+        ])
+        try:
+            await query.edit_message_text(msg, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    # ── Settings toggles ──
+    if data == "td_set_mev" and _dex_available:
+        s = _dex.get_settings()
+        new_val = not s.get("mev_protection", True)
+        _dex.update_settings(mev_protection=new_val)
+        em = "\U0001f6e1 ON" if new_val else "\u274c OFF"
+        try:
+            await query.edit_message_text(
+                f"MEV Protection: {em}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Settings", callback_data="td_settings")]]),
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "td_set_auto" and _dex_available:
+        s = _dex.get_settings()
+        new_val = not s.get("auto_approve", False)
+        _dex.update_settings(auto_approve=new_val)
+        em = "\u2705 ON" if new_val else "\u274c OFF"
+        try:
+            await query.edit_message_text(
+                f"Auto Confirm: {em}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Settings", callback_data="td_settings")]]),
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "td_set_slip_up" and _dex_available:
+        s = _dex.get_settings()
+        new_buy = min(50, s.get("buy_slippage_pct", 15) + 5)
+        new_sell = min(50, s.get("sell_slippage_pct", 20) + 5)
+        _dex.update_settings(buy_slippage_pct=new_buy, sell_slippage_pct=new_sell)
+        try:
+            await query.edit_message_text(
+                f"Slippage: Buy {new_buy}% | Sell {new_sell}%",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Settings", callback_data="td_settings")]]),
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "td_set_slip_down" and _dex_available:
+        s = _dex.get_settings()
+        new_buy = max(1, s.get("buy_slippage_pct", 15) - 5)
+        new_sell = max(1, s.get("sell_slippage_pct", 20) - 5)
+        _dex.update_settings(buy_slippage_pct=new_buy, sell_slippage_pct=new_sell)
+        try:
+            await query.edit_message_text(
+                f"Slippage: Buy {new_buy}% | Sell {new_sell}%",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\u2b05\ufe0f Settings", callback_data="td_settings")]]),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Alpha Signals ──
+    if data == "td_alpha":
+        try:
+            if _alpha_engine and hasattr(_alpha_engine, 'get_latest_picks'):
+                picks = _alpha_engine.get_latest_picks(5)
+                if picks:
+                    msg = "\U0001f50d ALPHA SIGNALS (Latest 5)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    for p in picks:
+                        sym = p.get("symbol", "?")
+                        score = p.get("score", 0)
+                        msg += f"\n\u2b50 {sym} — score: {score:.1f}"
+                        addr = p.get("address", "")
+                        if addr:
+                            _cache_address(addr)
+                            msg += f"\nCA: {addr[:20]}..."
+                else:
+                    msg = "\U0001f50d No recent alpha signals"
+            else:
+                msg = "\U0001f50d Alpha Engine: use /alpha for full scan"
+        except Exception:
+            msg = "\U0001f50d Alpha: use /alpha for full scan"
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f504 Scan Now", callback_data="td_alpha_scan"),
+             InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+        ])
+        try:
+            await query.edit_message_text(msg, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "td_alpha_scan":
+        try:
+            await query.edit_message_text("\U0001f50d Scanning alpha signals...")
+            if _scan_alpha:
+                result = await _scan_alpha()
+                report = _format_alpha_report(result) if _format_alpha_report and result else "No signals found"
+                await _safe_send(context.bot, chat_id, report[:4096])
+            else:
+                await _safe_send(context.bot, chat_id, "Alpha engine not available. Use /alpha")
+        except Exception as e:
+            await _safe_send(context.bot, chat_id, f"Scan error: {str(e)[:200]}")
+        return
+
+    # ── Onchain ──
+    if data == "td_onchain":
+        msg = (
+            "\U0001f517 ONCHAIN SCANNER\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Use /onchain for latest on-chain signals\n"
+            "New tokens, trending, top boosts"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f504 Scan Now", callback_data="td_onchain_scan"),
+             InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+        ])
+        try:
+            await query.edit_message_text(msg, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "td_onchain_scan":
+        try:
+            await query.edit_message_text("\U0001f517 Scanning on-chain...")
+            # Trigger onchain scan via the existing function
+            if _alpha_engine and hasattr(_alpha_engine, 'onchain_filter_new_only'):
+                result = await _alpha_engine.onchain_filter_new_only()
+                if result:
+                    lines = ["\U0001f517 On-chain Results\n"]
+                    for item in (result if isinstance(result, list) else [result])[:5]:
+                        if isinstance(item, dict):
+                            lines.append(f"\u2022 {item.get('symbol', '?')} — ${item.get('mcap', 0):,.0f} mcap")
+                    await _safe_send(context.bot, chat_id, "\n".join(lines))
+                else:
+                    await _safe_send(context.bot, chat_id, "No new tokens found")
+            else:
+                await _safe_send(context.bot, chat_id, "Use /onchain for full scan")
+        except Exception as e:
+            await _safe_send(context.bot, chat_id, f"Scan error: {str(e)[:200]}")
+        return
+
+    # ── Whales ──
+    if data == "td_whales":
+        try:
+            if _whale_available and _whale_tracker:
+                report = _whale_tracker.format_24h_report()
+                msg = report[:3800] if report else "No whale activity"
+            else:
+                msg = "\U0001f40b Whale tracker not available"
+        except Exception:
+            msg = "\U0001f40b Whale data unavailable"
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f504 Refresh", callback_data="td_whales"),
+             InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+        ])
+        try:
+            await query.edit_message_text(msg, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    # ── Back to Dashboard ──
+    if data == "td_back":
+        text = await _build_trading_dashboard()
+        kb = _build_dashboard_keyboard()
+        try:
+            await query.edit_message_text(text, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+
 async def arb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show today's arbitrage summary + live top-5 spreads."""
     if not update.message:
@@ -4639,6 +5212,8 @@ def main():
     app.add_handler(CommandHandler("sell", sell_command, filters=auth_filter))
     app.add_handler(CommandHandler("settings", trade_settings_command, filters=auth_filter))
     app.add_handler(CommandHandler("pnl", pnl_command, filters=auth_filter))
+    app.add_handler(CommandHandler("trade", trade_dashboard_command, filters=auth_filter))
+    app.add_handler(CommandHandler("t", trade_dashboard_command, filters=auth_filter))
     app.add_handler(CommandHandler("arb", arb_command, filters=auth_filter))
     app.add_handler(CommandHandler("search", search_command, filters=auth_filter))
     app.add_handler(CommandHandler("whales", whales_command, filters=auth_filter))
@@ -4677,6 +5252,7 @@ def main():
 
     # Callbacks — panel first, then DEX trading, then session control, then quick actions, then safety confirmations
     app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
+    app.add_handler(CallbackQueryHandler(handle_trade_dashboard_callback, pattern="^td_"))
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern="^dex_"))
     app.add_handler(CallbackQueryHandler(handle_session_control_callback, pattern="^sc_"))
     app.add_handler(CallbackQueryHandler(handle_quick_action_callback, pattern="^qa_"))
@@ -4754,17 +5330,15 @@ def main():
         # Register commands FIRST (before any background tasks that might fail)
         try:
             await application.bot.set_my_commands([
-                ("start", "🏠 Main Menu"),
+                ("trade", "💹 Trading Dashboard"),
                 ("positions", "📊 View Positions"),
                 ("buy", "💰 Buy Token"),
                 ("sell", "💸 Sell Token"),
                 ("pnl", "📈 PnL & Stats"),
                 ("paper", "📝 Paper Trading"),
                 ("settings", "⚙️ Trading Settings"),
-                ("onchain", "🔗 Onchain Scanner"),
-                ("alpha", "🔍 Alpha Signals"),
+                ("alpha", "🔍 Alpha / Onchain"),
                 ("status", "🤖 Bot Status"),
-                ("vital", "💀 Vital Signs"),
                 ("help", "❓ All Commands"),
             ])
             logger.info("Bot commands registered with Telegram")
