@@ -536,8 +536,8 @@ class CorrelationHedgeMonitor:
         # Deduplicate by (action, symbol), keep highest urgency
         seen: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for s in suggestions:
-            k = (s["action"], s["symbol"])
-            if k not in seen or s["urgency"] > seen[k]["urgency"]:
+            k = (s.get("action", ""), s.get("symbol", ""))
+            if k not in seen or s.get("urgency", 0) > seen[k].get("urgency", 0):
                 seen[k] = s
         suggestions = sorted(seen.values(), key=lambda x: -x["urgency"])
 

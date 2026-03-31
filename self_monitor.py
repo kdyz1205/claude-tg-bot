@@ -146,14 +146,14 @@ class ActionMemory:
         first_seen: dict[tuple[str, str], str] = {}
         last_seen: dict[tuple[str, str], str] = {}
 
-        for a in self._data["actions"]:
-            if a["success"]:
+        for a in self._data.get("actions", []):
+            if a.get("success"):
                 continue
-            key = (a["action_type"], _normalise_error(a.get("error", "")))
+            key = (a.get("action_type", "unknown"), _normalise_error(a.get("error", "")))
             error_counter[key] = error_counter.get(key, 0) + 1
             if key not in first_seen:
-                first_seen[key] = a["ts"]
-            last_seen[key] = a["ts"]
+                first_seen[key] = a.get("ts", "")
+            last_seen[key] = a.get("ts", "")
 
         patterns = []
         for (atype, err_norm), count in error_counter.items():

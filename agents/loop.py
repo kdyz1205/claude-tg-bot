@@ -272,16 +272,16 @@ async def autonomous_loop(
     # ── Summary ──
     elapsed = time.time() - start_time
     total_rounds = len(history)
-    final_passed = history[-1]["passed"] if history else False
+    final_passed = history[-1].get("passed", False) if history else False
 
     summary_parts = []
     for h in history:
-        icon = "✅" if h["passed"] else "❌"
+        icon = "✅" if h.get("passed") else "❌"
         summary_parts.append(
-            f"{icon} Round {h['round']}:\n"
+            f"{icon} Round {h.get('round', '?')}:\n"
             f"  Root cause: {h.get('investigate', '')[:100]}\n"
             f"  Fix: {h.get('fix', '')[:100]}\n"
-            f"  Verify: {h['verify'][:100]}"
+            f"  Verify: {str(h.get('verify', ''))[:100]}"
         )
 
     status = "DONE" if final_passed else f"INCOMPLETE ({total_rounds} rounds)"

@@ -365,7 +365,7 @@ def generate_chart() -> Optional[str]:
     dates_wr = []
     for i in range(window - 1, len(resolved)):
         batch = resolved[i - window + 1: i + 1]
-        win_rates.append(sum(1 for s in batch if s["status"] == "win") / window * 100)
+        win_rates.append(sum(1 for s in batch if s.get("status") == "win") / window * 100)
         dates_wr.append(datetime.fromtimestamp(resolved[i].get("timestamp", 0)))
 
     # Cumulative PnL

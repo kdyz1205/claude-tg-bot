@@ -450,7 +450,7 @@ def main():
                 continue
 
             task = current_tasks[task_index]
-            task_id = task["id"]
+            task_id = task.get("id", f"unknown_{task_index}")
 
             # 已完成的跳过
             if task_id in state.get("completed_tasks", []):
@@ -466,15 +466,15 @@ def main():
                 continue
             consecutive_skips = 0  # Reset on actual task execution
 
-            log.info(f"▶ 执行 Phase{phase} 任务 {task_index+1}/{len(current_tasks)}: {task['name']}")
-            tg(f"▶ 进化中: Phase{phase} [{task_index+1}/{len(current_tasks)}]\n📝 {task['name']}")
+            log.info(f"▶ 执行 Phase{phase} 任务 {task_index+1}/{len(current_tasks)}: {task.get('name', '?')}")
+            tg(f"▶ 进化中: Phase{phase} [{task_index+1}/{len(current_tasks)}]\n📝 {task.get('name', '?')}")
 
             state["total_runs"] = state.get("total_runs", 0) + 1
             save_state(state)
 
             # 执行任务
             task_start = time.time()
-            success, output = run_claude_task(task["prompt"], timeout=900)
+            success, output = run_claude_task(task.get("prompt", ""), timeout=900)
             task_elapsed = time.time() - task_start
 
             # Safety: if task "completed" in < 10 seconds, it's fake
@@ -486,8 +486,8 @@ def main():
             completed = check_completion(output, task_id)
 
             if completed and success:
-                log.info(f"✅ 任务完成: {task['name']}")
-                tg(f"✅ Phase{phase}-{task_index+1} 完成: {task['name']}")
+                log.info(f"✅ 任务完成: {task.get('name', '?')}")
+                tg(f"✅ Phase{phase}-{task_index+1} 完成: {task.get('name', '?')}")
 
                 completed_list = state.get("completed_tasks", []) + [task_id]
                 state["completed_tasks"] = completed_list[-200:]  # keep only last 200
@@ -502,11 +502,11 @@ def main():
                 state["consecutive_failures"] = failures
                 save_state(state)
 
-                log.warning(f"⚠️ 任务失败 ({failures}次): {task['name']}")
+                log.warning(f"⚠️ 任务失败 ({failures}次): {task.get('name', '?')}")
 
                 if failures >= 3:
-                    log.error(f"❌ 任务连续失败3次，跳过: {task['name']}")
-                    tg(f"⚠️ 跳过失败任务: {task['name']}（将在下轮重试）")
+                    log.error(f"❌ 任务连续失败3次，跳过: {task.get('name', '?')}")
+                    tg(f"⚠️ 跳过失败任务: {task.get('name', '?')}（将在下轮重试）")
                     state["failed_tasks"] = (state.get("failed_tasks", []) + [task_id])[-200:]
                     state["task_index"] = task_index + 1
                     state["consecutive_failures"] = 0
@@ -520,7 +520,7 @@ def main():
         tg("⏹ 无限进化引擎已停止（手动）")
     except Exception as e:
         log.error(f"致命错误: {e}")
-        tg(f"❌ 进化引擎错误: {e}")
+        tg(f"❌ 进化引擎错误: {str(e)[:300]}")
     finally:
         if lock_fh:
             try:

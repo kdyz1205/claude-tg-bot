@@ -1450,7 +1450,7 @@ class StrategyOptimizer:
         try:
             return run_optimization(trigger=trigger)
         except Exception as e:
-            return {"status": "error", "message": f"❌ 优化失败: {e}", "changes": {}}
+            return {"status": "error", "message": f"❌ 优化失败: {str(e)[:300]}", "changes": {}}
 
     async def evolve_now(self) -> dict:
         """Phase 2: run GA evolution immediately (for /strategy_evolve command)."""
@@ -1459,7 +1459,7 @@ class StrategyOptimizer:
             return await loop.run_in_executor(None, run_ga_evolution, "manual")
         except Exception as e:
             logger.error("GA evolve_now failed: %s", e)
-            return {"status": "error", "message": f"❌ 进化失败: {e}", "strategies": {}}
+            return {"status": "error", "message": f"❌ 进化失败: {str(e)[:300]}", "strategies": {}}
 
     @property
     def running(self) -> bool:

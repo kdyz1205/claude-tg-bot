@@ -239,7 +239,7 @@ async def run_training(
         await _run_training_loop(domain_id, send_status, send_photo, model, loops)
     except Exception as e:
         logger.exception(f"Training crashed: {e}")
-        await send_status(f"❌ 训练崩溃: {e}")
+        await send_status(f"❌ 训练崩溃: {str(e)[:300]}")
     finally:
         if not _internal:
             _training_active = False

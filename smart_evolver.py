@@ -301,7 +301,7 @@ def _restart_bot():
         time.sleep(15)
     except Exception as e:
         log.error(f"Failed to restart bot: {e}")
-        tg(f"❌ Bot重启失败: {e}")
+        tg(f"❌ Bot重启失败: {str(e)[:300]}")
 
 
 def _check_claude_cli_available() -> bool:
@@ -711,7 +711,7 @@ def retire_weak_skills(state: dict) -> int:
         m = load_metrics()
         retired = 0
 
-        for skill_id, metrics in m["skills"].items():
+        for skill_id, metrics in m.get("skills", {}).items():
             use_count = metrics.get("use_count", 0)
             success_count = metrics.get("success_count", 0)
 
@@ -864,7 +864,7 @@ def run_skill_audit(state: dict):
 
     except Exception as e:
         log.error(f"Skill audit failed: {e}")
-        tg(f"❌ 技能审计失败: {e}")
+        tg(f"❌ 技能审计失败: {str(e)[:300]}")
 
 
 # ─── Main Loop ───────────────────────────────────────────────────────────────

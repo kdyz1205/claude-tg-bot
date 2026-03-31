@@ -597,10 +597,10 @@ class ArbEngine:
                 "total_estimated_profit_usdt": 0.0,
                 "opportunities": [],
             }
-        avg_spread = sum(o["spread_pct"] for o in today_opps) / len(today_opps)
+        avg_spread = sum(o.get("spread_pct", 0) for o in today_opps) / len(today_opps)
         avg_net    = sum(o.get("net_profit_pct", 0) for o in today_opps) / len(today_opps)
         total_pnl  = sum(o.get("net_profit_usdt", 0) for o in today_opps)
-        top10      = sorted(today_opps, key=lambda x: x["spread_pct"], reverse=True)[:10]
+        top10      = sorted(today_opps, key=lambda x: x.get("spread_pct", 0), reverse=True)[:10]
         return {
             "date": today,
             "count": len(today_opps),

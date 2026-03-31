@@ -178,7 +178,7 @@ class TelegramBot:
                             await loop.run_in_executor(None, self.send_message, msg.chat_id, response)
                         except Exception as e:
                             logger.error(f"Handler error: {e}")
-                            await loop.run_in_executor(None, self.send_message, msg.chat_id, f"Error: {e}")
+                            await loop.run_in_executor(None, self.send_message, msg.chat_id, f"Error: {str(e)[:300]}")
             except Exception as e:
                 logger.error(f"Polling error: {e}")
                 await asyncio.sleep(5)

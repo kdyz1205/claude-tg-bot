@@ -118,16 +118,16 @@ def check_and_send():
 
     # Check if session is idle
     if not is_session_idle():
-        print(f"⏳ Session busy, waiting... (Next task: {task['name']})")
+        print(f"⏳ Session busy, waiting... (Next task: {task.get('name', '?')})")
         return True  # continue loop
 
     # Session is idle, send the task
-    print(f"\n[SENDING] evolution task #{task['id']}: {task['name']}")
+    print(f"\n[SENDING] evolution task #{task.get('id', '?')}: {task.get('name', '?')}")
 
     evolution_prompt = f"""
-**[进化任务 #{task['id']}: {task['name']}]**
+**[进化任务 #{task.get('id', '?')}: {task.get('name', '?')}]**
 
-{task['prompt']}
+{task.get('prompt', '')}
 
 完成后：
 1. 总结你做了什么
@@ -136,9 +136,9 @@ def check_and_send():
 """.strip()
 
     send_to_session(evolution_prompt)
-    mark_task_sent(task["id"])
+    mark_task_sent(task.get("id", 0))
 
-    print(f"[SENT] Task #{task['id']} sent. Waiting for completion...")
+    print(f"[SENT] Task #{task.get('id', '?')} sent. Waiting for completion...")
     return True
 
 def main():

@@ -459,12 +459,12 @@ class ProactiveSelfRepair:
         syntax_errors = scan_syntax_errors()
         results["syntax_errors"] = syntax_errors
         for err in syntax_errors:
-            logger.warning("ProactiveSelfRepair: SyntaxError in %s: %s", err["file"], err["error_msg"][:80])
-            fixed_source = await _generate_syntax_fix(err["path"], err["error_msg"])
+            logger.warning("ProactiveSelfRepair: SyntaxError in %s: %s", err.get("file", "?"), str(err.get("error_msg", ""))[:80])
+            fixed_source = await _generate_syntax_fix(err.get("path", ""), err.get("error_msg", ""))
             if fixed_source:
-                success = await _apply_syntax_fix(err["path"], fixed_source, err, self._notify_fn)
+                success = await _apply_syntax_fix(err.get("path", ""), fixed_source, err, self._notify_fn)
                 if success:
-                    results["fixed"].append(err["file"])
+                    results["fixed"].append(err.get("file", "?"))
                     if self._notify_fn:
                         await self._notify_fn(
                             f"🔧 *自动修复成功*\n"
@@ -657,7 +657,7 @@ def _collect_module_profiles() -> list[dict]:
             "score": round(score, 2),
         })
 
-    profiles.sort(key=lambda x: x["score"], reverse=True)
+    profiles.sort(key=lambda x: x.get("score", 0), reverse=True)
     return profiles
 
 
@@ -1270,10 +1270,10 @@ def analyze_code_quality() -> dict:
         metrics["path"] = str(path)
         results.append(metrics)
 
-    results.sort(key=lambda x: x["score"])  # worst first
+    results.sort(key=lambda x: x.get("score", 0))  # worst first
 
-    low_quality = [r for r in results if r["score"] < 60]
-    avg_score = round(sum(r["score"] for r in results) / len(results), 1) if results else 0
+    low_quality = [r for r in results if r.get("score", 100) < 60]
+    avg_score = round(sum(r.get("score", 0) for r in results) / len(results), 1) if results else 0
 
     report = {
         "generated_at": datetime.now().isoformat(),

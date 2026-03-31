@@ -470,16 +470,16 @@ class OnchainTracker:
         return found
 
     def _build_signal(self, classified: dict, address: str, label: str, network: str) -> dict:
-        token = classified["token"]
-        action = classified["action"]
+        token = classified.get("token", "unknown")
+        action = classified.get("action", "unknown")
         sig = {
             "address": address,
             "address_label": label,
             "token": token,
-            "amount_usd": classified["amount_usd"],
+            "amount_usd": classified.get("amount_usd", 0),
             "action": action,
-            "tx_hash": classified["tx_hash"],
-            "timestamp": classified["timestamp"],
+            "tx_hash": classified.get("tx_hash", ""),
+            "timestamp": classified.get("timestamp", 0),
             "network": network,
             "confidence": "NORMAL",
             "dual_confirmed": False,
@@ -487,10 +487,10 @@ class OnchainTracker:
         dual = _dual_confirm(action, token)
         if dual:
             sig.update({
-                "confidence": dual["confidence"],
+                "confidence": dual.get("confidence", "HIGH"),
                 "dual_confirmed": True,
-                "direction": dual["direction"],
-                "tech_score": dual["tech_score"],
+                "direction": dual.get("direction", "unknown"),
+                "tech_score": dual.get("tech_score", 0),
             })
         return sig
 
@@ -852,10 +852,10 @@ class SmartMoneyTracker:
         if not evaluated and not pending:
             return "📊 尚无聪明钱信号表现数据"
 
-        wins = [r for r in evaluated if r["result"] is True]
-        losses = [r for r in evaluated if r["result"] is False]
+        wins = [r for r in evaluated if r.get("result") is True]
+        losses = [r for r in evaluated if r.get("result") is False]
         accuracy = len(wins) / len(evaluated) * 100 if evaluated else 0
-        avg_pnl = sum(r["pnl_pct"] for r in evaluated) / len(evaluated) if evaluated else 0
+        avg_pnl = sum(r.get("pnl_pct", 0) for r in evaluated) / len(evaluated) if evaluated else 0
 
         lines = [
             f"📊 聪明钱信号 24h 准确率报告",
@@ -865,13 +865,13 @@ class SmartMoneyTracker:
         ]
         if evaluated:
             lines.append("\n最近5条记录:")
-            for r in sorted(evaluated, key=lambda x: x["timestamp"], reverse=True)[:5]:
-                ts = datetime.fromtimestamp(r["timestamp"]).strftime("%m/%d %H:%M")
-                icon = "✅" if r["result"] else "❌"
+            for r in sorted(evaluated, key=lambda x: x.get("timestamp", 0), reverse=True)[:5]:
+                ts = datetime.fromtimestamp(r.get("timestamp", 0)).strftime("%m/%d %H:%M")
+                icon = "✅" if r.get("result") else "❌"
                 lines.append(
-                    f"  {icon} {r['address_label']} {r['token']} "
-                    f"入{r['entry_price']:.6g}→出{r.get('exit_price',0):.6g} "
-                    f"{r['pnl_pct']:+.1f}% @{ts}"
+                    f"  {icon} {r.get('address_label', '?')} {r.get('token', '?')} "
+                    f"入{r.get('entry_price', 0):.6g}→出{r.get('exit_price',0):.6g} "
+                    f"{r.get('pnl_pct', 0):+.1f}% @{ts}"
                 )
         result = "\n".join(lines)
         return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result

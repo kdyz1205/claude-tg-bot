@@ -664,7 +664,7 @@ async def scan_alpha(cfg: dict = None) -> list[dict]:
                 "scanned_at": time.time(),
             })
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
+    scored.sort(key=lambda x: x.get("score", 0), reverse=True)
     return scored[:top_n]
 
 
@@ -791,13 +791,13 @@ def get_performance_summary() -> str:
     lines = [f"📊 Alpha信号真实绩效 (共{total}个信号)\n"]
 
     if has_1h:
-        avg_1h = sum(r["pnl_1h"] for r in has_1h) / len(has_1h)
-        win_1h = sum(1 for r in has_1h if r["pnl_1h"] > 0)
+        avg_1h = sum(r.get("pnl_1h", 0) for r in has_1h) / len(has_1h)
+        win_1h = sum(1 for r in has_1h if r.get("pnl_1h", 0) > 0)
         lines.append(f"1h: 胜率{win_1h}/{len(has_1h)} ({win_1h/len(has_1h)*100:.0f}%) 平均{avg_1h:+.1f}%")
 
     if has_24h:
-        avg_24h = sum(r["pnl_24h"] for r in has_24h) / len(has_24h)
-        win_24h = sum(1 for r in has_24h if r["pnl_24h"] > 0)
+        avg_24h = sum(r.get("pnl_24h", 0) for r in has_24h) / len(has_24h)
+        win_24h = sum(1 for r in has_24h if r.get("pnl_24h", 0) > 0)
         lines.append(f"24h: 胜率{win_24h}/{len(has_24h)} ({win_24h/len(has_24h)*100:.0f}%) 平均{avg_24h:+.1f}%")
 
     # Top 3 best and worst
@@ -805,10 +805,10 @@ def get_performance_summary() -> str:
         sorted_by_pnl = sorted(has_24h, key=lambda r: r.get("pnl_24h", 0), reverse=True)
         lines.append("\n🏆 最佳:")
         for r in sorted_by_pnl[:3]:
-            lines.append(f"  {r['symbol']}: {r['pnl_24h']:+.1f}%")
+            lines.append(f"  {r.get('symbol', '?')}: {r.get('pnl_24h', 0):+.1f}%")
         lines.append("💀 最差:")
         for r in sorted_by_pnl[-3:]:
-            lines.append(f"  {r['symbol']}: {r['pnl_24h']:+.1f}%")
+            lines.append(f"  {r.get('symbol', '?')}: {r.get('pnl_24h', 0):+.1f}%")
 
     result = "\n".join(lines)
     if len(result) > 4000:

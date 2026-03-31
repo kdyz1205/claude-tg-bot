@@ -454,8 +454,8 @@ async def run_pipeline(
     elapsed = time.time() - start_time
     parts = []
     for r in results:
-        icon = {"computer": "🖥️", "review": "🔍", "debug": "🔧", "code": "📝", "verify": "✅"}.get(r["agent"], "⚙️")
-        parts.append(f"{icon} {r['task'][:60]}\n{r['result'][:300]}")
+        icon = {"computer": "🖥️", "review": "🔍", "debug": "🔧", "code": "📝", "verify": "✅"}.get(r.get("agent", ""), "⚙️")
+        parts.append(f"{icon} {str(r.get('task', ''))[:60]}\n{str(r.get('result', ''))[:300]}")
 
     final = "\n\n".join(parts)
     final += f"\n\n⏱️ {elapsed:.0f}s | 🔄 {review_rounds} review rounds"

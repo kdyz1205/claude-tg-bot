@@ -108,9 +108,9 @@ if _flask_available:
         with _stats_lock:
             stats_snap = dict(_stats)
 
-        total = stats_snap["total"]
-        success_rate = round(stats_snap["success"] / total * 100, 1) if total > 0 else 0.0
-        avg_ms = round(stats_snap["total_ms"] / total) if total > 0 else 0
+        total = stats_snap.get("total", 0)
+        success_rate = round(stats_snap.get("success", 0) / total * 100, 1) if total > 0 else 0.0
+        avg_ms = round(stats_snap.get("total_ms", 0) / total) if total > 0 else 0
 
         sys_stats = _get_system_stats()
         evolution = _get_evolution_progress()
@@ -119,8 +119,8 @@ if _flask_available:
             "timestamp": datetime.now().isoformat(),
             "messages": {
                 "total": total,
-                "success": stats_snap["success"],
-                "failed": stats_snap["failed"],
+                "success": stats_snap.get("success", 0),
+                "failed": stats_snap.get("failed", 0),
                 "success_rate": success_rate,
                 "avg_ms": avg_ms,
             },
@@ -362,10 +362,10 @@ def start_dashboard(host: str = "127.0.0.1", port: int = 8080) -> bool:
 def get_stats_text() -> str:
     """Return formatted text stats for Telegram /dashboard command."""
     with _stats_lock:
-        total = _stats["total"]
-        success = _stats["success"]
-        failed = _stats["failed"]
-        total_ms = _stats["total_ms"]
+        total = _stats.get("total", 0)
+        success = _stats.get("success", 0)
+        failed = _stats.get("failed", 0)
+        total_ms = _stats.get("total_ms", 0)
 
     success_rate = round(success / total * 100, 1) if total > 0 else 0.0
     avg_ms = round(total_ms / total) if total > 0 else 0
@@ -388,7 +388,7 @@ def get_stats_text() -> str:
         f"**Avg Response:** {avg_ms}ms",
         f"**Errors (1h):** {err_1h}",
         f"**Bot State:** {state.upper()}\n",
-        f"**Evolution:** {evo['completed_count']}/{evo['total']} tasks done",
+        f"**Evolution:** {evo.get('completed_count', 0)}/{evo.get('total', 7)} tasks done",
         f"**Dashboard URL:** http://localhost:8080\n",
     ]
 
@@ -397,8 +397,8 @@ def get_stats_text() -> str:
     if recent_snap:
         lines.append("**Recent Messages:**")
         for msg in recent_snap[-5:]:
-            icon = "✅" if msg["success"] else "❌"
-            lines.append(f"  {icon} [{msg['ts']}] {msg['text'][:50]} ({msg['duration_ms']}ms)")
+            icon = "✅" if msg.get("success") else "❌"
+            lines.append(f"  {icon} [{msg.get('ts', '?')}] {str(msg.get('text', ''))[:50]} ({msg.get('duration_ms', 0)}ms)")
 
     result = "\n".join(lines)
     # Truncate for Telegram's 4096 char limit

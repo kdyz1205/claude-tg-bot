@@ -413,27 +413,27 @@ def get_status_text() -> str:
         emoji = "✅" if ok else "❌"
         inv_lines.append(f"  {emoji} {name}")
 
-    alive_emoji = "🫀" if inv["ALIVE"] else "💀"
+    alive_emoji = "🫀" if inv.get("ALIVE") else "💀"
 
     text = (
-        f"{alive_emoji} Vital Signs — {state_emoji.get(vs['lifecycle'], '?')} {vs['lifecycle'].upper()}\n"
-        f"⏱ Uptime: {vs['uptime_hours']:.1f}h\n"
+        f"{alive_emoji} Vital Signs — {state_emoji.get(vs.get('lifecycle', 'unknown'), '?')} {vs.get('lifecycle', 'unknown').upper()}\n"
+        f"⏱ Uptime: {vs.get('uptime_hours', 0):.1f}h\n"
         f"\n"
         f"📊 8 Vital Metrics:\n"
-        f"  Runway: {vs['runway_days']}d\n"
-        f"  Models: {vs['model_access']}\n"
-        f"  Tasks/h: {vs['task_throughput_h']}\n"
-        f"  Learning: {vs['learning_rate']}\n"
-        f"  Recovery: {vs['error_recovery_s']}s\n"
-        f"  Revenue/h: {vs['revenue_rate_h']}/h\n"
-        f"  Autonomy: {vs['autonomy_pct']}%\n"
+        f"  Runway: {vs.get('runway_days', 0)}d\n"
+        f"  Models: {vs.get('model_access', 0)}\n"
+        f"  Tasks/h: {vs.get('task_throughput_h', 0)}\n"
+        f"  Learning: {vs.get('learning_rate', 0)}\n"
+        f"  Recovery: {vs.get('error_recovery_s', 0)}s\n"
+        f"  Revenue/h: {vs.get('revenue_rate_h', 0)}/h\n"
+        f"  Autonomy: {vs.get('autonomy_pct', 0)}%\n"
         f"\n"
         f"🔬 Five Invariants:\n"
         + "\n".join(inv_lines)
         + f"\n\n"
-        f"📈 Tasks: {vs['successful_tasks']}/{vs['total_tasks']} "
-        f"| Skills: {vs['skills_created']} "
-        f"| Self-heals: {vs['self_heal_successes']}/{vs['self_heals']}"
+        f"📈 Tasks: {vs.get('successful_tasks', 0)}/{vs.get('total_tasks', 0)} "
+        f"| Skills: {vs.get('skills_created', 0)} "
+        f"| Self-heals: {vs.get('self_heal_successes', 0)}/{vs.get('self_heals', 0)}"
     )
     # Truncate for Telegram's 4096 char limit
     if len(text) > 4000:

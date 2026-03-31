@@ -577,9 +577,9 @@ class ProactiveAgent:
         for atype, s in stats.items():
             total = s.get("ok", 0) + s.get("fail", 0)
             if total >= 3 and s.get("fail", 0) > 0:
-                fail_rate = s["fail"] / total
+                fail_rate = s.get("fail", 0) / total
                 if fail_rate > 0.2:
-                    failures.append((atype, s["fail"], total))
+                    failures.append((atype, s.get("fail", 0), total))
         failures.sort(key=lambda x: x[1], reverse=True)
 
         if failures:

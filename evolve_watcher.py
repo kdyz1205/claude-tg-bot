@@ -100,7 +100,7 @@ def advance_queue(q, completed_task_name):
         tasks[idx]["status"] = "completed"
         tasks[idx]["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         completed = q.setdefault("completed_tasks", [])
-    completed.append(tasks[idx]["name"])
+    completed.append(tasks[idx].get("name", "unknown"))
     # Cap completed_tasks to prevent unbounded list growth
     if len(completed) > 200:
         q["completed_tasks"] = completed[-200:]
@@ -129,11 +129,11 @@ def get_task_prompt(q, context_limit=False):
         return (
             _SAFETY_RULES +
             f"CONTEXT LIMIT DETECTED - 继续进化任务队列。\n\n"
-            f"当前任务：{task['name']} (任务{task['id']}/7)\n\n"
-            f"{task['prompt']}\n\n"
-            f"注意：这是续命指令，请继续完成上面的任务，完成后说 ✅任务{task['id']}完成。"
+            f"当前任务：{task.get('name', '?')} (任务{task.get('id', '?')}/7)\n\n"
+            f"{task.get('prompt', '')}\n\n"
+            f"注意：这是续命指令，请继续完成上面的任务，完成后说 ✅任务{task.get('id', '?')}完成。"
         )
-    return _SAFETY_RULES + task["prompt"]
+    return _SAFETY_RULES + task.get("prompt", "")
 
 
 def log(msg):
@@ -326,7 +326,7 @@ def send_revival_cli(state, context_limit=False):
     if q:
         msg = get_task_prompt(q, context_limit=context_limit)
         task = get_current_task(q)
-        task_info = f"任务{task['id']}/7: {task['name']}" if task else "循环进化"
+        task_info = f"任务{task.get('id', '?')}/7: {task.get('name', '?')}" if task else "循环进化"
     else:
         msg = REVIVAL_PROMPTS[state.get("revival_idx", 0) % len(REVIVAL_PROMPTS)]
         task_info = "generic revival"
@@ -372,11 +372,11 @@ def send_revival_cli(state, context_limit=False):
                 task = get_current_task(q)
                 completion_markers = ["✅", "任务完成", "task complete", "completed"]
                 if task and any(m in response_text.lower() for m in completion_markers):
-                    log(f"Task completion detected! Advancing from task {task['id']}: {task['name']}")
-                    next_task = advance_queue(q, task["name"])
+                    log(f"Task completion detected! Advancing from task {task.get('id', '?')}: {task.get('name', '?')}")
+                    next_task = advance_queue(q, task.get("name", "unknown"))
                     if next_task:
-                        notify_tg(f"✅ 任务{task['id']} [{task['name']}] 完成！\n下一个: 任务{next_task['id']} [{next_task['name']}]")
-                        log(f"Next task: {next_task['id']}: {next_task['name']}")
+                        notify_tg(f"✅ 任务{task.get('id', '?')} [{task.get('name', '?')}] 完成！\n下一个: 任务{next_task.get('id', '?')} [{next_task.get('name', '?')}]")
+                        log(f"Next task: {next_task.get('id', '?')}: {next_task.get('name', '?')}")
                     state["_force_next_task"] = True  # immediately send next task
         else:
             log(f"Revival command failed (exit code {result.returncode})")
@@ -530,7 +530,7 @@ if __name__ == "__main__":
             task = get_current_task(q)
             print(f"Loop #{q.get('loop_count', 0)} | Current task index: {q['current_task_index']}")
             if task:
-                print(f"  Current: [{task['id']}] {task['name']} ({task['status']})")
+                print(f"  Current: [{task.get('id', '?')}] {task.get('name', '?')} ({task.get('status', '?')})")
             else:
                 print("  All tasks done!")
             print(f"  Completed: {q.get('completed_tasks', [])}")
@@ -540,9 +540,9 @@ if __name__ == "__main__":
         q = load_queue()
         if q:
             t = get_current_task(q)
-            name = t["name"] if t else "unknown"
+            name = t.get("name", "unknown") if t else "unknown"
             next_t = advance_queue(q, name)
-            print(f"Advanced past '{name}' → next: {next_t['name'] if next_t else 'all done'}")
+            print(f"Advanced past '{name}' → next: {next_t.get('name', '?') if next_t else 'all done'}")
     elif len(sys.argv) > 1 and sys.argv[1] == "reset":
         q = load_queue()
         if q:

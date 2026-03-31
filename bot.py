@@ -360,7 +360,7 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Clear command error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ 清空失败: {e}")
+            await update.message.reply_text(f"❌ 清空失败: {str(e)[:300]}")
         except Exception:
             pass
 
@@ -390,7 +390,7 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔪 已终止 Claude 进程并清空队列。\n发新消息重新开始。"
             )
         except Exception as e:
-            await update.message.reply_text(f"🔪 队列已清空。进程终止: {e}")
+            await update.message.reply_text(f"🔪 队列已清空。进程终止: {str(e)[:300]}")
     except Exception as e:
         logger.error(f"Kill command error: {e}", exc_info=True)
         try:
@@ -457,6 +457,8 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cancel [task_id] — cancel queued tasks."""
     if not update.message:
+        return
+    if not update.effective_chat:
         return
     try:
         chat_id = update.effective_chat.id
@@ -840,7 +842,7 @@ async def _learn_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
                 lines.append("")
             await update.message.reply_text("\n".join(lines)[:4096])
         except Exception as e:
-            await update.message.reply_text(f"Gaps error: {e}")
+            await update.message.reply_text(f"Gaps error: {str(e)[:300]}")
 
     else:
         await update.message.reply_text(
@@ -916,7 +918,7 @@ async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Self-training curriculum system."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         import auto_train
@@ -1805,7 +1807,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detailed health check command."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         await _send_health(context, update.effective_chat.id)
@@ -1835,7 +1837,7 @@ async def vital_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show trading positions."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         await _send_portfolio(context, update.effective_chat.id)
@@ -1849,7 +1851,7 @@ async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show latest trading signals."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         await _send_signals(context, update.effective_chat.id)
@@ -2896,7 +2898,7 @@ async def whales_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Web search. Usage: /search <query>"""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     query = " ".join(context.args) if context.args else ""
     if not query:
@@ -3015,7 +3017,7 @@ async def addwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate and send signal performance report."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         await _send_profit_report(context, update.effective_chat.id)
@@ -3051,7 +3053,7 @@ async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show risk metrics."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         await _send_risk(context, update.effective_chat.id)
@@ -3472,7 +3474,7 @@ async def okx_backtest_command(update: Update, context: ContextTypes.DEFAULT_TYP
     Usage: /okx_backtest [timeframe]
     Example: /okx_backtest 1H
     """
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     tf = context.args[0] if context.args else "1H"
     chat_id = update.effective_chat.id
@@ -3620,7 +3622,7 @@ async def ma_ribbon_screener_command(update: Update, context: ContextTypes.DEFAU
 
     Usage: /ma_ribbon_screener
     """
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
     msg = await update.message.reply_text(
@@ -3906,7 +3908,7 @@ async def proactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Control the market monitor. Usage: /market [on|off|status]"""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         action = (context.args[0].lower() if context.args else "status")
@@ -3955,7 +3957,7 @@ async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def autonomy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Control autonomous agent. Usage: /autonomy [start|stop|status|goal <text>]"""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     if not _autonomy_available:
         await update.message.reply_text("Autonomy module not available.")
@@ -4046,7 +4048,7 @@ async def consciousness_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Self-evolution: bot analyzes and improves its own code. Usage: /evolve [focus]"""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         from agents.loop import self_evolve
@@ -4073,7 +4075,7 @@ async def evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def strategy_evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """GA strategy parameter evolution. Usage: /strategy_evolve"""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         from strategy_optimizer import strategy_optimizer, format_ga_result
@@ -4098,7 +4100,7 @@ async def strategy_evolve_command(update: Update, context: ContextTypes.DEFAULT_
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View or edit bot memory. Usage: /memory [show|shortcuts|patterns|summary <text>|set <key> <value>]"""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
     args = context.args or []
@@ -4289,7 +4291,7 @@ async def multi_session_command(update: Update, context: ContextTypes.DEFAULT_TY
 # ─── Screenshot & Quick Actions ───────────────────────────────────────────────
 
 async def quick_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     try:
         from screenshots import capture_screenshot
@@ -4313,7 +4315,7 @@ async def quick_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await update.message.reply_photo(photo=buffer, reply_markup=keyboard)
     except Exception as e:
-        await update.message.reply_text(f"Screenshot failed: {e}")
+        await update.message.reply_text(f"Screenshot failed: {str(e)[:300]}")
 
 
 async def quick_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4526,7 +4528,7 @@ async def _background_session_scan(learner):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
@@ -4710,7 +4712,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle photos — save to disk and pass to Claude with vision support in API mode."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
     caption = update.message.caption or ""
@@ -4800,7 +4802,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle voice messages — transcribe with Gemini, process as text."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
     try:
@@ -4898,7 +4900,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle files — save to desktop and notify AI."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
     try:
@@ -4950,7 +4952,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle video/animation — save to disk and tell Claude."""
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
     try:
@@ -5305,7 +5307,7 @@ def main():
         except Exception as e:
             logger.error(f"Location handling error: {e}", exc_info=True)
             try:
-                await u.message.reply_text(f"❌ 位置处理失败: {e}")
+                await u.message.reply_text(f"❌ 位置处理失败: {str(e)[:300]}")
             except Exception:
                 pass
     app.add_handler(MessageHandler(auth_filter & filters.LOCATION, _handle_location))
@@ -5322,7 +5324,7 @@ def main():
         except Exception as e:
             logger.error(f"Contact handling error: {e}", exc_info=True)
             try:
-                await u.message.reply_text(f"❌ 联系人处理失败: {e}")
+                await u.message.reply_text(f"❌ 联系人处理失败: {str(e)[:300]}")
             except Exception:
                 pass
     app.add_handler(MessageHandler(auth_filter & filters.CONTACT, _handle_contact))
