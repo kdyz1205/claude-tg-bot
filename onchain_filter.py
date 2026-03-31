@@ -163,7 +163,7 @@ def _save_alerted():
         os.replace(tmp, str(ALERTED_FILE))
     except Exception:
         try:
-            os.unlink(tmp)
+            os.unlink(str(ALERTED_FILE) + ".tmp")
         except OSError:
             pass
 
@@ -200,12 +200,16 @@ def _macd(closes: list, fast=12, slow=26, signal=9):
     if len(closes) < slow + signal:
         return None, None
     def ema(data, period):
+        if not data:
+            return 0.0
         k = 2 / (period + 1)
         e = data[0]
         for v in data[1:]:
             e = v * k + e * (1 - k)
         return e
     def ema_series(data, period):
+        if not data:
+            return [0.0]
         k = 2 / (period + 1)
         result = [data[0]]
         for v in data[1:]:

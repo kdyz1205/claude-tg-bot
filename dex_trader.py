@@ -535,6 +535,8 @@ def format_buy_result(pos: dict, amount_sol: float) -> str:
 
 def format_sell_result(result: dict) -> str:
     """Format sell confirmation message."""
+    if not result or not isinstance(result, dict):
+        return "Sell failed — no result"
     pos = result.get("position", {})
     pnl = result.get("pnl_pct", 0)
     em = "\U0001f7e2" if pnl > 0 else "\U0001f534"

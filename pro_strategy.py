@@ -214,11 +214,12 @@ def _parse_candles(candles: list) -> dict:
 def _ema(values: list, period: int) -> list:
     if period <= 0 or len(values) < period:
         return [None] * len(values)
+    vals = [v if v is not None else 0.0 for v in values]
     k = 2 / (period + 1)
     result = [None] * (period - 1)
-    ema_val = sum(values[:period]) / period
+    ema_val = sum(vals[:period]) / period
     result.append(ema_val)
-    for v in values[period:]:
+    for v in vals[period:]:
         ema_val = v * k + ema_val * (1 - k)
         result.append(ema_val)
     return result
@@ -993,13 +994,26 @@ class ProStrategyEngine:
                 if signals:
                     self._last_signals = signals[:self._MAX_LAST_SIGNALS]
                     min_score = cfg.get("min_combined_score", 60)
-                    # Record and send top signals (double-check score threshold)
                     for sig in signals[:3]:
                         if sig.get("combined_score", 0) < min_score:
                             continue
                         if self._send:
                             await self._send(format_pro_signal(sig))
                         _record_signal(sig)
+                    # Auto-open paper trades for qualifying signals
+                    try:
+                        from paper_trader import on_signal_detected
+                        paper_tokens = [{
+                            "symbol": s.get("symbol", "?"),
+                            "price": s.get("entry_price", 0),
+                            "direction": s.get("direction", "long"),
+                            "score": s.get("combined_score", 0),
+                            "source": "pro_strategy",
+                        } for s in signals[:3] if s.get("combined_score", 0) >= min_score]
+                        if paper_tokens:
+                            await on_signal_detected(paper_tokens, self._send)
+                    except Exception as e:
+                        logger.debug("Pro→paper trade error: %s", str(e)[:200])
             except asyncio.CancelledError:
                 raise
             except Exception as e:

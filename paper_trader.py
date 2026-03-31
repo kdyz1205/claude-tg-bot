@@ -147,23 +147,26 @@ def can_open_trade(token: dict, cfg: dict = None) -> tuple:
     if abs(daily_loss) >= cfg.get("daily_loss_limit_sol", 0.3):
         return False, f"daily loss limit hit ({daily_loss:.3f} SOL)"
 
-    # Check duplicate (same address already open)
+    # Check duplicate (same symbol or address already open)
     addr = token.get("address", "")
+    sym = token.get("symbol", "")
     for t in open_trades:
-        if t.get("address") == addr:
+        if addr and t.get("address") == addr:
             return False, f"already have open position in {token.get('symbol', '?')}"
+        if sym and not addr and t.get("symbol") == sym:
+            return False, f"already have open position in {sym}"
 
-    # Check liquidity
-    liq = token.get("liquidity_usd", 0) or token.get("entry_liq", 0)
-    if liq < cfg.get("min_liquidity", 20000):
-        return False, f"liquidity too low (${liq:,.0f})"
-
-    # Check mcap
-    mcap = token.get("market_cap_usd", 0) or token.get("entry_mcap", 0) or token.get("mcap", 0)
-    if mcap < cfg.get("min_mcap", 15000):
-        return False, f"mcap too low (${mcap:,.0f})"
-    if mcap > cfg.get("max_mcap", 8000000):
-        return False, f"mcap too high (${mcap:,.0f})"
+    # CEX futures (e.g. BTC-USDT, ETH-USDT) skip liquidity/mcap checks
+    is_cex = token.get("source") == "pro_strategy" or "-USDT" in token.get("symbol", "")
+    if not is_cex:
+        liq = token.get("liquidity_usd", 0) or token.get("entry_liq", 0)
+        if liq < cfg.get("min_liquidity", 20000):
+            return False, f"liquidity too low (${liq:,.0f})"
+        mcap = token.get("market_cap_usd", 0) or token.get("entry_mcap", 0) or token.get("mcap", 0)
+        if mcap < cfg.get("min_mcap", 15000):
+            return False, f"mcap too low (${mcap:,.0f})"
+        if mcap > cfg.get("max_mcap", 8000000):
+            return False, f"mcap too high (${mcap:,.0f})"
 
     return True, "ok"
 
@@ -181,7 +184,7 @@ def open_paper_trade(token: dict, cfg: dict = None) -> Optional[dict]:
         logger.info(f"Paper trade rejected for {token.get('symbol', '?')}: {reason}")
         return None
 
-    price = float(token.get("price_usd", 0) or token.get("entry_price", 0) or 0)
+    price = float(token.get("price_usd", 0) or token.get("price", 0) or token.get("entry_price", 0) or 0)
     if price <= 0:
         logger.warning(f"Invalid price for {token.get('symbol', '?')}: {price}")
         return None
@@ -258,8 +261,32 @@ def close_paper_trade(trade_id: str, current_price: float, reason: str) -> Optio
 
 # ─── Price Monitoring Loop ───
 
-async def _fetch_current_price(address: str) -> Optional[float]:
-    """Fetch current price from DexScreener."""
+async def _fetch_okx_price(symbol: str) -> Optional[float]:
+    """Fetch current price from OKX (free, no API key)."""
+    try:
+        import httpx
+        instId = symbol.replace("-USDT", "-USDT-SWAP") if "-USDT" in symbol else symbol
+        url = f"https://www.okx.com/api/v5/market/ticker?instId={symbol}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if data.get("code") == "0" and data.get("data"):
+                return float(data["data"][0].get("last", 0))
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_current_price(address: str, symbol: str = "") -> Optional[float]:
+    """Fetch current price. Uses OKX for CEX pairs, DexScreener for onchain."""
+    # CEX pair: use OKX
+    if symbol and "-USDT" in symbol:
+        return await _fetch_okx_price(symbol)
+    # Onchain: use DexScreener
+    if not address:
+        return None
     try:
         import httpx
         url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
@@ -271,7 +298,6 @@ async def _fetch_current_price(address: str) -> Optional[float]:
             pairs = data.get("pairs") or []
             if not pairs:
                 return None
-            # Pick pair with most liquidity
             best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
             return float(best.get("priceUsd", 0) or 0)
     except Exception as e:
@@ -296,13 +322,14 @@ async def check_and_update_trades(send_func=None) -> dict:
 
     for trade in open_trades:
         address = trade.get("address", "")
-        if not address:
+        symbol = trade.get("symbol", "")
+        if not address and not symbol:
             continue
 
         # Rate limit: 0.3s between API calls
         await asyncio.sleep(0.3)
 
-        price = await _fetch_current_price(address)
+        price = await _fetch_current_price(address, symbol)
         if price is None or price <= 0:
             continue
 
@@ -594,17 +621,23 @@ async def on_signal_detected(tokens: list, send_func=None) -> list:
         if trade:
             opened.append(trade)
             if send_func:
-                msg = (
-                    f"\U0001f4dd Paper Trade \u5f00\u4ed3\n\n"
-                    f"Token: {trade['symbol']} ({trade['name']})\n"
-                    f"Chain: {trade['chain']}\n"
-                    f"\u5165\u573a\u4ef7: ${trade['entry_price']:.8f}\n"
-                    f"\u4ed3\u4f4d: {trade['position_sol']} SOL (~{trade['position_tokens']:.0f} tokens)\n"
-                    f"MCap: ${trade['entry_mcap']:,.0f}\n"
-                    f"Liq: ${trade['entry_liq']:,.0f}\n"
-                    f"\u6b62\u76c8: +{cfg.get('take_profit_pct', 50)}% | \u6b62\u635f: {cfg.get('stop_loss_pct', -20)}%\n"
-                    f"\n{trade.get('pair_url', '')}"
-                )
+                direction = trade.get("direction", "long")
+                arrow = "\u2b07\ufe0f SHORT" if direction == "short" else "\u2b06\ufe0f LONG"
+                lines = [
+                    f"\U0001f4dd Paper Trade \u5f00\u4ed3 {arrow}",
+                    f"",
+                    f"Token: {trade.get('symbol', '?')}",
+                    f"\u5165\u573a\u4ef7: ${trade.get('entry_price', 0):.6g}",
+                    f"\u4ed3\u4f4d: {trade.get('position_sol', 0)} SOL",
+                ]
+                if trade.get("entry_mcap"):
+                    lines.append(f"MCap: ${trade['entry_mcap']:,.0f}")
+                if trade.get("entry_liq"):
+                    lines.append(f"Liq: ${trade['entry_liq']:,.0f}")
+                lines.append(f"\u6b62\u76c8: +{cfg.get('take_profit_pct', 50)}% | \u6b62\u635f: {cfg.get('stop_loss_pct', -20)}%")
+                if trade.get("pair_url"):
+                    lines.append(f"\n{trade['pair_url']}")
+                msg = "\n".join(lines)
                 try:
                     await send_func(msg)
                 except Exception:

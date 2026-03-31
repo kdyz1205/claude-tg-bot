@@ -27,6 +27,7 @@ Thumbs.db
 *.tmp
 *.log
 *.log.*
+tmp*.txt
 screenshots/
 bridge_data/
 telegram_files/
@@ -34,3 +35,55 @@ test_screenshot.jpg
 *.jpg
 *.png
 *.ogg
+*.bak
+*.ps1
+
+# Runtime state files (bot generates these)
+_paper_trades.json
+_pro_strategy_perf.json
+_dex_positions.json
+_dex_settings.json
+_onchain_alerted.json
+_vital_signs.json
+_watcher_state.json
+_watcher.lock
+_performance_stats.json
+_error_log.txt
+_evolution_queue.json
+_evolve_state.json
+_ga_population.json
+_infinite_evolver_state.json
+_smart_evolver_state.json
+_alpha_tracking.json
+_skill_lifecycle.json
+_signal_engine_config.json
+.bot.lock
+.bot_memory.json
+.bot_memory.md
+.bot_scores.jsonl
+.bot_workflows.json
+.code_quality_report.json
+.risk_params.json
+.smart_wallet_cache.json
+.smart_wallets.json
+.p3_last_daily_push
+improvement_proposal.json
+_restart.ps1
+
+# Runtime data (bot generates these at runtime)
+.experiments.jsonl
+.meta_learning.json
+.reflections.jsonl
+.solutions_index.jsonl
+.user_language.json
+.system_prompt.txt
+action_memory.json
+evolution_log.jsonl
+
+# Knowledge and session data
+.knowledge/
+session_knowledge.json
+.whale_addresses.json
+
+# Generated docs
+docs/
