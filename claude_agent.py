@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 import os
-import re as _re
+import re
 import time
 import traceback
 from datetime import datetime
@@ -46,6 +46,14 @@ logger = logging.getLogger(__name__)
 _TG_SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tg_screenshots")
 
 
+def _safe_mtime(path: str) -> float:
+    """Return file mtime, or 0 on error (file deleted between listing and stat)."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
 async def _forward_new_screenshots(chat_id: int, context, *, user_requested: bool = False):
     """Send new screenshots from _tg_screenshots/ to Telegram, then delete them.
 
@@ -65,11 +73,6 @@ async def _forward_new_screenshots(chat_id: int, context, *, user_requested: boo
         return
 
     # Sort by modification time (oldest first)
-    def _safe_mtime(x):
-        try:
-            return os.path.getmtime(x)
-        except OSError:
-            return 0
     files.sort(key=_safe_mtime)
 
     # Only send the latest screenshot unless user explicitly asked
@@ -113,7 +116,7 @@ _MEDIA_EXTENSIONS = {
 
 # Regex to find Windows-style file paths (C:\...\file.ext or C:/..../file.ext)
 # and Unix-style paths (/tmp/...) in text
-_FILE_PATH_RE = _re.compile(
+_FILE_PATH_RE = re.compile(
     r'(?:'
     r'[A-Za-z]:[/\\](?:[^\s<>"\'|*?\n]+)'  # Windows path: C:\foo\bar.png or C:/foo/bar.png
     r'|'
@@ -625,8 +628,6 @@ def _get_lock(chat_id: int) -> asyncio.Lock:
 
 # Short/simple messages → Sonnet (fast, 5-10s)
 # Complex coding/debugging → Opus (slow but smart, 30-90s)
-import re
-
 _OPUS_PATTERNS = [
     r"修复|fix|debug|bug",
     r"写代码|write code|implement|重构|refactor",
@@ -801,12 +802,6 @@ def _fire_and_forget(coro, name: str = "background"):
     completed = [t for t in _background_tasks if t.done()]
     for t in completed:
         _background_tasks.discard(t)
-    if len(_background_tasks) >= _MAX_BACKGROUND_TASKS:
-        logger.warning(f"Background tasks at limit ({_MAX_BACKGROUND_TASKS}), dropping completed")
-        # Discard all completed tasks first; sets are unordered so pop() is arbitrary
-        done = [t for t in _background_tasks if t.done()]
-        for t in done:
-            _background_tasks.discard(t)
     if len(_background_tasks) >= _MAX_BACKGROUND_TASKS:
         logger.warning("Background task limit reached, dropping task")
         return
@@ -1290,22 +1285,21 @@ async def _run_claude_cli(
 # ─── Response Sender ──────────────────────────────────────────────────────────
 
 # Patterns that should NEVER appear in outgoing messages (security)
-import re as _re_mod
 _DANGEROUS_OUTPUT_PATTERNS = [
-    _re_mod.compile(r'sk-ant-[a-zA-Z0-9\-_]{20,}', _re_mod.IGNORECASE),  # Anthropic API keys
-    _re_mod.compile(r'sk-[a-zA-Z0-9]{20,}'),  # OpenAI API keys
-    _re_mod.compile(r'AIza[a-zA-Z0-9\-_]{30,}'),  # Google API keys
-    _re_mod.compile(r'\b\d{9,10}:AA[A-Za-z0-9\-_]{30,}'),  # Telegram bot tokens
+    re.compile(r'sk-ant-[a-zA-Z0-9\-_]{20,}', re.IGNORECASE),  # Anthropic API keys
+    re.compile(r'sk-[a-zA-Z0-9]{20,}'),  # OpenAI API keys
+    re.compile(r'AIza[a-zA-Z0-9\-_]{30,}'),  # Google API keys
+    re.compile(r'\b\d{9,10}:AA[A-Za-z0-9\-_]{30,}'),  # Telegram bot tokens
 ]
-_SECRET_REQUEST_PATTERNS = _re_mod.compile(
+_SECRET_REQUEST_PATTERNS = re.compile(
     r'(api.?key|密钥|token|secret|password|credential|ANTHROPIC_API_KEY|OPENAI_API_KEY|环境变量丢失).{0,500}'
     r'(发给|send|provide|share|paste|输入|告诉|give|设置|重启|重新)',
-    _re_mod.IGNORECASE | _re_mod.DOTALL,
+    re.IGNORECASE | re.DOTALL,
 )
 # Secondary pattern: any message mentioning API key setup instructions
-_API_KEY_INSTRUCTION_PATTERN = _re_mod.compile(
+_API_KEY_INSTRUCTION_PATTERN = re.compile(
     r'(sk-ant-|ANTHROPIC_API_KEY|OPENAI_API_KEY|环境变量丢失|API Key 发给|把.*api.?key)',
-    _re_mod.IGNORECASE,
+    re.IGNORECASE,
 )
 
 
@@ -1419,7 +1413,7 @@ def _queue_message(chat_id: int, text: str) -> int:
     queue = _pending_messages.setdefault(chat_id, [])
     # Prune stale messages before adding
     now = time.time()
-    queue[:] = [m for m in queue if now - m["time"] < _MAX_PENDING_AGE]
+    queue[:] = [m for m in queue if now - m.get("time", 0) < _MAX_PENDING_AGE]
     if len(queue) >= _MAX_PENDING_QUEUE_SIZE:
         queue.pop(0)
         logger.warning(f"Chat {chat_id}: queue full ({_MAX_PENDING_QUEUE_SIZE}), dropped oldest")
@@ -1649,10 +1643,14 @@ def _log_self_heal(error: str, diagnosis: dict, success: bool):
         # Truncate if file is too large
         try:
             if os.path.exists(heal_log) and os.path.getsize(heal_log) > _MAX_SELF_HEAL_LOG_SIZE:
-                with open(heal_log, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                with open(heal_log, "w", encoding="utf-8") as f:
-                    f.writelines(lines[len(lines) // 2:])
+                with open(heal_log, "r", encoding="utf-8") as rf:
+                    lines = rf.readlines()
+                tmp_path = heal_log + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as wf:
+                    wf.writelines(lines[len(lines) // 2:])
+                    wf.flush()
+                    os.fsync(wf.fileno())
+                os.replace(tmp_path, heal_log)
         except Exception:
             pass
         with open(heal_log, "a", encoding="utf-8") as f:
@@ -1898,7 +1896,7 @@ def _cleanup_chat_contexts() -> None:
         return
     now = time.time()
     stale = [cid for cid, ctx in _chat_contexts.items()
-             if now - ctx.get("last_updated", 0) > 3600]
+             if now - ctx.get("last_updated", 0) > _CONTEXT_TTL]
     for cid in stale:
         del _chat_contexts[cid]
 
@@ -2037,7 +2035,7 @@ def _resolve_fuzzy_message(message: str, chat_id: int) -> tuple[str, bool]:
     if _FUZZY_PRONOUN_RE.search(message):
         ref = last.get("address") or last.get("symbol") or ""
         if ref:
-            resolved = _FUZZY_PRONOUN_RE.sub(ref, message, count=1)
+            resolved = _FUZZY_PRONOUN_RE.sub(lambda m: ref, message, count=1)
             if resolved != message:
                 logger.info(f"Chat {chat_id}: pronoun resolved '{message}' → '{resolved}'")
                 return resolved, True
@@ -2090,12 +2088,12 @@ _PROACTIVE_COOLDOWN_SECS = 300  # 5 min between suggestions per chat
 
 
 def _cleanup_proactive_cooldown() -> None:
-    """Remove stale entries when dict exceeds 50 entries."""
-    if len(_proactive_cooldown) <= 50:
+    """Remove stale entries when dict exceeds 20 entries."""
+    if len(_proactive_cooldown) <= 20:
         return
     now = time.time()
     stale = [cid for cid, ts in _proactive_cooldown.items()
-             if now - ts > 3600]
+             if now - ts > _PROACTIVE_COOLDOWN_SECS * 2]
     for cid in stale:
         del _proactive_cooldown[cid]
 
@@ -2214,7 +2212,6 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs) ->
             # ── Multi-intent: process each intent sequentially ──
             if is_multi_intent:
                 all_success = True
-                last_response_for_suggestion = ""
                 for idx, intent in enumerate(intents):
                     if idx > 0:
                         await _send_response(chat_id, f"▶ 任务 {idx+1}/{len(intents)}：{intent[:60]}...", context)
@@ -2373,7 +2370,7 @@ async def _auto_compile_check(response: str, tool_output_text: str, chat_id: int
         )
         try:
             fix_resp, fix_sid, _, _ = await asyncio.wait_for(
-                _run_claude_cli(fix_prompt, f"__compile_fix_{chat_id}", context, timeout=120),
+                _run_claude_cli(fix_prompt, -(abs(chat_id) + 1000000), context, timeout=120),
                 timeout=130,
             )
             # Verify fix worked
@@ -2630,7 +2627,7 @@ async def _forward_new_screenshots_direct(send_photo):
     files = sorted(
         [os.path.join(_TG_SCREENSHOT_DIR, f) for f in os.listdir(_TG_SCREENSHOT_DIR)
          if f.lower().endswith((".jpg", ".jpeg", ".png"))],
-        key=lambda x: os.path.getmtime(x),
+        key=lambda x: _safe_mtime(x),
     )
     for fp in files:
         try:

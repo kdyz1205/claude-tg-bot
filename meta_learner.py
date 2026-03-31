@@ -84,13 +84,17 @@ def _append_changelog(entry: dict) -> None:
     try:
         with open(EVOLUTION_CHANGELOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-        # Truncate if too many lines
+        # Truncate if too many lines (atomic: tmp+fsync+replace)
         try:
             with open(EVOLUTION_CHANGELOG, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             if len(lines) > _MAX_CHANGELOG_LINES:
-                with open(EVOLUTION_CHANGELOG, "w", encoding="utf-8") as f:
+                tmp_trunc = EVOLUTION_CHANGELOG + ".trunc.tmp"
+                with open(tmp_trunc, "w", encoding="utf-8") as f:
                     f.writelines(lines[-_MAX_CHANGELOG_LINES:])
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_trunc, EVOLUTION_CHANGELOG)
         except Exception:
             pass
     except Exception as e:
@@ -613,8 +617,8 @@ def generate_weekly_report(analysis: dict, ab_eval: dict) -> str:
         lines += [
             "",
             f"🔬 *A/B测试结果*",
-            f"  胜者: 变体{ab_eval['winner']} (score {ab_eval['results'].get(ab_eval['winner'], {}).get('score', 0):.3f})",
-            f"  淘汰: 变体{ab_eval['loser']} → 生成新挑战者",
+            f"  胜者: 变体{ab_eval.get('winner', '?')} (score {ab_eval.get('results', {}).get(ab_eval.get('winner', ''), {}).get('score', 0):.3f})",
+            f"  淘汰: 变体{ab_eval.get('loser', '?')} → 生成新挑战者",
         ]
     else:
         lines += [

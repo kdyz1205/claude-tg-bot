@@ -322,6 +322,8 @@ async def _apply_syntax_fix(
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(fixed_source)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, file_path)
         logger.info("self_repair: applied syntax fix to %s", error_info["file"])
         _append_repair_log({

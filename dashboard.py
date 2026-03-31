@@ -40,8 +40,6 @@ def record_message(text: str, success: bool, duration_ms: float, response: str =
         else:
             _stats["failed"] += 1
         _stats["total_ms"] += duration_ms
-
-    with _stats_lock:
         _recent_messages.append({
             "ts": datetime.now().strftime("%H:%M:%S"),
             "text": text[:80],
@@ -101,6 +99,10 @@ if _flask_available:
         except Exception:
             return {"tasks": [], "completed_count": 0, "total": 7, "current_index": 0}
 
+    def _get_recent_messages_safe() -> list:
+        with _stats_lock:
+            return list(_recent_messages)
+
     @app.route("/api/stats")
     def api_stats():
         with _stats_lock:
@@ -123,7 +125,7 @@ if _flask_available:
                 "avg_ms": avg_ms,
             },
             "system": sys_stats,
-            "recent_messages": (lambda: (_stats_lock.acquire(), list(_recent_messages), _stats_lock.release())[1])(),
+            "recent_messages": _get_recent_messages_safe(),
             "evolution": evolution,
         })
 
@@ -323,7 +325,7 @@ setInterval(refresh, 5000);
         return render_template_string(_HTML)
 
 
-def start_dashboard(host: str = "0.0.0.0", port: int = 8080) -> bool:
+def start_dashboard(host: str = "127.0.0.1", port: int = 8080) -> bool:
     """Start Flask dashboard in a background thread. Returns True if started."""
     global _server_started, _server_thread
 

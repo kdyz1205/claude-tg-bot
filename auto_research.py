@@ -846,8 +846,13 @@ async def _experiment_knowledge_build(experiment: dict) -> dict:
         if not raw or len(raw) < 50:
             return {"success": False, "summary": "Knowledge generation too short"}
 
-        # Save knowledge
-        Path(kb_file).write_text(raw, encoding="utf-8")
+        # Save knowledge (atomic: tmp+fsync+replace)
+        kb_tmp = kb_file + ".tmp"
+        with open(kb_tmp, "w", encoding="utf-8") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(kb_tmp, kb_file)
         logger.info(f"Knowledge built: {domain} ({len(raw)} chars)")
 
         return {"success": True, "summary": f"Built {domain} knowledge ({len(raw)} chars)"}

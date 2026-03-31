@@ -395,12 +395,17 @@ def _acquire_singleton_lock():
     try:
         # Open lock file — keep handle open for entire process lifetime
         fh = open(LOCK_FILE, "w", encoding="utf-8")  # noqa: SIM115 — intentionally not using `with`; handle must outlive this function
+        # Write a byte first so Windows msvcrt.locking has data to lock
+        fh.write(" ")
+        fh.flush()
+        fh.seek(0)
         if sys.platform == "win32":
             import msvcrt
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.seek(0)
         fh.write(str(os.getpid()))
         fh.flush()
         return fh

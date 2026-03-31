@@ -19,6 +19,16 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# ── Shared HTTP client (avoids creating 4+ TCP connections per symbol) ───────
+_signal_client: httpx.AsyncClient | None = None
+
+
+async def _get_client() -> httpx.AsyncClient:
+    global _signal_client
+    if _signal_client is None or _signal_client.is_closed:
+        _signal_client = httpx.AsyncClient(timeout=15, follow_redirects=True)
+    return _signal_client
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE           = os.path.join(BASE_DIR, "_signal_engine_config.json")
 PERF_FILE             = os.path.join(BASE_DIR, ".signal_performance.json")
@@ -129,11 +139,11 @@ async def _fetch_okx_candles(symbol: str, bar: str, limit: int = 60) -> list:
         f"?instId={symbol}&bar={bar}&limit={limit}"
     )
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            data = resp.json()
-            if data.get("code") == "0":
-                return list(reversed(data.get("data", [])))
+        client = await _get_client()
+        resp = await client.get(url)
+        data = resp.json()
+        if data.get("code") == "0":
+            return list(reversed(data.get("data", [])))
     except Exception as e:
         logger.debug("okx_candles %s: %s", symbol, e)
     return []
@@ -142,15 +152,15 @@ async def _fetch_okx_candles(symbol: str, bar: str, limit: int = 60) -> list:
 async def _fetch_okx_orderbook(symbol: str, sz: int = 20) -> dict:
     url = f"https://www.okx.com/api/v5/market/books?instId={symbol}&sz={sz}"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url)
-            data = resp.json()
-            if data.get("code") == "0" and data.get("data"):
-                book = data["data"][0]
-                return {
-                    "bids": [[float(b[0]), float(b[1])] for b in book.get("bids", [])],
-                    "asks": [[float(a[0]), float(a[1])] for a in book.get("asks", [])],
-                }
+        client = await _get_client()
+        resp = await client.get(url)
+        data = resp.json()
+        if data.get("code") == "0" and data.get("data"):
+            book = data["data"][0]
+            return {
+                "bids": [[float(b[0]), float(b[1])] for b in book.get("bids", [])],
+                "asks": [[float(a[0]), float(a[1])] for a in book.get("asks", [])],
+            }
     except Exception as e:
         logger.debug("okx_orderbook %s: %s", symbol, e)
     return {}
@@ -164,10 +174,10 @@ async def _fetch_binance_candles(symbol: str, interval: str, limit: int = 60) ->
         f"?symbol={symbol}&interval={interval}&limit={limit}"
     )
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                return resp.json()
+        client = await _get_client()
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            return resp.json()
     except Exception as e:
         logger.debug("binance_candles %s: %s", symbol, e)
     return []
@@ -176,14 +186,14 @@ async def _fetch_binance_candles(symbol: str, interval: str, limit: int = 60) ->
 async def _fetch_binance_orderbook(symbol: str, limit: int = 20) -> dict:
     url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                return {
-                    "bids": [[float(b[0]), float(b[1])] for b in data.get("bids", [])],
-                    "asks": [[float(a[0]), float(a[1])] for a in data.get("asks", [])],
-                }
+        client = await _get_client()
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                "bids": [[float(b[0]), float(b[1])] for b in data.get("bids", [])],
+                "asks": [[float(a[0]), float(a[1])] for a in data.get("asks", [])],
+            }
     except Exception as e:
         logger.debug("binance_orderbook %s: %s", symbol, e)
     return {}
@@ -198,12 +208,12 @@ async def _fetch_bybit_candles(symbol: str, interval: str, limit: int = 60) -> l
         f"?category=spot&symbol={symbol}&interval={interval}&limit={limit}"
     )
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            data = resp.json()
-            if data.get("retCode") == 0:
-                rows = data.get("result", {}).get("list", [])
-                return list(reversed(rows))
+        client = await _get_client()
+        resp = await client.get(url)
+        data = resp.json()
+        if data.get("retCode") == 0:
+            rows = data.get("result", {}).get("list", [])
+            return list(reversed(rows))
     except Exception as e:
         logger.debug("bybit_candles %s: %s", symbol, e)
     return []
@@ -215,15 +225,15 @@ async def _fetch_bybit_orderbook(symbol: str, limit: int = 20) -> dict:
         f"?category=spot&symbol={symbol}&limit={limit}"
     )
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url)
-            data = resp.json()
-            if data.get("retCode") == 0:
-                result = data.get("result", {})
-                return {
-                    "bids": [[float(b[0]), float(b[1])] for b in result.get("b", [])],
-                    "asks": [[float(a[0]), float(a[1])] for a in result.get("a", [])],
-                }
+        client = await _get_client()
+        resp = await client.get(url)
+        data = resp.json()
+        if data.get("retCode") == 0:
+            result = data.get("result", {})
+            return {
+                "bids": [[float(b[0]), float(b[1])] for b in result.get("b", [])],
+                "asks": [[float(a[0]), float(a[1])] for a in result.get("a", [])],
+            }
     except Exception as e:
         logger.debug("bybit_orderbook %s: %s", symbol, e)
     return {}
@@ -622,16 +632,16 @@ async def _check_pending_outcomes() -> None:
         return
 
     current_prices: dict = {}
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for sym in needs_price:
-            try:
-                url = f"https://www.okx.com/api/v5/market/ticker?instId={sym}"
-                resp = await client.get(url)
-                data = resp.json()
-                if data.get("code") == "0" and data.get("data"):
-                    current_prices[sym] = float(data["data"][0].get("last", 0))
-            except Exception:
-                pass
+    client = await _get_client()
+    for sym in needs_price:
+        try:
+            url = f"https://www.okx.com/api/v5/market/ticker?instId={sym}"
+            resp = await client.get(url)
+            data = resp.json()
+            if data.get("code") == "0" and data.get("data"):
+                current_prices[sym] = float(data["data"][0].get("last", 0))
+        except Exception:
+            pass
 
     changed = False
     for entry in perf.get("signals", []):

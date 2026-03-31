@@ -693,7 +693,13 @@ def prune_skills():
         avg_score = skill.get("avg_score_when_used") or 0
         updated = skill.get("updated_at", "2000-01-01")
         try:
-            age_days = (datetime.now() - datetime.fromisoformat(updated)).days
+            dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            age_days = (datetime.now() - dt.replace(tzinfo=None)).days
+        except (ValueError, AttributeError):
+            try:
+                age_days = (datetime.now() - datetime.fromisoformat(updated)).days
+            except Exception:
+                age_days = 999
         except Exception:
             age_days = 999
         entry["_value"] = use_count * 2 + avg_score * 5 - age_days * 0.1

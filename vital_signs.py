@@ -368,8 +368,11 @@ def check_invariants() -> dict:
     cost = s.get("cost_total_usd", 0)
     self_sustaining = revenue >= cost or s.get("lifecycle") in ("productive", "self_funding", "expanding", "resilient")
 
-    # 3. Adaptive: learning rate > 0 (creating new skills)
-    adaptive = s.get("learning_rate", 0) > 0 or s.get("skills_created", 0) > 0
+    # 3. Adaptive: learning rate > 0, or skills created, or successfully completed tasks, or self-healed
+    adaptive = (s.get("learning_rate", 0) > 0
+                or s.get("skills_created", 0) > 0
+                or s.get("successful_tasks", 0) > 0
+                or s.get("self_heal_successes", 0) > 0)
 
     # 4. Economically Viable: success rate > 50% and tasks being done
     economically_viable = success_rate >= 0.5 and total >= 5

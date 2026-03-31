@@ -423,6 +423,13 @@ def generate_chart() -> Optional[str]:
 async def _fetch_price(symbol: str) -> Optional[float]:
     try:
         import httpx
+        # Normalize symbol for OKX: "BTCUSDT" → "BTC-USDT"
+        if symbol and "-" not in symbol:
+            # Try common quote currencies
+            for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
+                if symbol.upper().endswith(quote):
+                    symbol = symbol[:-len(quote)] + "-" + quote
+                    break
         url = f"https://www.okx.com/api/v5/market/ticker?instId={symbol}"
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url)

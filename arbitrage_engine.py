@@ -87,6 +87,7 @@ class ArbEngine:
         self._alert_cooldown: dict[str, float] = {}       # cooldown_key → last_ts
         self._history: list[dict] = []                    # all recorded opportunities
         self._scan_stats = {"scanned": 0, "qualified": 0, "alerted": 0}
+        self._wallets_lock = __import__('threading').Lock()
         self._load_history()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -197,6 +198,7 @@ class ArbEngine:
                 cooldown_key = f"{pair}:{buy_ex}:{sell_ex}"
                 if now - self._alert_cooldown.get(cooldown_key, 0) >= ALERT_COOLDOWN:
                     self._alert_cooldown[cooldown_key] = now
+                    self._prune_alert_cooldown()
                     self._record_opportunity(new_signals[-1])
 
         if new_signals:
@@ -318,6 +320,7 @@ class ArbEngine:
                             "source": "rest_scan",
                         }
                         self._alert_cooldown[cooldown_key] = now
+                        self._prune_alert_cooldown()
                         to_record.append(sig)
                         self._scan_stats["alerted"] += 1
 
@@ -474,38 +477,47 @@ class ArbEngine:
         self._write_arb_to_wallets(record)
         self._record_to_profit_tracker(record)
 
+    def _prune_alert_cooldown(self) -> None:
+        """Prune _alert_cooldown when it grows too large."""
+        if len(self._alert_cooldown) > 200:
+            cutoff = time.time() - 3600  # 1 hour
+            self._alert_cooldown = {
+                k: v for k, v in self._alert_cooldown.items() if v >= cutoff
+            }
+
     def _write_arb_to_wallets(self, sig: dict) -> None:
         """Append arb signal to .smart_wallets.json under 'arb_signals' key."""
-        try:
-            if os.path.exists(SMART_WALLETS_FILE):
-                with open(SMART_WALLETS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            else:
-                data = {}
-            arb_list = data.get("arb_signals", [])
-            entry = {
-                "pair": sig.get("pair", "?"),
-                "buy_exchange": sig.get("buy_exchange", "?"),
-                "sell_exchange": sig.get("sell_exchange", "?"),
-                "spread_pct": sig.get("spread_pct", 0),
-                "net_profit_pct": sig.get("net_profit_pct", 0),
-                "net_profit_usdt": sig.get("net_profit_usdt", 0),
-                "buy_price": sig.get("buy_price", 0),
-                "sell_price": sig.get("sell_price", 0),
-                "timestamp": sig.get("timestamp", time.time()),
-                "date": sig.get("date", ""),
-                "source": sig.get("source", "websocket"),
-            }
-            arb_list.append(entry)
-            data["arb_signals"] = arb_list[-MAX_WALLETS_ARB_SIGNALS:]
-            tmp = str(SMART_WALLETS_FILE) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, str(SMART_WALLETS_FILE))
-        except Exception as e:
-            logger.warning("ArbEngine _write_arb_to_wallets error: %s", e)
+        with self._wallets_lock:
+            try:
+                if os.path.exists(SMART_WALLETS_FILE):
+                    with open(SMART_WALLETS_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                else:
+                    data = {}
+                arb_list = data.get("arb_signals", [])
+                entry = {
+                    "pair": sig.get("pair", "?"),
+                    "buy_exchange": sig.get("buy_exchange", "?"),
+                    "sell_exchange": sig.get("sell_exchange", "?"),
+                    "spread_pct": sig.get("spread_pct", 0),
+                    "net_profit_pct": sig.get("net_profit_pct", 0),
+                    "net_profit_usdt": sig.get("net_profit_usdt", 0),
+                    "buy_price": sig.get("buy_price", 0),
+                    "sell_price": sig.get("sell_price", 0),
+                    "timestamp": sig.get("timestamp", time.time()),
+                    "date": sig.get("date", ""),
+                    "source": sig.get("source", "websocket"),
+                }
+                arb_list.append(entry)
+                data["arb_signals"] = arb_list[-MAX_WALLETS_ARB_SIGNALS:]
+                tmp = str(SMART_WALLETS_FILE) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, str(SMART_WALLETS_FILE))
+            except Exception as e:
+                logger.warning("ArbEngine _write_arb_to_wallets error: %s", e)
 
     @staticmethod
     def _append_signal_jsonl(sig: dict) -> None:

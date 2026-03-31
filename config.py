@@ -88,6 +88,10 @@ DANGEROUS_PATTERNS = [
     r"\bSet-ExecutionPolicy\b\s+Unrestricted",  # Unrestricted execution
     r"\bRemove-Item\b.*-Recurse.*[\\\/]Windows",  # Recursive delete Windows
     r"\bRemove-Item\b.*-Recurse.*[\\\/]Program Files",  # Recursive delete Program Files
+    # Linux-specific dangerous patterns
+    r"\bdd\b\s+if=",                  # dd raw disk write
+    r"\bmkfs\b",                      # Filesystem formatting
+    r"\bchmod\s+777\b",              # World-writable permissions
 ]
 
 # ─── AI Capabilities ───────────────────────────────────────────────────────────

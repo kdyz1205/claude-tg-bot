@@ -2099,6 +2099,8 @@ class PerformanceOptimizer:
                 logger.info("P3: Bayesian opt skipped: %s", result.get("status"))
 
         # 3. Daily push at 09:00 (UTC+8 approximate: check once per day)
+        # NOTE: Hardcoded UTC+8 assumption. To change timezone, adjust the
+        # offset below: offset_hours = desired_hour - 8 (e.g., UTC+3 → -5*3600)
         today_9am = (now // 86400) * 86400 + 1 * 3600  # 01:00 UTC = 09:00 UTC+8
         if (now >= today_9am
                 and self._last_daily_push < today_9am

@@ -1134,6 +1134,8 @@ async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TY
     cmd = data[5:]  # strip "pcmd_"
     # Answer callback FIRST to prevent Telegram timeout spinner
     await query.answer(f"/{cmd}...")
+    if not query.message:
+        return
     chat_id = query.message.chat_id
 
     # Dispatch table for simple text responses (no async work needed)
@@ -1502,7 +1504,7 @@ async def _send_signals(context, chat_id):
             lines.append("Send a request like \"analyze BTC signals\" to generate.")
     except Exception as e:
         lines.append(f"Error: {e}")
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
 
 
 async def _send_vol_filter(context, chat_id):
@@ -1558,7 +1560,7 @@ async def _send_portfolio(context, chat_id):
             lines.append("Ask me to check your exchange positions.")
     except Exception as e:
         lines.append(f"Error: {e}")
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
 
 
 async def _send_risk(context, chat_id):
@@ -1581,7 +1583,7 @@ async def _send_risk(context, chat_id):
             lines.append("Ask me to calculate risk metrics for your portfolio.")
     except Exception as e:
         lines.append(f"Error: {e}")
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
 
 
 async def _send_regime(context, chat_id):
@@ -1702,8 +1704,11 @@ async def _send_okx_top30(context, chat_id):
         lines = ["OKX Top 30 (24h Vol)\n"]
         for i, t in enumerate(top30, 1):
             sym = t.get("instId", "?").replace("-USDT-SWAP", "")
-            price = float(t.get("last", 0))
-            open24 = float(t.get("open24h", 0) or 0)
+            try:
+                price = float(t.get("last", 0) or 0)
+                open24 = float(t.get("open24h", 0) or 0)
+            except (ValueError, TypeError):
+                continue
             chg = ((price - open24) / open24 * 100) if abs(open24) > 0.0001 else 0
             vol = float(t.get("volCcy24h", 0) or 0)
             vol_str = f"{vol/1e6:.0f}M" if vol >= 1e6 else f"{vol:,.0f}"
@@ -1945,7 +1950,7 @@ async def arb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_line = "已连接: " + " / ".join(status_parts) if status_parts else "连接中..."
 
         full = f"{today_text}\n\n─────────────────\n{live_text}\n\n📶 {status_line}"
-        await update.message.reply_text(full[:4000], parse_mode="Markdown")
+        await _safe_reply(update.message, full[:4096], parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Arb command error: {e}", exc_info=True)
         try:
@@ -2244,7 +2249,7 @@ async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Default: Phase 1 win-rate optimization
         await update.message.reply_text("⚙️ 正在分析信号数据并优化参数...")
         result = await _strategy_optimizer.strategy_optimizer.optimize_now(trigger="manual")
-        await _safe_reply(update.message, result["message"], parse_mode="Markdown")
+        await _safe_reply(update.message, result.get("message", "No result"), parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"Optimize command error: {e}", exc_info=True)
@@ -2462,9 +2467,9 @@ async def selfrepair_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append(f"\n🔧 *已自动修复* ({len(fixed)} 个): {', '.join(f'`{f}`' for f in fixed)}")
         if installed:
             lines.append(f"\n📦 *已安装依赖*: {', '.join(f'`{p}`' for p in installed)}")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _safe_reply(update.message, "\n".join(lines), parse_mode="Markdown")
         report = format_repair_status(n_recent=5)
-        await update.message.reply_text(report, parse_mode="Markdown")
+        await _safe_reply(update.message, report, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"selfrepair_command error: {e}", exc_info=True)
         try:
@@ -2573,7 +2578,7 @@ async def okx_backtest_command(update: Update, context: ContextTypes.DEFAULT_TYP
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: subprocess.run(
-                    [sys.executable, script],
+                    [sys.executable, script, "--tf", tf],
                     capture_output=True, text=True, timeout=600,
                     cwd=CRYPTO_ANALYSIS_DIR,
                 )
@@ -2801,7 +2806,7 @@ async def okx_top30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             emoji = "+" if chg >= 0 else ""
             lines.append(f"{i:>2} {sym:<14} {price:>12.4f} {emoji}{chg:>6.2f}% {vol_str:>14}")
 
-        text = "\n".join(lines)
+        text = "\n".join(lines)[:4080]
         try:
             await msg.edit_text(f"```\n{text}\n```", parse_mode="Markdown")
         except Exception:
@@ -3001,11 +3006,16 @@ async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                 market_monitor._send = _send
                 await market_monitor.start()
+            try:
+                _status = str(market_monitor.status())
+                _interval = _status.split('interval:')[1].split(',')[0].strip() if 'interval:' in _status else '300s'
+            except Exception:
+                _interval = '300s'
             await update.message.reply_text(
                 "Market Monitor started.\n"
                 "Watching: BTC/ETH/SOL\n"
                 "Alerts: 24h breakout + 1h change >3%\n"
-                f"Interval: every {(lambda s: s.split('interval:')[1].strip() if 'interval:' in s else '300s')(str(market_monitor.status()))}"
+                f"Interval: every {_interval}"
             )
         elif action == "off":
             if market_monitor._running:
@@ -3107,7 +3117,7 @@ async def consciousness_command(update: Update, context: ContextTypes.DEFAULT_TY
                 outcome = e.get("outcome", "?")
                 text += f"  • [{outcome}] {e.get('description', '?')[:60]}\n"
 
-        await update.message.reply_text(text[:4000])
+        await update.message.reply_text(text[:4096])
     except Exception as e:
         logger.error(f"Consciousness command error: {e}", exc_info=True)
         try:
@@ -3159,9 +3169,7 @@ async def strategy_evolve_command(update: Update, context: ContextTypes.DEFAULT_
 
         result = await strategy_optimizer.evolve_now()
         msg    = format_ga_result(result)
-        await context.bot.send_message(
-            chat_id=chat_id, text=msg[:4000], parse_mode="Markdown"
-        )
+        await _safe_send(context.bot, chat_id, msg[:4096], parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Strategy evolve command error: {e}", exc_info=True)
         try:
@@ -3235,7 +3243,7 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         logger.error(f"memory_command error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Memory error: {e}")
+        await update.message.reply_text(f"❌ Memory error: {str(e)[:3000]}")
 
 
 async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3294,7 +3302,7 @@ async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
     except Exception as e:
         logger.error(f"skills_command error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Skills error: {e}")
+        await update.message.reply_text(f"❌ Skills error: {str(e)[:3000]}")
 
 
 async def multi_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3344,7 +3352,7 @@ async def multi_session_command(update: Update, context: ContextTypes.DEFAULT_TY
                 await update.message.reply_text("Usage: /ms broadcast <message>")
                 return
             msg = " ".join(context.args[1:])
-            await update.message.reply_text(f"⏳ Broadcasting to {len(_session_mgr.sessions)} sessions...")
+            await update.message.reply_text(f"⏳ Broadcasting to {len(getattr(_session_mgr, 'sessions', {}))} sessions...")
             results = await _session_mgr.broadcast(msg)
             text = "Broadcast results:\n"
             for name, result in results.items():
@@ -3581,7 +3589,7 @@ async def handle_quick_action_callback(update, context):
             )
 
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ {str(e)[:3000]}")
 
 
 # ─── Session Learning Background ─────────────────────────────────────────────
@@ -3824,9 +3832,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_data = None
         if config.ENABLE_VISION and not config.BRIDGE_MODE and not config.HARNESS_MODE:
             try:
-                with open(save_path, "rb") as f:
-                    import base64
-                    image_data = base64.b64encode(f.read()).decode("utf-8")
+                import base64
+                loop = asyncio.get_running_loop()
+                image_data = await loop.run_in_executor(
+                    None,
+                    lambda: base64.b64encode(open(save_path, "rb").read()).decode("utf-8")
+                )
             except Exception as e:
                 logger.warning(f"Failed to read image as base64: {e}")
 
@@ -3993,8 +4004,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         safe_name = os.path.basename(doc.file_name or "")
         if not safe_name or safe_name in (".", ".."):
             safe_name = f"file_{doc.file_id}"
-        # Remove control characters but keep Unicode (Chinese filenames etc.)
-        safe_name = "".join(c for c in safe_name if c.isprintable())
+        # Remove control characters and Windows reserved chars, but keep Unicode (Chinese filenames etc.)
+        _WINDOWS_RESERVED = set('<>:"/\\|?*')
+        safe_name = "".join(c for c in safe_name if c.isprintable() and c not in _WINDOWS_RESERVED)
+        if not safe_name or safe_name in (".", ".."):
+            safe_name = f"file_{doc.file_id}"
         save_path = os.path.join(save_dir, safe_name)
         await file.download_to_drive(save_path)
 

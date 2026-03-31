@@ -534,8 +534,10 @@ class SessionLearner:
                         )
 
         # Also look for .jsonl in the bot directory itself
+        # Only pick up files that look like session logs (contain UUID-like pattern)
+        _SESSION_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
         for fname in os.listdir(BOT_DIR):
-            if fname.endswith(".jsonl") and not fname.startswith("."):
+            if fname.endswith(".jsonl") and not fname.startswith(".") and _SESSION_RE.search(fname):
                 jsonl_files.append((os.path.join(BOT_DIR, fname), "bot_dir"))
 
         for fpath, project in jsonl_files:
@@ -584,7 +586,10 @@ class SessionLearner:
         for m in messages:
             if m.get("type") == "user":
                 msg = m.get("message", {})
-                content = msg.get("content", "")
+                if isinstance(msg, str):
+                    user_texts.append(msg[:500])
+                    continue
+                content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str):
                     user_texts.append(content[:500])
                 elif isinstance(content, list):

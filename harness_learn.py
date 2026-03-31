@@ -193,6 +193,8 @@ def detect_patterns(scores: list[dict]) -> list[str]:
     if len(scores) < 3:
         return []
 
+    # Cap input to prevent unbounded processing
+    scores = scores[:100]
     insights = []
 
     # Repeated question-asking
@@ -228,7 +230,7 @@ def detect_patterns(scores: list[dict]) -> list[str]:
     avg_overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0
     insights.append(f"OVERALL: Average score {avg_overall:.2f}/1.00 over last {len(scores)} interactions.")
 
-    return insights
+    return insights[:50]  # Cap insights to prevent unbounded growth
 
 
 # ─── Workflow Templates ──────────────────────────────────────────────────────
@@ -467,6 +469,9 @@ def post_interaction_loop(
     """
     # 1. Score
     score = score_interaction(user_message, response, model, duration_ms, session_id)
+    # Ensure required keys always exist (defensive)
+    score.setdefault("overall", 0.5)
+    score.setdefault("flags", [])
 
     # 2. Log
     log_interaction(score)

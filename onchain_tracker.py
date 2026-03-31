@@ -732,6 +732,21 @@ class SmartMoneyTracker:
         self._recent_activity = [a for a in self._recent_activity if a.get("timestamp", 0) >= cutoff]
         if len(self._seen_hashes) > 5000:
             self._seen_hashes = set(list(self._seen_hashes)[-2500:])
+        # Prune unbounded discovery/buy dicts
+        if len(self._new_token_discoveries) > 200:
+            cutoff_disc = time.time() - 3600
+            self._new_token_discoveries = {
+                k: v for k, v in self._new_token_discoveries.items()
+                if v.get("first_seen", 0) >= cutoff_disc
+            }
+        if len(self._token_buys_1h) > 200:
+            cutoff_buys = time.time() - 3600
+            self._token_buys_1h = {
+                k: [b for b in v if b.get("ts", 0) >= cutoff_buys]
+                for k, v in self._token_buys_1h.items()
+            }
+            # Remove empty entries
+            self._token_buys_1h = {k: v for k, v in self._token_buys_1h.items() if v}
 
     def get_recent_activity(self, hours: int = 24) -> list:
         cutoff = time.time() - hours * 3600

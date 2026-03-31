@@ -327,6 +327,7 @@ def health_check(state) -> bool:
     if not _is_process_alive(bot_pid):
         log.warning(f"Bot PID {bot_pid} is dead!")
         _restart_bot()
+        return False
 
     if not _check_claude_cli_available():
         log.warning("Claude CLI not responding!")
@@ -381,9 +382,31 @@ def save_metrics(m: dict):
             pass
 
 
+_metrics_cache: dict | None = None
+_metrics_dirty = False
+_metrics_flush_interval = 30  # seconds
+_metrics_last_flush = 0.0
+
+
+def _flush_metrics_if_needed(force: bool = False) -> None:
+    """Flush in-memory metrics cache to disk if dirty and interval elapsed."""
+    global _metrics_cache, _metrics_dirty, _metrics_last_flush
+    if _metrics_cache is None or not _metrics_dirty:
+        return
+    now = time.time()
+    if not force and (now - _metrics_last_flush) < _metrics_flush_interval:
+        return
+    save_metrics(_metrics_cache)
+    _metrics_dirty = False
+    _metrics_last_flush = now
+
+
 def record_skill_usage(skill_id: str, success: bool, exec_time_ms: int):
-    """Record one skill usage event to metrics."""
-    m = load_metrics()
+    """Record one skill usage event to metrics (cached, periodic flush)."""
+    global _metrics_cache, _metrics_dirty
+    if _metrics_cache is None:
+        _metrics_cache = load_metrics()
+    m = _metrics_cache
     if skill_id not in m["skills"]:
         m["skills"][skill_id] = {
             "use_count": 0,
@@ -401,7 +424,8 @@ def record_skill_usage(skill_id: str, success: bool, exec_time_ms: int):
         s["success_count"] += 1
     else:
         s["fail_count"] += 1
-    save_metrics(m)
+    _metrics_dirty = True
+    _flush_metrics_if_needed()
 
 
 def get_skill_success_rate(skill_id: str) -> float:

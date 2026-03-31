@@ -185,8 +185,10 @@ _save_counter = 0
 
 def _maybe_autosave() -> None:
     global _save_counter
-    _save_counter += 1
-    if _save_counter % 20 == 0:
+    with _lock:
+        _save_counter += 1
+        should_save = (_save_counter % 20 == 0)
+    if should_save:
         # save() acquires _lock internally, safe from any thread
         save()
 
