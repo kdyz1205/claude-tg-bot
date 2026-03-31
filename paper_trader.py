@@ -341,8 +341,19 @@ async def check_and_update_trades(send_func=None) -> dict:
             close_reason = "time_stop"
 
         if close_reason:
-            close_paper_trade(trade["id"], price, close_reason)
+            # Close in-memory (NOT via close_paper_trade which reloads from disk
+            # and would be overwritten by our _save_trades below — classic lost update)
+            if entry <= 0:
+                entry = 1e-12
+            pnl_sol = trade.get("position_sol", 0) * (pnl_pct / 100)
+            trade["status"] = "closed"
+            trade["close_reason"] = close_reason
+            trade["close_price"] = price
+            trade["close_time"] = time.time()
+            trade["pnl_pct"] = round(pnl_pct, 2)
+            trade["pnl_sol"] = round(pnl_sol, 4)
             closed_count += 1
+            logger.info(f"Paper trade closed: {trade.get('symbol', '?')} | {close_reason} | PnL: {pnl_pct:+.1f}%")
 
             # Send notification
             if send_func:
@@ -359,7 +370,7 @@ async def check_and_update_trades(send_func=None) -> dict:
                     f"\u539f\u56e0: {reason_cn}\n"
                     f"\u5165\u573a: ${entry:.8f}\n"
                     f"\u51fa\u573a: ${price:.8f}\n"
-                    f"PnL: {pnl_pct:+.1f}% ({trade.get('position_sol', 0) * pnl_pct / 100:+.4f} SOL)\n"
+                    f"PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)\n"
                     f"\u6301\u4ed3\u65f6\u95f4: {age_hours:.1f}h\n"
                     f"\u6700\u9ad8: {trade.get('peak_pnl_pct', 0):+.1f}% | \u6700\u4f4e: {trade.get('trough_pnl_pct', 0):+.1f}%\n"
                     f"\n\U0001f4ca \u5f53\u524d\u6218\u7ee9: {format_stats_brief()}"
@@ -369,7 +380,7 @@ async def check_and_update_trades(send_func=None) -> dict:
                 except Exception:
                     pass
 
-    # Save updated price histories
+    # Save ALL updates (price histories + closures) in one atomic write
     _save_trades(trades)
 
     return {"checked": len(open_trades), "closed": closed_count}

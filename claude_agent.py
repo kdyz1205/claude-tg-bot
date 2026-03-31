@@ -886,7 +886,7 @@ async def _run_claude_cli(
     timeout: int = None,
 ) -> tuple[str, str | None, list, str]:
     """Run claude CLI and return (response_text, session_id, matched_skill_ids, tool_output_text)."""
-    global _rate_limited_until
+    global _rate_limited_until, _rate_limit_consecutive
     _ERROR_PATTERNS = {
         "credit": ["credit balance", "insufficient credit", "billing"],
         "auth": ["not logged in", "not authenticated", "auth failed", "login required", "invalid x-api-key",
@@ -1202,9 +1202,15 @@ async def _run_claude_cli(
                     logger.error(f"Claude CLI credit error: {response[:200]}")
                     response = "❌ Claude API 额度不足或账单问题。请检查你的 Anthropic 账户。"
                     new_session_id = None
-                # Rate limit detection — ONLY from stderr (see below), NEVER from response content.
-                # Claude's normal responses may mention "rate limit" in conversation.
-                # This block intentionally removed to prevent false positives.
+                # Rate limit detection in SHORT responses only (< 200 chars = definitely a CLI error, not conversation)
+                if len(response) < 200 and any(p in resp_lower for p in _ERROR_PATTERNS["rate"]):
+                    logger.warning(f"Claude CLI rate limit detected in short response: {response[:200]}")
+                    cooldown = _get_rate_limit_cooldown()
+                    _rate_limit_consecutive += 1
+                    _rate_limited_until = time.time() + cooldown
+                    _schedule_rate_limit_resume(cooldown)
+                    response = f"⏳ Claude CLI 限速中，{cooldown}s后自动恢复。"
+                    new_session_id = None
 
         except json.JSONDecodeError:
             # CLI may output warnings before JSON — search from the end
@@ -1263,7 +1269,6 @@ async def _run_claude_cli(
                 new_session_id = None
             # Check for rate limit errors (stderr is reliable — this is a real error from CLI)
             elif any(p in err_lower for p in _ERROR_PATTERNS["rate"]):
-                global _rate_limit_consecutive, _rate_limited_until
                 # Parse reset time from error message if available
                 reset_match = re.search(r'(\d+)\s*(second|minute|sec|min|s\b|m\b)', err_lower)
                 parsed_val = None
