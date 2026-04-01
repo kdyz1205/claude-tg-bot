@@ -26,7 +26,7 @@ import random
 import re
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -1427,3 +1427,240 @@ class SmartMoneyTracker:
 
 # Module-level singleton
 smart_tracker = SmartMoneyTracker()
+
+
+# ── Smart Money Parasite: hot-token cache + target wallet monitor ─────────────
+
+# Wrapped SOL mint (exclude as buy target; still counts toward SOL spent)
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# Hardcoded insider-style Solana wallets (10) — logs_subscribe mentions + tx parse
+DEFAULT_PARASITE_TARGET_WALLETS: tuple[str, ...] = (
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "7VHUFJHWu2CuExkJcJrzhQPJ2oygupTWkL2A2For4BmE",
+    "HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH",
+    "3tE3Hs7P2VbPEpBmAKvqEGMb1HzB6qRqjAnCjpfeFiLt",
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+    "2iZo6zrSQWgcVfFsmCXEcqQGPKySMfckJwHTTGCDatAy",
+    "FbGeZS8LiPCZiFpFwdUUeF2yxXtSsdfJoHTsVMvM8STh",
+    "Gx5dx4YEt7PLKYU62i1UWdxjNr3rmH4CAFGfVLLb2PJ4",
+    "AGNHGKiuZwrxMPDmpJsLyp3HtYDJCB2Cg5kxFLRFjhSs",
+)
+
+PARASITE_HOT_PRUNE_SEC = 3600  # memory cap for entries older than 1h
+PARASITE_CONSENSUS_WINDOW_SEC = 300  # 5 minutes
+PARASITE_CONSENSUS_MIN_WALLETS = 3  # strictly > 2 distinct target wallets
+
+
+class HotTokenCache:
+    """
+    In-memory mint → [{wallet, ts}, …] for target-wallet SOL/WSOL swap buys.
+    Async lock: all reads/writes are awaitable and non-blocking for other tasks.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._buys: dict[str, list[dict[str, Any]]] = {}
+
+    def _prune_locked(self, now: float) -> None:
+        cutoff = now - PARASITE_HOT_PRUNE_SEC
+        for mint in list(self._buys.keys()):
+            self._buys[mint] = [b for b in self._buys[mint] if b.get("ts", 0) >= cutoff]
+            if not self._buys[mint]:
+                del self._buys[mint]
+
+    async def record_buy(self, mint: str, wallet: str, ts: float | None = None) -> None:
+        if not mint or not wallet:
+            return
+        t = float(ts if ts is not None else time.time())
+        async with self._lock:
+            self._prune_locked(t)
+            self._buys.setdefault(mint, []).append({"wallet": wallet, "ts": t})
+
+    async def distinct_wallets_in_window(self, mint: str, window_sec: float) -> int:
+        """Count distinct `wallet` values with ts in (now - window_sec, now]."""
+        now = time.time()
+        async with self._lock:
+            self._prune_locked(now)
+            cutoff = now - window_sec
+            seen: set[str] = set()
+            for row in self._buys.get(mint, []):
+                if row.get("ts", 0) >= cutoff:
+                    w = row.get("wallet")
+                    if w:
+                        seen.add(w)
+            return len(seen)
+
+    async def hot_buy_signal(self, mint: str) -> bool:
+        """True if >2 distinct target wallets bought this mint in the last 5 minutes."""
+        n = await self.distinct_wallets_in_window(mint, PARASITE_CONSENSUS_WINDOW_SEC)
+        return n >= PARASITE_CONSENSUS_MIN_WALLETS
+
+
+def _parasite_spl_gained_mints(
+    pre_tb: list[Any],
+    post_tb: list[Any],
+    wallet: str,
+) -> list[str]:
+    """Mints where `wallet` token balance strictly increased (raw amount)."""
+    w = str(wallet)
+    pre_map: dict[str, int] = {}
+    for x in pre_tb:
+        try:
+            if x.owner is None or str(x.owner) != w:
+                continue
+            pre_map[str(x.mint)] = int(x.ui_token_amount.amount)
+        except Exception:
+            continue
+    out: list[str] = []
+    for pb in post_tb:
+        try:
+            if pb.owner is None or str(pb.owner) != w:
+                continue
+            mint = str(pb.mint)
+            post_raw = int(pb.ui_token_amount.amount)
+            pre_raw = pre_map.get(mint, 0)
+            if post_raw > pre_raw:
+                out.append(mint)
+        except Exception:
+            continue
+    return out
+
+
+def _parasite_wsol_spent_raw(pre_tb: list[Any], post_tb: list[Any], wallet: str) -> int:
+    """Positive = WSOL balance decreased (spent)."""
+    w = str(wallet)
+    pre_raw = 0
+    post_raw = 0
+    for x in pre_tb:
+        try:
+            if x.owner and str(x.owner) == w and str(x.mint) == WSOL_MINT:
+                pre_raw = int(x.ui_token_amount.amount)
+                break
+        except Exception:
+            continue
+    for x in post_tb:
+        try:
+            if x.owner and str(x.owner) == w and str(x.mint) == WSOL_MINT:
+                post_raw = int(x.ui_token_amount.amount)
+                break
+        except Exception:
+            continue
+    return max(0, pre_raw - post_raw)
+
+
+class TargetWalletMonitor:
+    """
+    Subscribes to Solana logs for hardcoded target wallets (via onchain_ws_listen).
+    When a target spends ≥ SMART_MIN_SOL in native SOL + WSOL and gains SPL mints,
+    those mints are pushed to ``HotTokenCache`` (no K-line / no waiting).
+    """
+
+    def __init__(
+        self,
+        target_addresses: list[str] | tuple[str, ...] | None = None,
+        cache: Optional["HotTokenCache"] = None,
+    ) -> None:
+        self.targets: frozenset[str] = frozenset(
+            target_addresses if target_addresses is not None else DEFAULT_PARASITE_TARGET_WALLETS
+        )
+        self.cache = cache if cache is not None else HotTokenCache()
+        self._running = False
+        self._ws_tasks: list[asyncio.Task] = []
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        import onchain_ws_listen
+
+        self._ws_tasks = onchain_ws_listen._schedule_target_wallet_monitor(self)
+        for t in self._ws_tasks:
+            t.add_done_callback(self._ws_task_done)
+        if not self._ws_tasks:
+            logger.warning(
+                "TargetWalletMonitor: no WS tasks (set ONCHAIN_SOL_WSS + SOLANA_RPC_HTTP)."
+            )
+        logger.info("TargetWalletMonitor started, %d targets", len(self.targets))
+
+    async def stop(self) -> None:
+        self._running = False
+        for t in self._ws_tasks:
+            if not t.done():
+                t.cancel()
+        for t in self._ws_tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        self._ws_tasks.clear()
+
+    def _ws_task_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as e:
+            logger.error("TargetWalletMonitor WS task crashed: %s", e, exc_info=True)
+
+    async def process_signature(
+        self,
+        wallet: str,
+        sig_str: str,
+        http_rpc: str,
+    ) -> None:
+        """
+        Fetch tx, estimate SOL+WSOL spent by wallet, record gained SPL mints if spend ≥ SMART_MIN_SOL.
+        """
+        from solders.signature import Signature
+        from solana.rpc.async_api import AsyncClient
+        from solana.rpc.commitment import Confirmed
+
+        from onchain_ws_listen import _native_sol_delta_for_wallet
+
+        try:
+            async with AsyncClient(http_rpc) as client:
+                resp = await client.get_transaction(
+                    Signature.from_string(sig_str),
+                    commitment=Confirmed,
+                    max_supported_transaction_version=0,
+                )
+        except Exception as e:
+            logger.debug("parasite get_tx %s: %s", sig_str[:12], e)
+            return
+
+        pre_tb: list[Any] = []
+        post_tb: list[Any] = []
+        try:
+            meta = resp.value.transaction.meta if resp and resp.value else None
+            if meta:
+                pre_tb = list(meta.pre_token_balances or [])
+                post_tb = list(meta.post_token_balances or [])
+        except Exception:
+            pass
+
+        native_delta = await _native_sol_delta_for_wallet(resp, wallet)
+        lamports_spent = max(0, -int(native_delta))
+        wsol_spent_raw = _parasite_wsol_spent_raw(pre_tb, post_tb, wallet)
+        total_lamports_spent = lamports_spent + wsol_spent_raw
+        sol_spent = total_lamports_spent / 1e9
+        if sol_spent < float(SMART_MIN_SOL):
+            return
+
+        gained = _parasite_spl_gained_mints(pre_tb, post_tb, wallet)
+        bt = int(time.time())
+        try:
+            if resp.value and resp.value.block_time is not None:
+                bt = int(resp.value.block_time)
+        except Exception:
+            pass
+
+        for mint in gained:
+            if mint == WSOL_MINT:
+                continue
+            await self.cache.record_buy(mint, wallet, float(bt))
+
+
+hot_token_cache = HotTokenCache()
+target_wallet_monitor = TargetWalletMonitor(cache=hot_token_cache)

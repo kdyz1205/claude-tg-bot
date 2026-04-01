@@ -196,8 +196,19 @@ MARKET_MONITOR_ENABLED = os.getenv("MARKET_MONITOR_ENABLED", "true").lower() == 
 # Public defaults; override with your own Alchemy/Infura/QuickNode WSS if needed.
 ONCHAIN_ETH_WSS = os.getenv("ONCHAIN_ETH_WSS", "wss://ethereum-rpc.publicnode.com").strip()
 ONCHAIN_BSC_WSS = os.getenv("ONCHAIN_BSC_WSS", "wss://bsc-rpc.publicnode.com").strip()
-ONCHAIN_SOL_WSS = os.getenv("ONCHAIN_SOL_WSS", "wss://api.mainnet-beta.solana.com").strip()
-SOLANA_RPC_HTTP = os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com").strip()
+
+# Solana: whale / smart-money / TargetWalletMonitor need BOTH WSS + HTTP (get_transaction).
+# If you set HELIUS_API_KEY only, defaults below become Helius mainnet (recommended for logs_subscribe).
+_HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
+_DEFAULT_SOL_WSS = "wss://api.mainnet-beta.solana.com"
+_DEFAULT_SOL_HTTP = "https://api.mainnet-beta.solana.com"
+if _HELIUS_API_KEY:
+    _q = f"?api-key={_HELIUS_API_KEY}"
+    _DEFAULT_SOL_WSS = f"wss://mainnet.helius-rpc.com/{_q}"
+    _DEFAULT_SOL_HTTP = f"https://mainnet.helius-rpc.com/{_q}"
+
+ONCHAIN_SOL_WSS = os.getenv("ONCHAIN_SOL_WSS", _DEFAULT_SOL_WSS).strip()
+SOLANA_RPC_HTTP = os.getenv("SOLANA_RPC_HTTP", _DEFAULT_SOL_HTTP).strip()
 
 # ─── Never-Die Fallback Chain ────────────────────────────────────────────────
 # The bot should NEVER stop responding. When one provider fails, switch to next.

@@ -1,8 +1,8 @@
 """
 Declarative mapping: Telegram command name(s) → handler attribute name on bot.py.
 
-Blueprint：仅 ``/start``、``/trade``、``/t`` 注册为 CommandHandler；其余斜杠由
-``jarvis_plain_text_entry`` → Jarvis 语义层处理。
+Blueprint：仅 ``/start``、``/trade`` 注册为 CommandHandler；其它斜杠由
+``handle_unknown_slash_command`` 提示；自然语言走 ``jarvis_plain_text_entry`` → Jarvis。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler
 
 COMMAND_BINDINGS: list[tuple[tuple[str, ...], str]] = [
     (("start",), "jarvis_start"),
-    (("trade", "t"), "jarvis_trade"),
+    (("trade",), "jarvis_trade"),
 ]
 
 
