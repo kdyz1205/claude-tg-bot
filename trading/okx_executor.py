@@ -353,7 +353,36 @@ class OKXExecutor:
             return None, f"Position size too small: ${size_usd:.2f}"
         return size_usd, ""
 
-    async def open_position(self, symbol: str, side: str, size_usd: float) -> dict:
+    async def open_position(
+        self,
+        symbol: str,
+        side: str,
+        size_usd: float,
+        *,
+        risk_context: dict | None = None,
+    ) -> dict:
+        try:
+            from trading import learned_risk_guards as lrg
+            from trading import loss_immunity
+
+            sid = loss_immunity.strategy_id_from_executor(self)
+            blocked, susp_reason = loss_immunity.is_strategy_suspended(sid)
+            if blocked:
+                return {"ok": False, "reason": susp_reason}
+            ctx: dict = {
+                "symbol": symbol,
+                "side": side,
+                "size_usd": size_usd,
+                "equity": self.state.equity,
+            }
+            if risk_context:
+                ctx.update(risk_context)
+            allow, gr = lrg.evaluate_all(ctx)
+            if not allow:
+                return {"ok": False, "reason": gr}
+        except Exception:
+            pass
+
         # Paper: single critical section (no long-lived I/O vs delta-neutral gather).
         if self.state.mode != "live":
             async with self._lock:
@@ -599,6 +628,12 @@ class OKXExecutor:
             self.state.trade_history.append(record)
             if len(self.state.trade_history) > 500:
                 self.state.trade_history = self.state.trade_history[-500:]
+            try:
+                from trading import loss_immunity
+
+                loss_immunity.after_trade_closed(self, record)
+            except Exception:
+                log.debug("loss_immunity.after_trade_closed skipped", exc_info=True)
             self.state.total_trades += 1
             self.state.total_pnl_usd += pnl_usd
             self.state.daily_pnl += pnl_usd
@@ -1034,12 +1069,16 @@ class OKXExecutor:
         side: str,
         size_usd: float,
         max_retries: int = 4,
+        *,
+        risk_context: dict | None = None,
     ) -> dict:
         """REST order placement with exponential backoff (Phase 12)."""
         delay = 0.4
         last: dict = {"ok": False, "reason": "no_attempt"}
         for attempt in range(max(1, max_retries)):
-            last = await self.open_position(symbol, side, size_usd)
+            last = await self.open_position(
+                symbol, side, size_usd, risk_context=risk_context
+            )
             if last.get("ok"):
                 return last
             log.warning(

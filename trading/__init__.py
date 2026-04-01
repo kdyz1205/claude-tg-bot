@@ -11,7 +11,12 @@ from .okx_executor import (
 )
 from .strategy_brain import StrategyBrain, LessonsLedger, PreTradeChecklist
 from .backtest_engine import (
-    run_backtest, quick_backtest, BacktestConfig, BacktestResult, fetch_ohlcv,
+    run_backtest,
+    quick_backtest,
+    run_backtest_with_factor_file,
+    BacktestConfig,
+    BacktestResult,
+    fetch_ohlcv,
 )
 from .alpha_evolver import AlphaEvolver, alpha_evolver
 from .strategy_arena import StrategyArena, strategy_arena
@@ -27,7 +32,12 @@ __all__ = [
     "AgentState",
     "StrategyBrain", "LessonsLedger", "PreTradeChecklist",
     "sma", "ema", "atr", "bb_upper", "bb_lower", "slope",
-    "run_backtest", "quick_backtest", "BacktestConfig", "BacktestResult", "fetch_ohlcv",
+    "run_backtest",
+    "quick_backtest",
+    "run_backtest_with_factor_file",
+    "BacktestConfig",
+    "BacktestResult",
+    "fetch_ohlcv",
     "AlphaEvolver", "alpha_evolver",
     "StrategyArena", "strategy_arena",
     "ReflectionEngine", "reflection_engine",

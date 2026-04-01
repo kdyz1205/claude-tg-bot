@@ -200,3 +200,105 @@ def get_reflexion_engine() -> ReflexionEngine:
     if _engine is None:
         _engine = ReflexionEngine()
     return _engine
+
+
+async def reflect_trading_loss_immunity(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    LLM diagnosis for 3 consecutive losses + one ``def guard(ctx) -> bool`` snippet.
+
+    ``guard`` must return **True** to **veto** (block) the next open. Use only
+    ``ctx`` dict: symbol, side, size_usd, equity, confidence, volatility_regime,
+    liquidity_ratio, spread_bps, etc.
+    """
+    try:
+        from agents.loop import _cli_call
+    except ImportError:
+        return {
+            "diagnosis": "agents.loop unavailable",
+            "defensive_code": (
+                "def guard(ctx):\n"
+                "    return float(ctx.get('confidence', 1.0) or 1.0) < 0.2\n"
+            ),
+            "summary_zh": "离线回退：低置信度拦截。",
+        }
+
+    blob = json.dumps(payload, ensure_ascii=False, default=str)[:12000]
+    prompt = f"""你是量化交易风控架构师。以下 JSON 是同一策略在 1 小时内连续 3 笔亏损单的明细、
+PostTrade 批处理摘要、以及 BTC/ETH/SOL 快照。
+
+任务：
+1. 用中文简短诊断「死因」类别（例如：被夹、假突破、流动性枯竭、止损过紧、趋势反转未识别）。
+2. 输出**一段可执行的 Python**，仅包含一个函数：
+
+def guard(ctx) -> bool:
+    \"\"\"若应禁止开仓返回 True；允许开仓返回 False。仅使用 ctx 字典键。\"\"\"
+    ...
+
+ctx 常见键：symbol, side, size_usd, equity, confidence, volatility_regime,
+liquidity_ratio, spread_bps, regime（字符串）.
+禁止 import、文件、网络、exec/eval。只用比较与 float/int/min/max/abs。
+
+3. 用一句话中文总结学到的防御。
+
+JSON 输入：
+{blob}
+
+严格按以下格式回复（先诊断段落，再代码块，再总结行）：
+DIAGNOSIS_ZH: ...
+```python
+def guard(ctx):
+    ...
+```
+SUMMARY_ZH: ...
+"""
+    try:
+        text, _ = await _cli_call(
+            prompt, model="claude-haiku-4-5-20251001", timeout=45
+        )
+    except Exception as e:
+        return {
+            "diagnosis": str(e)[:500],
+            "defensive_code": (
+                "def guard(ctx):\n"
+                "    return float(ctx.get('confidence', 1.0) or 1.0) < 0.25\n"
+            ),
+            "summary_zh": "反思调用失败，使用保守门槛。",
+        }
+
+    diagnosis = ""
+    if "DIAGNOSIS_ZH:" in text:
+        part = text.split("DIAGNOSIS_ZH:", 1)[1]
+        diagnosis = part.split("```")[0].strip()[:800]
+    summary_zh = ""
+    if "SUMMARY_ZH:" in text:
+        summary_zh = text.split("SUMMARY_ZH:", 1)[1].strip().split("\n")[0][:400]
+
+    code = ""
+    if "```python" in text:
+        code = text.split("```python", 1)[1].split("```", 1)[0].strip()
+    elif "```" in text:
+        code = text.split("```", 1)[1].split("```", 1)[0].strip()
+
+    if "def guard" not in code:
+        code = (
+            "def guard(ctx):\n"
+            "    return float(ctx.get('confidence', 1.0) or 1.0) < 0.25\n"
+        )
+
+    eng = get_reflexion_engine()
+    eng._save_reflection(
+        {
+            "timestamp": time.time(),
+            "category": "trading_loss_immunity",
+            "insight": diagnosis[:300],
+            "success": False,
+            "action": "loss_streak_3",
+            "result": summary_zh[:200],
+        }
+    )
+
+    return {
+        "diagnosis": diagnosis or "未解析诊断",
+        "defensive_code": code,
+        "summary_zh": summary_zh or "已生成防御函数。",
+    }

@@ -4,6 +4,10 @@ chaos_monkey.py — Adversarial fault injection for resilience testing.
 Simulates production failures: RPC/HTTP 502, signing timeouts, SQLite-style
 DB lock contention, and pathological LLM output. Apply via context manager;
 uses unittest.mock for urllib and (optionally) requests.
+
+End-to-end **trading** chaos (paper + mocked OKX, ``hard_risk_kill``,
+``reconcile_state_with_exchange``) lives in ``harness.chaos_trading_immunity``;
+Telegram phrase 「启动混沌测试」schedules that battery via the gateway bridge.
 """
 from __future__ import annotations
 

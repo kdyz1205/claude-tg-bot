@@ -17,9 +17,12 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+from skills.base_skill import BaseSkill
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,115 @@ def build_codex_charger_payload(paper: PaperRecord, extra_constraints: str = "")
         "cli_prompt": prompt,
         "target_modules": ["singularity_engine", "harness", "codex_charger"],
     }
+
+
+def build_vectorized_factor_source(
+    formulas: List[str],
+    architecture: Optional[Dict[str, Any]],
+    *,
+    skill_id: str,
+) -> str:
+    """
+    Translate extracted paper/architecture context into a **NumPy + Pandas** module
+    exposing ``paper_alpha_signals(close, high, low, vol, params)`` for ``backtest_engine``.
+    Deterministic rolling z-score of returns; ``fragment_len`` comes from architecture when present.
+    """
+    frag = 16
+    if architecture and isinstance(architecture.get("hyperparams"), dict):
+        try:
+            frag = int(architecture["hyperparams"].get("fragment_len", 16))
+        except (TypeError, ValueError):
+            frag = 16
+    frag = max(3, min(frag, 120))
+    formulas_json = json.dumps(formulas[:22], ensure_ascii=False)
+    # skill_id embedded for traceability; avoid f-string brace clashes in generated code
+    return f'''# -*- coding: utf-8 -*-
+"""Paper→alpha vectorized factor (NumPy + Pandas). skill_id={skill_id!s}"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+FORMULAS = {formulas_json}
+
+
+def paper_alpha_signals(close, high, low, vol, params):
+    """
+    Discrete signals for walk-forward backtest: 1 long, -1 short, 0 flat.
+    Rolling z-score of close returns over ``fragment_len`` (from params or arch default).
+    """
+    _ = (high, low, vol)
+    n = len(close)
+    signals = np.zeros(n, dtype=np.int32)
+    w = int(params.get("fragment_len", {frag}))
+    w = max(3, min(w, 200))
+    thr = float(params.get("z_threshold", 0.4))
+    c = np.asarray(close, dtype=np.float64)
+    ret = pd.Series(c).pct_change()
+    m = ret.rolling(w, min_periods=max(2, w // 2)).mean()
+    sd = ret.rolling(w, min_periods=max(2, w // 2)).std().replace(0, np.nan)
+    z = (ret - m) / sd
+    zv = z.to_numpy()
+    for i in range(n):
+        zi = zv[i]
+        if np.isnan(zi):
+            continue
+        if zi > thr:
+            signals[i] = 1
+        elif zi < -thr:
+            signals[i] = -1
+    return signals
+
+
+class PaperAlphaFactorSkill(BaseSkill):
+    skill_id = "{skill_id}"
+    default_timeout_sec = 90.0
+
+    async def _execute(self, payload: Dict[str, Any]) -> Any:
+        c = np.asarray(payload.get("close") or [], dtype=np.float64)
+        if len(c) < 10:
+            return {{
+                "buy_confidence": 0.0,
+                "sell_confidence": 0.0,
+                "reason": "insufficient_bars",
+            }}
+        h = np.asarray(payload.get("high") or c, dtype=np.float64)
+        lo = np.asarray(payload.get("low") or c, dtype=np.float64)
+        v = np.asarray(payload.get("vol") or np.ones_like(c), dtype=np.float64)
+        p = dict(payload.get("params") or {{}})
+        sig = paper_alpha_signals(c, h, lo, v, p)
+        last = int(sig[-1])
+        buy = 1.0 if last == 1 else 0.0
+        sell = 1.0 if last == -1 else 0.0
+        return {{
+            "buy_confidence": buy,
+            "sell_confidence": sell,
+            "last_signal": last,
+            "formula_count": len(FORMULAS),
+        }}
+
+
+SKILL_CLASS = PaperAlphaFactorSkill
+'''
+
+
+def write_paper_factor_skill_file(
+    formulas: List[str],
+    architecture: Optional[Dict[str, Any]],
+    fingerprint: str,
+    *,
+    skills_dir: Optional[Path] = None,
+) -> Path:
+    """Write ``skills/sk_paper_alpha_<fp>.py`` and return its path."""
+    base = skills_dir or Path(__file__).resolve().parent
+    fp = re.sub(r"[^a-zA-Z0-9_]", "_", fingerprint)[:12] or "default"
+    skill_id = f"sk_paper_alpha_{fp}"
+    src = build_vectorized_factor_source(
+        formulas, architecture, skill_id=skill_id
+    )
+    path = base / f"{skill_id}.py"
+    path.write_text(src, encoding="utf-8")
+    return path
 
 
 def extract_json_from_llm_response(text: str) -> Optional[Dict[str, Any]]:

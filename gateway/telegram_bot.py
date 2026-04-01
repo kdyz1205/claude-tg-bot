@@ -30,7 +30,11 @@ from telegram.ext import (
     filters,
 )
 
-from pipeline.tg_dev_bridge import process_dev_task
+from pipeline.tg_dev_bridge import (
+    process_chaos_immunity_task,
+    process_dev_task,
+    process_wallet_clone_task,
+)
 
 from gateway.tg_front import (
     GW_CB,
@@ -409,6 +413,48 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    from gateway.jarvis_semantic import classify_intent
+
+    row = await classify_intent(prompt, uid=uid)
+    if str(row.get("intent") or "").upper() == "CHAOS_IMMUNITY":
+        await update.message.reply_text(
+            "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
+            "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
+        )
+        _gw_schedule(
+            context.application,
+            process_chaos_immunity_task(
+                bot=context.bot,
+                chat_id=update.message.chat_id,
+                uid=uid,
+                dev_timeout_sec=900,
+                min_interval_sec=3.0,
+            ),
+        )
+        return
+
+    if str(row.get("intent") or "").upper() == "WALLET_CLONE":
+        addr = row.get("extracted_address")
+        if not addr:
+            await update.message.reply_text("未识别到有效的 0x 钱包地址。")
+            return
+        await update.message.reply_text(
+            "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
+        )
+        _gw_schedule(
+            context.application,
+            process_wallet_clone_task(
+                bot=context.bot,
+                chat_id=update.message.chat_id,
+                wallet_address=str(addr),
+                timeout_sec=600,
+                min_interval_sec=3.0,
+            ),
+        )
+        return
+
+    sub_intent = row.get("sub_intent")
+
     await update.message.reply_text(
         "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
     )
@@ -420,6 +466,7 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             prompt=prompt,
             timeout_sec=600,
             min_interval_sec=3.0,
+            sub_intent=sub_intent,
         ),
     )
 
@@ -462,8 +509,46 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         row = await classify_intent(text, uid=uid)
         intent = str(row.get("intent") or "CHAT").upper()
 
+        if intent == "CHAOS_IMMUNITY":
+            await update.message.reply_text(
+                "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
+                "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
+            )
+            _gw_schedule(
+                application,
+                process_chaos_immunity_task(
+                    bot=context.bot,
+                    chat_id=update.message.chat_id,
+                    uid=uid,
+                    dev_timeout_sec=900,
+                    min_interval_sec=3.0,
+                ),
+            )
+            return
+
+        if intent == "WALLET_CLONE":
+            addr = row.get("extracted_address")
+            if not addr:
+                await update.message.reply_text("未识别到有效的 0x 钱包地址。")
+                return
+            await update.message.reply_text(
+                "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
+            )
+            _gw_schedule(
+                application,
+                process_wallet_clone_task(
+                    bot=context.bot,
+                    chat_id=update.message.chat_id,
+                    wallet_address=str(addr),
+                    timeout_sec=600,
+                    min_interval_sec=3.0,
+                ),
+            )
+            return
+
         if intent == "AUTO_DEV":
             req = (row.get("extracted_requirement") or "").strip() or text
+            sub_intent = row.get("sub_intent")
             await update.message.reply_text(
                 "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
             )
@@ -475,6 +560,7 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     prompt=req,
                     timeout_sec=600,
                     min_interval_sec=3.0,
+                    sub_intent=sub_intent,
                 ),
             )
             return

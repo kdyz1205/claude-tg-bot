@@ -1,6 +1,9 @@
 """
 Strategy Arena — FinEvo-style multi-agent competition framework.
 
+Live execution uses a separate pre-trade **MoE gate** in ``trading.moe_gate``
+(three local experts + 1s debate before ``StrategyBrain`` calls ``open_position``).
+
 Based on ICLR 2026 FinEvo patterns:
 - Maintain a population of 10-20 strategies (rule-based + evolved + LLM-generated)
 - Each generation: all strategies trade the same historical period simultaneously
