@@ -431,7 +431,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _jarvis_semantic_route(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, uid: int
 ) -> None:
-    """Jarvis：纯文本或未注册斜杠（/start、/trade 已由 CommandHandler 吃掉）。"""
+    """Jarvis：非命令纯文本（/start、/trade 及其它斜杠已由 CommandHandler 或未知斜杠处理器处理）。"""
     global USER_MODE
     if not update.message:
         return
