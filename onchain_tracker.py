@@ -904,6 +904,19 @@ class SmartMoneyTracker:
             except Exception:
                 pass
         logger.info("Consensus signal emitted: %s (%d wallets)", token, len(active_buys))
+        try:
+            from trading.smart_money_copy_hook import dispatch_consensus_copy
+
+            asyncio.create_task(
+                dispatch_consensus_copy(
+                    contract=contract,
+                    token=token,
+                    buys=list(active_buys),
+                ),
+                name="smart_money_consensus_copy",
+            )
+        except Exception:
+            logger.debug("consensus copy-trade dispatch skipped", exc_info=True)
 
     def _format_consensus_signal(self, contract: str, token: str, buys: list) -> str:
         total_usd = sum(b.get("amount_usd", 0) for b in buys)

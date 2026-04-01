@@ -29,7 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _MAX_CAPTURE_CHARS = 256_000
 _TAIL_FOR_REPORT = 3500
 _DEFAULT_TIMEOUT_SEC = int(os.environ.get("TG_DEV_TIMEOUT_SEC", "600"))
-_PROMPT_INLINE_MAX = 7500
+# Windows CreateProcess ~8191 char total line; keep -p small (same idea as claude_agent).
+_PROMPT_INLINE_MAX = int(os.environ.get("CLI_DEV_PROMPT_INLINE_MAX", "1200" if os.name == "nt" else "7500"))
 
 _CONFIRM_LINE_HINTS: tuple[str, ...] = (
     "[y/n]",

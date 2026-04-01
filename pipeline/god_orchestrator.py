@@ -2,7 +2,7 @@
 God Loop — dual-rail scheduler: InfiniteEvolver (forge) + live delta-neutral radar.
 
 Bridges promoted backtest genes into ``GLOBAL_BEST_STRATEGY`` and drives
-``live_trader.execute_delta_neutral_buy`` with a fixed SOL notional while a
+``live_trader.execute_delta_neutral_buy`` with Kelly-sized SOL (optional ``GOD_TRADE_SOL`` cap) while a
 session loss fuse is armed.
 """
 
@@ -35,12 +35,65 @@ class GodOrchestrator:
         label = self.active_skill or "(全局择优/遗传同步)"
         logger.info("⚡ 雷达已实时切换至: %s", label)
 
+    def reload_skills(self) -> None:
+        """
+        读取 ``session_commander_config.json`` 的 ``active_skills``（及兼容 ``god_active_skill``），
+        热切换雷达并尝试 ``load_skill_from_file`` 对应 ``skills/{id}.py``。
+        """
+        global _session_cfg_mtime, _watchdog_last_reload_mono
+        now = time.monotonic()
+        if now - _watchdog_last_reload_mono < _WATCHDOG_DEBOUNCE_SEC:
+            return
+        _watchdog_last_reload_mono = now
+        p = _SESSION_COMMANDER_CFG
+        if not p.is_file():
+            logger.debug("reload_skills: missing %s", p)
+            return
+        try:
+            _session_cfg_mtime = p.stat().st_mtime
+            data = json.loads(p.read_text(encoding="utf-8"))
+            raw = data.get("active_skills")
+            primary = ""
+            if isinstance(raw, list) and raw:
+                primary = str(raw[0] or "").strip()
+            elif isinstance(raw, str):
+                primary = raw.strip()
+            if not primary:
+                primary = str(data.get("god_active_skill") or "").strip()
+            self.hot_swap_skill(primary)
+            if primary:
+                py_path = p.parent / "skills" / f"{primary}.py"
+                if py_path.is_file():
+                    try:
+                        from skills.skill_runtime import load_skill_from_file
+
+                        load_skill_from_file(py_path)
+                    except Exception:
+                        logger.debug(
+                            "reload_skills load_skill_from_file failed",
+                            exc_info=True,
+                        )
+            _refresh_global_best_sync()
+        except Exception:
+            logger.warning("reload_skills failed", exc_info=True)
+
 
 GOD_ORCHESTRATOR = GodOrchestrator()
 
 EVOLVE_INTERVAL_SEC = float(os.environ.get("GOD_EVOLVE_INTERVAL_SEC", "7200"))
-TRADE_NOTIONAL_SOL = float(os.environ.get("GOD_TRADE_SOL", "0.5"))
 MAX_SESSION_LOSS_SOL = float(os.environ.get("GOD_MAX_LOSS_SOL", "0.1"))
+
+
+def _optional_god_max_trade_sol_cap() -> float | None:
+    """Optional hard ceiling (SOL) for live legs; unset ``GOD_TRADE_SOL`` = Kelly-only cap from config."""
+    raw = (os.environ.get("GOD_TRADE_SOL") or "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except ValueError:
+        return None
 RADAR_POLL_SEC = float(os.environ.get("GOD_RADAR_POLL_SEC", "45"))
 DEFAULT_CONFIDENCE_FLOOR = float(os.environ.get("GOD_CONFIDENCE_FLOOR", "0.85"))
 
@@ -66,6 +119,14 @@ _alert_sender: Optional[Callable[[str], Awaitable[None]]] = None
 _trip_once = threading.Event()
 # When set, forge/radar tasks use PTB ``Application.create_task`` (same loop as polling).
 _telegram_create_task: Optional[Callable[..., Any]] = None
+
+# session_commander_config.json — watchdog 热更 + mtime 去抖
+_SESSION_COMMANDER_CFG: Path = Path(__file__).resolve().parents[1] / "session_commander_config.json"
+_session_cfg_mtime: float = 0.0
+_watchdog_observer: Any = None
+_watchdog_lock = threading.Lock()
+_watchdog_last_reload_mono: float = 0.0
+_WATCHDOG_DEBOUNCE_SEC = 0.35
 
 
 def is_god_hard_stop() -> bool:
@@ -291,13 +352,27 @@ async def _god_radar_once() -> None:
     if float(pred.get("confidence", 0)) < thr or pred.get("action") != "long":
         return
 
-    import secure_wallet
+    from trading.portfolio_manager import (
+        KELLY_MIN_TRADE_SOL,
+        PortfolioManager,
+        clamp_kelly_stake_to_balance,
+    )
+    from trading.portfolio_snapshot import fetch_tradable_sol_balance
 
-    balance = await secure_wallet.get_sol_balance()
-    if not balance:
+    equity, _eq_src = await fetch_tradable_sol_balance()
+    if equity <= 0:
         return
-    gas_floor = max(float(cfg.get("min_sol_reserve", 0.05)), 0.015)
-    trade_sol = min(TRADE_NOTIONAL_SOL, max(0.01, balance - gas_floor))
+    skill_for_kelly = snap.get("skill_id") or "god_orchestrator"
+    raw_sol = PortfolioManager.get_kelly_position_size(skill_for_kelly, equity, cfg=cfg)
+    trade_sol = clamp_kelly_stake_to_balance(raw_sol, equity, cfg)
+    if trade_sol is None:
+        return
+    cap = _optional_god_max_trade_sol_cap()
+    if cap is not None:
+        trade_sol = min(trade_sol, cap)
+        if trade_sol < KELLY_MIN_TRADE_SOL:
+            logger.warning("Kelly 仓位建议不足或已熔断，放弃开火。")
+            return
 
     hedge_sym = cfg.get("neural_hedge_symbol") or "SOLUSDT"
     sigd = {
@@ -328,6 +403,57 @@ async def _god_radar_once() -> None:
             )
         except Exception:
             pass
+
+
+def _start_session_commander_watchdog() -> None:
+    """在独立线程中监控 ``session_commander_config.json``，变更即 ``reload_skills``。"""
+    global _watchdog_observer
+
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+    except ImportError:
+        logger.warning(
+            "watchdog 未安装，跳过 session_commander_config 文件监控；"
+            "请 pip install watchdog 或依赖 Jarvis 写配置后的即时 reload_skills() 调用。"
+        )
+        return
+
+    cfg_path = _SESSION_COMMANDER_CFG.resolve()
+
+    class _Handler(FileSystemEventHandler):
+        def on_modified(self, event):  # type: ignore[override]
+            if getattr(event, "is_directory", False):
+                return
+            try:
+                if Path(event.src_path).resolve() != cfg_path:
+                    return
+            except OSError:
+                return
+            with _watchdog_lock:
+                try:
+                    GOD_ORCHESTRATOR.reload_skills()
+                except Exception:
+                    logger.debug("watchdog reload_skills", exc_info=True)
+
+    parent = str(cfg_path.parent)
+    obs = Observer()
+    obs.schedule(_Handler(), parent, recursive=False)
+    obs.start()
+    _watchdog_observer = obs
+    logger.info("watchdog observing %s for God reload_skills", cfg_path)
+
+
+def _stop_session_commander_watchdog() -> None:
+    global _watchdog_observer
+    obs = _watchdog_observer
+    _watchdog_observer = None
+    if obs is not None:
+        try:
+            obs.stop()
+            obs.join(timeout=5.0)
+        except Exception:
+            logger.debug("watchdog stop failed", exc_info=True)
 
 
 async def _radar_loop(stop: asyncio.Event, *, paper_mode: bool) -> None:
@@ -371,7 +497,9 @@ def _apply_live_config_for_god() -> None:
     cfg["enabled"] = True
     # God radar runs its own tensor → hedge path; disable built-in neural listener to avoid double fires.
     cfg["neural_execution_enabled"] = False
-    cfg["max_trade_sol"] = TRADE_NOTIONAL_SOL
+    cap = _optional_god_max_trade_sol_cap()
+    if cap is not None:
+        cfg["max_trade_sol"] = cap
     lt._save_config(cfg)
 
 
@@ -386,7 +514,7 @@ async def start_autonomous_engine(
 
     Returns False if already running. ``paper_mode`` runs forge only (radar idles).
     """
-    global _running, _stop_event, _bg_tasks, _alert_sender, _telegram_create_task
+    global _running, _stop_event, _bg_tasks, _alert_sender, _telegram_create_task, _session_cfg_mtime
 
     if _running:
         logger.info("God engine already running")
@@ -412,6 +540,13 @@ async def start_autonomous_engine(
 
     _running = True
 
+    try:
+        GOD_ORCHESTRATOR.reload_skills()
+    except Exception:
+        logger.debug("god initial reload_skills skipped", exc_info=True)
+
+    _start_session_commander_watchdog()
+
     t_forge = _spawn_loop_task(_forge_loop(_stop_event), name="god_forge")
     t_radar = _spawn_loop_task(
         _radar_loop(_stop_event, paper_mode=paper_mode),
@@ -420,9 +555,9 @@ async def start_autonomous_engine(
     _bg_tasks = [t_forge, t_radar]
 
     logger.info(
-        "God autonomous engine started (paper_mode=%s trade_sol=%s loss_fuse=%s)",
+        "God autonomous engine started (paper_mode=%s kelly_cap_sol=%s loss_fuse=%s)",
         paper_mode,
-        TRADE_NOTIONAL_SOL,
+        _optional_god_max_trade_sol_cap(),
         MAX_SESSION_LOSS_SOL,
     )
     return True
@@ -447,3 +582,4 @@ async def stop_autonomous_engine() -> None:
             pass
     _bg_tasks = []
     _telegram_create_task = None
+    _stop_session_commander_watchdog()

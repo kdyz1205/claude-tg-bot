@@ -1,43 +1,86 @@
 """
-Human-facing command catalog and Telegram menu entries.
+Human-facing command catalog: /help text and Telegram menu entries.
 
-Blueprint mode: slash surface is **only** ``/start`` (main panel) and ``/trade`` (manual hint).
-All other capabilities are reached via natural language → ``gateway.jarvis_semantic`` (main bot)
-or remain available as typed commands where ``bot.py`` still registers handlers (no menu pollution).
+Kept separate from ``registration.py`` so wording can evolve without touching
+handler wiring order.
 """
 
 from __future__ import annotations
 
 from telegram import BotCommand
 
+# Shown under /start (short; detailed list is /help)
 START_FOOTER_COMMANDS = "/start /trade"
 
+# Sections for /help — trimmed to commands that stay registered (see tg_registry/registration.py)
 HELP_SECTIONS: list[tuple[str, list[str]]] = [
     (
-        "🧠 Jarvis 网关（极简）",
+        "⚙️ 核心",
         [
-            "/start — 主控台：持仓摘要、引擎启停、刷新、纸/实盘切换",
-            "/trade — 手动交易说明（实际买卖请用自然语言，由语义层路由）",
-            "其余需求直接打字：闲聊 / 交易意图 / 写代码与因子 → 自动分流，无需记命令表。",
+            "/start — 欢迎 + 实盘/Paper 视图",
+            "/help — 本清单",
+            "/panel /ping /clear /q /quick — 面板与快捷",
+            "/model /provider — 模型与路由",
+            "/status — Bot 与系统状态",
+            "/cancel — 取消排队任务",
+            "/train、/train_file_ops … — 子代理训练",
+        ],
+    ),
+    (
+        "🔗 交易与链上",
+        [
+            "/chain — 链上面板（快照 + 按钮）",
+            "/portfolio — 聚合持仓",
+            "/strategy — 策略总控",
+            "/trade (/t) — 综合交易键盘",
+            "/live start|stop|status — 实盘调度",
+            "/paper — 模拟盘",
+            "/buy /sell /positions /settings /pnl",
+            "/wallet_setup /wallet_delete",
+        ],
+    ),
+    (
+        "🚀 OKX · 信号",
+        [
+            "/okx_trade /okx /okx_account",
+            "/signal /signal_stats /alpha /arb",
+        ],
+    ),
+    (
+        "🐋 聪明钱与报告",
+        [
+            "/onchain /whales /track /wallets /addwallet",
+            "/report /risk /performance",
+            "/evolution /evostatus",
+        ],
+    ),
+    (
+        "💬 自然语言",
+        [
+            "网关模式：策略、造物、风控 → 直接中文说即可（不必记斜杠）。",
+            "粘贴 Solana CA — 狙击卡片（主 bot）",
         ],
     ),
 ]
 
 
 def format_help_message() -> str:
-    lines = ["🤖 命令一览（极简模式）\n"]
+    lines = ["🤖 Bot 功能一览（按类别）\n"]
     for title, items in HELP_SECTIONS:
         lines.append(title + "\n")
         for it in items:
             lines.append(f"  {it}\n")
         lines.append("")
-    lines.append("主机器人如仍注册其他 / 指令，可手动输入；本菜单仅展示 /start 与 /trade。")
+    lines.append("直接说就行，不用客气。")
     return "".join(lines)
 
 
-def telegram_menu_bot_commands() -> list[BotCommand]:
-    """Telegram ``set_my_commands`` palette — blueprint: two entries only."""
+def get_core_menu_commands() -> list[BotCommand]:
+    """
+    唯一 Telegram 侧栏菜单源：主进程与网关共用 ``set_my_commands``。
+    仅两项；其余指令仍可通过打字或 registration 使用，不进入 Bot 菜单。
+    """
     return [
-        BotCommand("start", "主控台·持仓·引擎"),
-        BotCommand("trade", "手动交易说明"),
+        BotCommand("start", "🚀 主控台与实盘大盘"),
+        BotCommand("trade", "⚔️ 极速手动交易面板"),
     ]

@@ -90,6 +90,10 @@ DEFAULT_CONFIG = {
     "jarvis_drain_routes": {},
     # 非空时：本 watch/monitor 进程只消费 resolve 后等于该名的队列项（多进程并行 drain）
     "jarvis_consumer_filter_session": "",
+    # God 雷达优先使用的 skill_id（空则沿用遗传/索引择优）；兼容旧键
+    "god_active_skill": "",
+    # Jarvis 实权：当前挂载的策略 skill_id 列表（雷达取首个）；覆写见 jarvis_semantic.update_config_active_skill
+    "active_skills": [],
 }
 
 def load_config():

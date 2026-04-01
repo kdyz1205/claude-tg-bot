@@ -1,7 +1,7 @@
 """
 Telegram Gateway — PTB：极简全自动看板。
 
-- 唯一主入口：`/start`（MarkdownV2 + ``gw:*`` 回调）。
+- 主入口：`/start`（MarkdownV2 + ``gw:*`` 回调）；交易类斜杠委托 ``bot.py`` 同名处理器。
 - UI 只读内存/文件缓存：`portfolio_snapshot.get_snapshot_for_gateway`、
   ``trade_scheduler.read_scheduler_state``、``live_trader.get_live_stats``；不在回调协程里
   ``await`` 链上或 OKX 实时拉取。重刷新通过后台 ``asyncio.create_task(refresh_once)`` 触发。
@@ -18,6 +18,9 @@ Telegram Gateway — PTB：极简全自动看板。
   ``JARVIS_QUEUE_DRAIN_SESSION`` — 入队项显式 ``drain_session``（覆盖路由表）。
   ``SESSION_COMMANDER_JARVIS_FILTER_SESSION`` — 本机 watch 只消费 resolve 后等于该名的任务（并行 drain）。
   ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
+  配置总线：写 ``session_commander_config.json`` 的 ``active_skills``；God 引擎用 **watchdog** 监听 JSON 并 ``reload_skills``。
+  斜杠：``/start`` 网关面板；``/trade``、``/t`` 委托 ``bot.trade_dashboard_command``。
+  其它 ``/…`` 与纯文本相同，走 Jarvis 语义路由（classify_intent → CHAT/TRADE/AUTO_DEV 等）。
 
 Run:   python -m gateway.telegram_bot
 """
@@ -40,7 +43,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
 from pipeline.tg_dev_bridge import (
     process_chaos_immunity_task,
     process_dev_task,
@@ -60,6 +62,10 @@ from gateway.gateway_lifecycle import (
     mark_gateway_user_activity,
     start_auto_research_background,
     sync_slash_command_menu,
+)
+from gateway.handlers.router import (
+    MOE_DEBATE_ACK,
+    schedule_trade_moe_nonblocking,
 )
 from tracker.session_store import SessionStore
 
@@ -110,6 +116,10 @@ def _allowed_user_ids() -> set[int]:
 
 
 _ALLOWED = _allowed_user_ids()
+
+
+def _gw_schedule(application: Application, coro) -> None:
+    application.create_task(coro, name="gw_bg")
 
 
 async def _gw_post_init(application: Application) -> None:
@@ -362,22 +372,39 @@ async def _gw_panel_work(
             logger.warning("gateway panel error edit failed: %s", e2)
 
 
-async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Dedicated /trade handler — never routed through Jarvis plain-text."""
-    if not update.effective_user or not update.message:
-        return
-    uid = update.effective_user.id
-    if not _is_authorized(uid):
-        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
-        return
-    mark_gateway_user_activity()
-    await update.message.reply_text(
-        "⚔️ *手动交易*\n"
-        "• 直接发自然语言（买/卖/平仓等），由 Jarvis 语义层路由到交易执行。\n"
-        "• 发送 `/start` 打开主控面板（引擎、刷新、纸/实盘与风控键盘）。\n"
-        "• 研发、情绪链接、混沌测试等同样用自然语言描述即可。",
-        parse_mode="Markdown",
-    )
+def _make_bot_delegate(handler_attr: str):
+    """把 ``bot`` 模块里已有的 CommandHandler 逻辑挂到网关进程上。"""
+
+    async def _handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not update.message:
+            return
+        if not _is_authorized(update.effective_user.id):
+            await update.message.reply_text("⛔ 未授权使用此网关机器人。")
+            return
+        mark_gateway_user_activity()
+        try:
+            import bot as _bot_mod
+
+            fn = getattr(_bot_mod, handler_attr, None)
+            if fn is None:
+                await update.message.reply_text(f"❌ 内部错误：无处理器 {handler_attr}")
+                return
+            await fn(update, context)
+        except Exception as e:
+            logger.exception("gateway delegate %s failed", handler_attr)
+            try:
+                await update.message.reply_text(
+                    f"❌ 命令执行失败: {e!s}"[:800]
+                )
+            except Exception:
+                pass
+
+    return _handler
+
+
+# 仅 /trade 委托 bot.py；其余斜杠不走 CommandHandler，由 Jarvis 语义路由处理。
+# ``terminal_ui`` 仍 ``from gateway.telegram_bot import cmd_trade``
+cmd_trade = _make_bot_delegate("trade_dashboard_command")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -401,9 +428,176 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """非命令纯文本：CHAT / TRADE / AUTO_DEV。"""
+async def _jarvis_semantic_route(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, uid: int
+) -> None:
+    """Jarvis：纯文本或未注册斜杠（/start、/trade 已由 CommandHandler 吃掉）。"""
     global USER_MODE
+    if not update.message:
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    from gateway.jarvis_semantic import (
+        chat_reply,
+        classify_intent,
+        maybe_mount_skill_after_auto_dev,
+        update_config_active_skill,
+        user_semantic_lock,
+    )
+    from gateway.sentiment_feed import is_single_url_message, process_sentiment_feed
+
+    store = await _session_store_async(context.application)
+    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
+    application = context.application
+
+    status_msg = None
+    try:
+        if is_single_url_message(text):
+            status_msg = await update.message.reply_text("⚡ Jarvis 拉取链接并分析情绪…")
+            try:
+                out = await process_sentiment_feed(text, user_mode=USER_MODE)
+            except Exception as e:
+                logger.exception("sentiment_feed url shortcut: %s", e)
+                out = f"❌ 分析失败: {e!s}"
+            await status_msg.edit_text(out[:4096])
+            return
+
+        async with user_semantic_lock(uid):
+            status_msg = await update.message.reply_text("⚡ Jarvis 正在解析...")
+            row = await classify_intent(text, uid=uid)
+            intent = str(row.get("intent") or "CHAT").upper()
+            logger.debug(
+                "jarvis_route uid=%s intent=%s sub=%s reasoning=%s",
+                uid,
+                intent,
+                row.get("sub_intent"),
+                row.get("reasoning"),
+            )
+
+            if intent == "CHAOS_IMMUNITY":
+                await status_msg.edit_text(
+                    "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
+                    "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
+                )
+                _gw_schedule(
+                    application,
+                    process_chaos_immunity_task(
+                        bot=context.bot,
+                        chat_id=update.message.chat_id,
+                        uid=uid,
+                        dev_timeout_sec=900,
+                        min_interval_sec=3.0,
+                    ),
+                )
+                return
+
+            if intent == "CONFIG_BUS":
+                from gateway.config_bus import append_lab_nudge_to_queue, apply_safe_config_patch
+
+                patches = row.get("config_patch") or {}
+                lines: list[str] = []
+                if patches:
+                    ok, msg = apply_safe_config_patch(patches)
+                    lines.append(f"⚙️ 配置总线：{'✅' if ok else '❌'} {msg}")
+                lp = row.get("lab_prompt")
+                if lp:
+                    ok2, msg2 = append_lab_nudge_to_queue(str(lp))
+                    lines.append(f"🧪 炼丹队列：{'✅' if ok2 else '❌'} {msg2}")
+                await status_msg.edit_text(
+                    "\n".join(lines) if lines else "✅ 已处理（无写入项）。"
+                )
+                return
+
+            if intent == "RUN_SKILL":
+                sid = str(row.get("skill_id") or "").strip()
+                ok_m, msg_m = update_config_active_skill(sid)
+                await status_msg.edit_text(
+                    f"⚔️ 已写入 `active_skills`：`{sid}`\n"
+                    f"配置总线：{'✅' if ok_m else '❌'} {msg_m}"
+                )
+                return
+
+            if intent == "WALLET_CLONE":
+                addr = row.get("extracted_address")
+                if not addr:
+                    await status_msg.edit_text("未识别到有效的 0x 钱包地址。")
+                    return
+                await status_msg.edit_text(
+                    "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
+                )
+                _gw_schedule(
+                    application,
+                    process_wallet_clone_task(
+                        bot=context.bot,
+                        chat_id=update.message.chat_id,
+                        wallet_address=str(addr),
+                        timeout_sec=600,
+                        min_interval_sec=3.0,
+                    ),
+                )
+                return
+
+            if intent == "AUTO_DEV":
+                req = (row.get("extracted_requirement") or "").strip() or text
+                sub_intent = row.get("sub_intent")
+                await status_msg.edit_text(
+                    "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
+                )
+                _gw_schedule(
+                    application,
+                    process_dev_task(
+                        bot=context.bot,
+                        chat_id=update.message.chat_id,
+                        prompt=req,
+                        timeout_sec=600,
+                        min_interval_sec=3.0,
+                        sub_intent=sub_intent,
+                    ),
+                )
+                maybe_mount_skill_after_auto_dev(text, req)
+                return
+
+            if intent == "TRADE":
+                await status_msg.edit_text(MOE_DEBATE_ACK)
+                schedule_trade_moe_nonblocking(
+                    application,
+                    context.bot,
+                    update.message.chat_id,
+                    text,
+                    uid=uid,
+                    user_mode=USER_MODE,
+                )
+                return
+
+            reply, err = await chat_reply(text, uid=uid)
+            if err:
+                await status_msg.edit_text(f"（模型不可用：{err[:800]}）")
+                return
+            final = (reply or "").strip()
+            if not final:
+                final = (
+                    "（Jarvis 未返回可展示的正文；请检查模型配置或稍后重试。）"
+                )
+            await status_msg.edit_text(final[:4096])
+    except Exception as e:
+        logger.exception("handle_plain_text failed uid=%s", uid)
+        err_reply = f"❌ 解析异常: {e!s}"[:4096]
+        try:
+            if status_msg is not None:
+                await status_msg.edit_text(err_reply)
+            else:
+                await update.message.reply_text(err_reply)
+        except Exception:
+            try:
+                await update.message.reply_text(err_reply)
+            except Exception:
+                pass
+
+
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """非命令纯文本 → Jarvis。"""
     if not update.effective_user or not update.message:
         return
     uid = update.effective_user.id
@@ -413,101 +607,21 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text = (update.message.text or "").strip()
     if not text:
         return
-    # 斜杠指令必须由 CommandHandler 处理；此处杜绝误入 Jarvis 语义层（含漏注册或边界情况）
-    if text.startswith("/"):
+    await _jarvis_semantic_route(update, context, uid=uid)
+
+
+async def handle_slash_as_semantic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """除 /start、/trade、/t 外，其余斜杠整段交给 Jarvis（与纯文本同路由）。"""
+    if not update.effective_user or not update.message:
         return
-
-    from gateway.jarvis_semantic import (
-        chat_reply,
-        classify_intent,
-        execute_trade_from_user_text,
-        user_semantic_lock,
-    )
-
-    store = await _session_store_async(context.application)
-    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
-    application = context.application
-
-    async with user_semantic_lock(uid):
-        row = await classify_intent(text, uid=uid)
-        intent = str(row.get("intent") or "CHAT").upper()
-        logger.debug(
-            "jarvis_route uid=%s intent=%s sub=%s reasoning=%s",
-            uid,
-            intent,
-            row.get("sub_intent"),
-            row.get("reasoning"),
-        )
-
-        if intent == "CHAOS_IMMUNITY":
-            await update.message.reply_text(
-                "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
-                "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
-            )
-            _gw_schedule(
-                application,
-                process_chaos_immunity_task(
-                    bot=context.bot,
-                    chat_id=update.message.chat_id,
-                    uid=uid,
-                    dev_timeout_sec=900,
-                    min_interval_sec=3.0,
-                ),
-            )
-            return
-
-        if intent == "WALLET_CLONE":
-            addr = row.get("extracted_address")
-            if not addr:
-                await update.message.reply_text("未识别到有效的 0x 钱包地址。")
-                return
-            await update.message.reply_text(
-                "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
-            )
-            _gw_schedule(
-                application,
-                process_wallet_clone_task(
-                    bot=context.bot,
-                    chat_id=update.message.chat_id,
-                    wallet_address=str(addr),
-                    timeout_sec=600,
-                    min_interval_sec=3.0,
-                ),
-            )
-            return
-
-        if intent == "AUTO_DEV":
-            req = (row.get("extracted_requirement") or "").strip() or text
-            sub_intent = row.get("sub_intent")
-            await update.message.reply_text(
-                "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
-            )
-            _gw_schedule(
-                application,
-                process_dev_task(
-                    bot=context.bot,
-                    chat_id=update.message.chat_id,
-                    prompt=req,
-                    timeout_sec=600,
-                    min_interval_sec=3.0,
-                    sub_intent=sub_intent,
-                ),
-            )
-            return
-
-        if intent == "TRADE":
-            _ok, msg = await execute_trade_from_user_text(
-                text, uid=uid, user_mode=USER_MODE
-            )
-            await update.message.reply_text(msg[:4096])
-            return
-
-        reply, err = await chat_reply(text, uid=uid)
-        if err:
-            await update.message.reply_text(f"（模型不可用：{err[:800]}）")
-            return
-        if reply:
-            await update.message.reply_text(reply[:4096])
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        return
+    mark_gateway_user_activity()
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    await _jarvis_semantic_route(update, context, uid=uid)
 
 
 async def handle_gateway_callback(
@@ -566,9 +680,13 @@ class TelegramBot:
             .post_shutdown(_gw_post_shutdown)
             .build()
         )
-        # CommandHandler 必须在全局 MessageHandler 之前注册，保证斜杠指令绝对优先
+        # CommandHandler 仅 /start /trade；其它斜杠由 Jarvis 语义层处理（与纯文本同路径）
+        from gateway.handlers.router import NON_START_TRADE_SLASH
+
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("trade", cmd_trade))
+        app.add_handler(CommandHandler("t", cmd_trade))
+        app.add_handler(MessageHandler(NON_START_TRADE_SLASH, handle_slash_as_semantic))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text)
         )

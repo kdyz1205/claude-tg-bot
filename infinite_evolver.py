@@ -812,7 +812,7 @@ async def _run_subprocess_backtest_async(script_path: str, data_snapshot: list) 
             "error": f"asyncio timeout (>{get_heavy_async_timeout_sec()}s, evolver fuse)",
         }
 
-_SHARPE_THRESHOLD = 1.5       # minimum annualised Sharpe to promote a strategy
+_SHARPE_THRESHOLD = 1.2       # minimum annualised Sharpe to promote + deploy (battlefield)
 # Backtest wall clock: env EVOLVER_BACKTEST_TIMEOUT (default 30s via evolver_firewall)
 _SKILL_LIB_INDEX = BASE / ".skill_library" / "index.json"
 _SKILL_LIB_SKILLS = BASE / ".skill_library" / "skills"
@@ -1361,15 +1361,28 @@ class InfiniteEvolver:
             _apply_strategy_params_to_agent_state(mutant)
             _touch_evolve_state_gene_event("v6_promoted", f"sharpe={sharpe:.3f}")
 
+            brain_path = str(BASE / "trading" / "strategy_brain.py")
+            try:
+                from pipeline.god_orchestrator import GOD_ORCHESTRATOR
+
+                GOD_ORCHESTRATOR.hot_swap_skill(skill_id)
+                GOD_ORCHESTRATOR.reload_skills()
+            except Exception:
+                log.debug("V6 god hot_swap/reload skipped", exc_info=True)
+            try:
+                from auto_research import send_battlefield_telegram_notice
+
+                send_battlefield_telegram_notice(f"{skill_id}.py", float(sharpe))
+            except Exception:
+                pass
             msg = (
-                f"✅ V6 Mutant Promoted: `{skill_id}`\n"
-                f"  Sharpe={sharpe:.2f} | Return={result.get('total_return_pct',0):.1f}%\n"
-                f"  Params: {', '.join(f'{k}={mutant[k]}' for k in to_mutate)}"
+                f"✅ V6 Mutant Promoted: `{skill_id}` | Sharpe={sharpe:.2f} | "
+                f"Params: {', '.join(f'{k}={mutant[k]}' for k in to_mutate)}"
             )
-            log.info(msg)
+            log.info("%s", msg)
             if self._send:
                 try:
-                    await self._send(msg)
+                    await self._send(msg[:3900])
                 except Exception:
                     pass
 
@@ -1478,15 +1491,29 @@ class InfiniteEvolver:
             genetics["sharpe_history"] = hist[-_SHARPE_HISTORY_CAP:]
             _save_genetics(genetics)
             _touch_evolve_state_gene_event("codegen_promoted", f"sharpe={sharpe:.3f}")
-            msg = (
-                f"✅ 策略晋升: `{skill_id}`\n"
-                f"  Sharpe={sharpe:.2f} | Return={backtest.get('total_return_pct',0):.1f}%"
-                f" | DD={backtest.get('max_drawdown_pct',0):.1f}%"
+            def _run_deploy() -> tuple[bool, str]:
+                from auto_research import deploy_to_battlefield
+
+                return deploy_to_battlefield(
+                    script_path,
+                    skill_id=skill_id,
+                    title=hypothesis[:80],
+                    user_request=hypothesis,
+                    sharpe=float(sharpe),
+                    send_telegram=True,
+                )
+
+            ok_dep, dep_msg = await _asyncio.to_thread(_run_deploy)
+            log.info(
+                "codegen deploy_to_battlefield ok=%s %s",
+                ok_dep,
+                dep_msg[:200],
             )
-            log.info(msg)
-            if self._send:
+            if self._send and not ok_dep:
                 try:
-                    await self._send(msg)
+                    await self._send(
+                        f"⚠️ 晋升成功但部署失败: `{skill_id}` — {dep_msg}"[:3900]
+                    )
                 except Exception:
                     pass
 

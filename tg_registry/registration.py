@@ -1,8 +1,8 @@
 """
 Declarative mapping: Telegram command name(s) → handler attribute name on bot.py.
 
-Blueprint purge: **only** ``/start`` and ``/trade`` are registered. All other behavior
-must enter through ``jarvis_plain_text_entry`` → ``gateway.jarvis_semantic``.
+Blueprint：仅 ``/start``、``/trade``、``/t`` 注册为 CommandHandler；其余斜杠由
+``jarvis_plain_text_entry`` → Jarvis 语义层处理。
 """
 
 from __future__ import annotations
@@ -11,14 +11,10 @@ from typing import Any, Callable
 
 from telegram.ext import Application, CommandHandler
 
-# (command names..., handler_dict_key) — physical surface = 2 commands only
 COMMAND_BINDINGS: list[tuple[tuple[str, ...], str]] = [
     (("start",), "jarvis_start"),
-    (("trade",), "jarvis_trade"),
+    (("trade", "t"), "jarvis_trade"),
 ]
-
-# Kept empty for backward-compatible imports; train_* handlers are removed.
-TRAIN_COMMAND_SUFFIXES: tuple[str, ...] = ()
 
 
 def register_command_handlers(
@@ -26,7 +22,7 @@ def register_command_handlers(
     auth_filter: Any,
     handlers: dict[str, Callable[..., Any]],
 ) -> None:
-    """Wire slash commands from COMMAND_BINDINGS only (no train_* aliases)."""
+    """Wire commands from COMMAND_BINDINGS only."""
     missing = [key for _, key in COMMAND_BINDINGS if key not in handlers]
     if missing:
         raise RuntimeError(

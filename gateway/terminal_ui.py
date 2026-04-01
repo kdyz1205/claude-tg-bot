@@ -4,7 +4,7 @@ address interceptor, and Telegram API throttling.
 
 Slash menu与可选 ``auto_research`` 后台与面板共用 ``gateway.gateway_lifecycle``（
 ``GATEWAY_AUTO_RESEARCH`` / ``GATEWAY_AUTO_RESEARCH_NOTIFY_CHAT_ID``）。
-全局命令（group -2）：仅 ``/trade``（复用 ``telegram_bot`` 处理器）；``/start`` 为会话入口。
+全局命令（group -2）：仅 ``/trade``（复用 ``telegram_bot``）；会话内 ``/start`` 为入口。
 
 Callback routing (prefix ``term:`` to avoid clashes with bot.py):
   term:main_menu

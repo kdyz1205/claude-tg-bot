@@ -25,8 +25,8 @@ import claude_agent
 import bridge
 from tg_registry import (
     START_FOOTER_COMMANDS,
+    get_core_menu_commands,
     register_command_handlers,
-    telegram_menu_bot_commands,
 )
 from safety import handle_confirmation_callback
 import psutil  # for health/system checks
@@ -3101,7 +3101,14 @@ async def trade_dashboard_command(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
 
-    text = await _build_trading_dashboard()
+    try:
+        text = await asyncio.wait_for(_build_trading_dashboard(), timeout=75.0)
+    except asyncio.TimeoutError:
+        await _safe_reply(
+            update.message,
+            "⏳ /trade 面板数据拉取超时（75s）。请稍后重试，或先开 /chain 点刷新。",
+        )
+        return
     if okx_lines:
         text = "\n".join(okx_lines) + "\n\n" + text
     kb = _build_dashboard_keyboard()
@@ -3603,7 +3610,16 @@ async def chain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid = update.effective_user.id if update.effective_user else None
-    await _reply_chain_dashboard_multipart(update.message, context, uid)
+    try:
+        await asyncio.wait_for(
+            _reply_chain_dashboard_multipart(update.message, context, uid),
+            timeout=90.0,
+        )
+    except asyncio.TimeoutError:
+        await _safe_reply(
+            update.message,
+            "⏳ /chain 面板生成超时（90s）。请点本条下的 🔄 刷新或稍后重试。",
+        )
 
 
 async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8238,6 +8254,13 @@ def _telegram_command_handlers():
     }
 
 
+async def handle_slash_as_natural_language(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """除 /start、/trade、/t 外，其余斜杠交给 Jarvis 文本总线（与蓝图一致）。"""
+    await jarvis_plain_text_entry(update, context)
+
+
 def create_application():
     app = (
         ApplicationBuilder()
@@ -8258,6 +8281,12 @@ def create_application():
     app.add_error_handler(error_handler)
 
     register_command_handlers(app, auth_filter, _telegram_command_handlers())
+    _slash_non_core = filters.COMMAND & ~filters.Regex(
+        r"(?i)^\s*/(start|trade|t)(@[\w_]+)?(\s|$)"
+    )
+    app.add_handler(
+        MessageHandler(auth_filter & _slash_non_core, handle_slash_as_natural_language)
+    )
 
     # Jarvis 主控台 inline 按钮（gw:*）— 唯一保留的 Callback 表面
     import re as _re_gw
@@ -8299,7 +8328,7 @@ def create_application():
     async def post_init(application):
         # Register commands FIRST (before any background tasks that might fail)
         try:
-            await application.bot.set_my_commands(telegram_menu_bot_commands())
+            await application.bot.set_my_commands(get_core_menu_commands())
             logger.info("Bot commands registered with Telegram")
         except Exception as e:
             logger.error(f"Failed to set bot commands: {e}")
@@ -8552,6 +8581,12 @@ def create_application():
                     except Exception:
                         pass
                 _smart_tracker._send = _smart_send
+                try:
+                    import live_trader
+
+                    live_trader.install_smart_money_copy_trade_bridge()
+                except Exception as _sm_bridge_e:
+                    logger.warning("Smart money copy-trade bridge: %s", _sm_bridge_e)
                 await _smart_tracker.start()
                 logger.info("SmartMoneyTracker started")
         except Exception as e:

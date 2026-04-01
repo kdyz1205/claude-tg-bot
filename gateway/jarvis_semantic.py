@@ -5,6 +5,9 @@ Heuristic intent first; optional ``JARVIS_INTENT_LLM=1`` + OpenAI/Anthropic recl
 messages that would otherwise be CHAT (small JSON classification call).
 
 v2: broader quant / 造物 routing, secondary spec detector, ``reasoning`` on every path.
+
+CHAT 对话走 ``llm_http_client.complete_turn``；可选 ``JARVIS_CHAT_MODEL``、
+``JARVIS_CHAT_TIMEOUT_SEC``（秒，默认参考 ``config.API_REQUEST_TIMEOUT_SEC``）。
 """
 
 from __future__ import annotations
@@ -66,6 +69,13 @@ _WALLET_CLONE_HINT = re.compile(
 _CHAOS_IMMUNITY_HINT = re.compile(
     r"(启动混沌测试|混沌测试|混沌猴|抗压免疫|系统级抗压|灾难演练|"
     r"chaos\s*test|resilience\s*test)",
+    re.I,
+)
+
+# 配置总线：改写 session_commander_config.json 白名单键 + 炼丹入队
+_LAB_EVOLVER_HINT = re.compile(
+    r"(启动炼丹|开始炼丹|启动进化|无限进化|跑\s*evolver|infinite\s*evolver|科研\s*挂机|"
+    r"开\s*实验室)",
     re.I,
 )
 
@@ -205,6 +215,80 @@ async def _llm_refine_intent_after_chat_heuristic(text: str, *, uid: int) -> dic
 _locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
+def try_config_bus_intent(text: str) -> dict[str, Any] | None:
+    """配置总线 + 炼丹入队；挂载策略时写 ``active_skills``。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    patch: dict[str, Any] = {}
+    if re.search(
+        r"(启用|打开|开启).{0,20}jarvis\s*自动消费|自动消费\s*(打开|启用|开|on)",
+        t,
+        re.I,
+    ):
+        patch["jarvis_auto_consume"] = True
+    elif re.search(
+        r"(禁用|关闭).{0,20}jarvis\s*自动消费|自动消费\s*(关|关闭|off)",
+        t,
+        re.I,
+    ):
+        patch["jarvis_auto_consume"] = False
+    if re.search(
+        r"(开启|打开)\s*dry\s*run|dry\s*run\s*on|演练模式|只记录不点|干跑",
+        t,
+        re.I,
+    ):
+        patch["dry_run"] = True
+    elif re.search(
+        r"(关闭|取消)\s*dry\s*run|dry\s*run\s*off|真实点击|实盘操作",
+        t,
+        re.I,
+    ):
+        patch["dry_run"] = False
+    if re.search(r"(清空雷达技能|取消挂载|雷达\s*默认|不用固定技能)", t, re.I):
+        patch["active_skills"] = []
+    elif re.search(
+        r"(挂载|切换|雷达|使用技能|固定技能|运行策略|执行策略|用上)", t, re.I
+    ):
+        m = re.search(r"\b(sk_[a-zA-Z0-9_]{4,})\b", t)
+        if m:
+            patch["active_skills"] = [m.group(1)]
+    lab_prompt: str | None = None
+    if _LAB_EVOLVER_HINT.search(t):
+        lab_prompt = t[:2000]
+    if patch or lab_prompt is not None:
+        return {
+            "intent": "CONFIG_BUS",
+            "config_patch": patch,
+            "lab_prompt": lab_prompt,
+            "reasoning": "config_bus_keywords",
+        }
+    return None
+
+
+def update_config_active_skill(skill_name: str | None) -> tuple[bool, str]:
+    """覆写 ``active_skills`` 并触发 God ``reload_skills``（经 config_bus）。"""
+    from gateway.config_bus import apply_safe_config_patch
+
+    name = (skill_name or "").strip()
+    if name:
+        return apply_safe_config_patch({"active_skills": [name]})
+    return apply_safe_config_patch({"active_skills": []})
+
+
+def maybe_mount_skill_after_auto_dev(text: str, req: str) -> tuple[bool, str]:
+    """AUTO_DEV 语义里若明确要求挂载某 ``sk_*``，实权写入配置。"""
+    blob = f"{(text or '').strip()}\n{(req or '').strip()}"
+    if not re.search(
+        r"(部署|挂载|实盘运行|切换为|用此策略).{0,24}sk_", blob, re.I
+    ):
+        return False, "skip"
+    m = re.search(r"\b(sk_[a-zA-Z0-9_]{4,})\b", blob)
+    if not m:
+        return False, "no_skill_id"
+    return update_config_active_skill(m.group(1))
+
+
 def user_semantic_lock(uid: int) -> asyncio.Lock:
     return _locks[int(uid)]
 
@@ -236,6 +320,9 @@ def _looks_like_quant_algorithm_spec(t: str) -> bool:
 
 async def classify_intent(text: str, *, uid: int) -> dict[str, Any]:
     t = (text or "").strip()
+    _cb = try_config_bus_intent(t)
+    if _cb is not None:
+        return _cb
     if _CHAOS_IMMUNITY_HINT.search(t):
         return {
             "intent": "CHAOS_IMMUNITY",
@@ -249,6 +336,17 @@ async def classify_intent(text: str, *, uid: int) -> dict[str, Any]:
             "extracted_requirement": t,
             "reasoning": "regex_wallet_clone_with_address",
         }
+    if re.search(r"(运行|执行|切换为|用上).{0,12}", t, re.I) and re.search(
+        r"\bsk_[a-zA-Z0-9_]{4,}\b", t, re.I
+    ):
+        m = re.search(r"\b(sk_[a-zA-Z0-9_]{4,})\b", t)
+        if m:
+            return {
+                "intent": "RUN_SKILL",
+                "skill_id": m.group(1),
+                "extracted_requirement": t,
+                "reasoning": "regex_run_skill_mount",
+            }
     if _FACTOR_FORGE_HINT.search(t):
         return {
             "intent": "AUTO_DEV",
@@ -313,12 +411,87 @@ async def execute_trade_from_user_text(
     return False, "请在主机器人或专用交易流程中下单；网关面板仅展示与引擎控制。"
 
 
+# 网关日常对话：经 llm_http_client.complete_turn（aiohttp，与 agents/sessions 同栈）
+_JARVIS_CHAT_SYSTEM = """你是 Jarvis，长官的专属高频量化作战副官。
+
+风格（强制）：
+- 极度冷酷、专业、极简；华尔街宽客 / systematic desk 口吻。
+- 拒绝废话、拒绝寒暄、拒绝堆叠表情符号（非必要不用）。
+- 长官用中文提问时，用中文作答；英文则英文。保持同一冷峻密度。
+- 不编造实时行情或持仓；无依据时直说「无数据 / 未接入」。
+- 涉及下单、实盘执行时提醒：以主控交易流与风控为准，网关对话不构成指令。
+
+回答长度默认控制在必要最小；若长官明确要求深度推演再展开。"""
+
+_JARVIS_CHAT_ERR_USER = "LLM 节点连接失败或超时"
+
+# 与 agents.sessions 的 8_000_000+ 虚拟 id 错开，按 Telegram uid 稳定映射多轮记忆
+_JARVIS_GW_CHAT_BASE = 71_000_000
+_JARVIS_GW_CHAT_MOD = 89_000_000
+
+
+def _jarvis_gateway_chat_id(uid: int) -> int:
+    return _JARVIS_GW_CHAT_BASE + (abs(int(uid)) % _JARVIS_GW_CHAT_MOD)
+
+
+def _jarvis_chat_timeout_sec() -> float:
+    try:
+        raw = (os.environ.get("JARVIS_CHAT_TIMEOUT_SEC") or "").strip()
+        if raw:
+            return max(15.0, min(600.0, float(raw)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        import config
+
+        return max(30.0, float(getattr(config, "API_REQUEST_TIMEOUT_SEC", 120.0)))
+    except Exception:
+        return 120.0
+
+
 async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
-    if llm_backend_configured():
-        return "", "未接入对话模型实现（仅意图路由）；请用 /dev 或看板按钮。"
-    return (
-        "💬 已收到。若你在描述**交易逻辑、因子或策略**（含公式、阈值、论文复现），"
-        "可直接写长一点并带指标名/回测等关键词，Jarvis 会路由到造物引擎；"
-        "也可 `/dev <需求>`。配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 后可扩展对话能力。",
-        "",
-    )
+    """
+    网关 CHAT 意图：真实 LLM 一轮（带 per-uid HTTP 会话记忆）。
+
+    成功: (reply_text, "")
+    失败: ("", _JARVIS_CHAT_ERR_USER) — 细节只写日志，交给外层展示统一文案。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+
+    import llm_http_client
+
+    chat_id = _jarvis_gateway_chat_id(uid)
+    model_hint = (os.environ.get("JARVIS_CHAT_MODEL") or "").strip() or None
+
+    try:
+        assistant_text, _sid, err = await llm_http_client.complete_turn(
+            chat_id=chat_id,
+            system_prompt=_JARVIS_CHAT_SYSTEM,
+            user_text=t[:120_000],
+            model_hint=model_hint,
+            timeout_sec=_jarvis_chat_timeout_sec(),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("jarvis chat_reply asyncio.TimeoutError uid=%s", uid)
+        return "", _JARVIS_CHAT_ERR_USER
+    except Exception as e:
+        logger.exception("jarvis chat_reply transport uid=%s: %s", uid, e)
+        return "", _JARVIS_CHAT_ERR_USER
+
+    if err:
+        logger.warning(
+            "jarvis chat_reply LLM err uid=%s chat_id=%s: %s",
+            uid,
+            chat_id,
+            (err or "")[:800],
+        )
+        return "", _JARVIS_CHAT_ERR_USER
+
+    out = (assistant_text or "").strip()
+    if not out:
+        logger.warning("jarvis chat_reply empty assistant uid=%s chat_id=%s", uid, chat_id)
+        return "", _JARVIS_CHAT_ERR_USER
+
+    return out, ""

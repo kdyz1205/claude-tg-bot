@@ -8,15 +8,14 @@ actual CommandHandler wiring.
 from tg_registry.catalog import (
     START_FOOTER_COMMANDS,
     format_help_message,
-    telegram_menu_bot_commands,
+    get_core_menu_commands,
 )
-from tg_registry.registration import COMMAND_BINDINGS, TRAIN_COMMAND_SUFFIXES, register_command_handlers
+from tg_registry.registration import COMMAND_BINDINGS, register_command_handlers
 
 __all__ = [
     "COMMAND_BINDINGS",
     "START_FOOTER_COMMANDS",
-    "TRAIN_COMMAND_SUFFIXES",
     "format_help_message",
+    "get_core_menu_commands",
     "register_command_handlers",
-    "telegram_menu_bot_commands",
 ]
