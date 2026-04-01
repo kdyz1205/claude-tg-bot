@@ -101,6 +101,16 @@ def _repo_root() -> Path:
 
 def get_snapshot() -> dict[str, Any]:
     """Thread-safe shallow+deep copy for readers (no network)."""
+    return get_local_cache()
+
+
+def get_local_cache() -> dict[str, Any]:
+    """
+    Synchronous read of the in-process RAM snapshot only.
+
+    Updated by ``run_background_loop`` (default interval 10s); no network, no Redis,
+    no ``refresh_once``. Use for Telegram fast paths that must stay sub-100ms.
+    """
     with _lock:
         snap = copy.deepcopy(_data)
     snap["age_sec"] = max(0.0, time.time() - float(snap.get("updated_at") or 0))
@@ -133,11 +143,9 @@ def try_snapshot_from_redis() -> dict[str, Any] | None:
 
 def get_latest_cache() -> dict[str, Any]:
     """
-    Strict **in-process** hot snapshot only: deepcopy of RAM cache, no Redis, no refresh.
-
-    Use for Telegram fast-path (持仓/余额) where sub-100ms response is required.
+    Alias of ``get_local_cache()`` — strict in-process hot snapshot, no Redis, no refresh.
     """
-    return get_snapshot()
+    return get_local_cache()
 
 
 def get_snapshot_for_gateway() -> dict[str, Any]:

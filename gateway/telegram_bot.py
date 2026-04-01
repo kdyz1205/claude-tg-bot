@@ -2,7 +2,7 @@
 Telegram Gateway — PTB：极简全自动看板。
 
 - 主入口：`/start`（MarkdownV2 + ``gw:*`` 回调）；交易类斜杠委托 ``bot.py`` 同名处理器。
-- UI 只读内存/文件缓存：快路径用 ``portfolio_snapshot.get_latest_cache()``（零网络）；
+- UI 只读内存/文件缓存：看板/速报快路径用 ``portfolio_snapshot.get_local_cache()``（零网络）；
   其它用 ``get_snapshot_for_gateway``、``trade_scheduler.read_scheduler_state``、
   ``live_trader.get_live_stats``；不在回调协程里
   ``await`` 链上或 OKX 实时拉取。重刷新通过后台 ``asyncio.create_task(refresh_once)`` 触发。
@@ -21,8 +21,8 @@ Telegram Gateway — PTB：极简全自动看板。
   ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
   配置总线：写 ``session_commander_config.json`` 的 ``active_skills``；God 引擎用 **watchdog** 监听 JSON 并 ``reload_skills``。
   斜杠：``/start`` 网关面板；``/trade``、``/t`` 委托 ``bot.trade_dashboard_command``。
-  其它 ``/…`` 与纯文本相同，默认走 Jarvis 语义路由；**FAST_ACTION_MAP** + **FAST_COMMANDS** 在 LLM 与 ``chat_reply`` 之前拦截：
-  中文「卖出/买入/下单…」→ ``/trade`` 面板；「持仓/余额/状态/面板…」→ ``render_dashboard_text``；「刷新…」→ 后台 ``refresh_once`` 后同看板；斜杠 ``/trade``、``/t``、``/portfolio``、``/status``、``/refresh`` 同理。
+  其它 ``/…`` 与纯文本相同，默认走 Jarvis 语义路由；**FAST_MAP**（语义路由最前）+ **FAST_COMMANDS** 在 LLM 与 ``chat_reply`` 之前拦截：
+  中文「卖出/买入/下单…」→ ``/trade`` 面板；「持仓/资产/余额/面板…」→ ``render_dashboard_text``（内存 ``get_local_cache()``）；「状态/监控」→ ``render_status_brief_text``；「刷新…」→ 仅后台 ``refresh_once``，面板仍读缓存；斜杠同理。``FAST_MAP`` 在 ``_jarvis_semantic_route`` 最前硬匹配，**不经** ``classify_intent``。
 
 Run:   python -m gateway.telegram_bot
 """
@@ -63,6 +63,7 @@ from gateway.tg_front import (
     escape_v2,
     render_dashboard_plain_text,
     render_dashboard_text,
+    render_status_brief_text,
     render_manual_hub_text,
     render_okx_lab_text,
     render_onchain_hub_text,
@@ -143,21 +144,52 @@ _FAST_TRADE_CN: tuple[tuple[str, str], ...] = (
     ("极速交易", "trade_panel"),
 )
 
-# 看板：``dashboard`` = 快照看板；``refresh_dashboard`` = 后台 refresh_once 后再渲染
+# Jarvis 入口最前硬匹配：不经 LLM / classify_intent（与 ``_resolve_fast_action`` 语义一致）
+FAST_MAP: dict[str, tuple[str, ...]] = {
+    "dashboard": ("持仓", "资产", "余额", "/portfolio"),
+    "status_brief": ("状态", "监控", "/status"),
+}
+
+
+def _jarvis_fast_map_match(text: str) -> str | None:
+    """
+    Return ``dashboard`` | ``status_brief`` | ``None``.
+    Portfolio keys are checked before status so e.g.「资产状态」→ 看板。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+    parts = low.split()
+    head = parts[0] if parts else low
+
+    for action, needles in (
+        ("dashboard", FAST_MAP["dashboard"]),
+        ("status_brief", FAST_MAP["status_brief"]),
+    ):
+        for n in needles:
+            if n.startswith("/"):
+                nl = n.lower()
+                if head == nl or head.startswith(f"{nl}@"):
+                    return action
+            elif n in raw:
+                return action
+    return None
+
+
+# 看板：``dashboard`` = 快照看板；``status_brief`` = 状态速报；``refresh_dashboard`` = 仅后台 refresh_once
 FAST_COMMANDS: dict[str, tuple[str, ...]] = {
     "refresh_dashboard": ("刷新", "刷新资产", "重载快照", "更新快照", "/refresh"),
+    "status_brief": ("状态", "监控"),
     "dashboard": (
         "持仓",
         "仓位",
         "余额",
         "资产",
-        "状态",
-        "监控",
         "面板",
         "看板",
         "主控",
         "/portfolio",
-        "/status",
         "/panel",
     ),
 }
@@ -165,7 +197,7 @@ FAST_COMMANDS: dict[str, tuple[str, ...]] = {
 
 def _resolve_fast_action(text: str) -> str | None:
     """
-    Return ``trade_panel`` | ``refresh_dashboard`` | ``dashboard`` | ``None``.
+    Return ``trade_panel`` | ``refresh_dashboard`` | ``dashboard`` | ``status_brief`` | ``None``.
     刷新优先于看板子串；交易子串在刷新之后、看板之前。斜杠支持 ``@botname``。
     """
     raw = (text or "").strip()
@@ -181,9 +213,9 @@ def _resolve_fast_action(text: str) -> str | None:
         return "trade_panel"
     if "/refresh" in low or head.startswith("/refresh"):
         return "refresh_dashboard"
+    if head in ("/status",) or head.startswith("/status@"):
+        return "status_brief"
     if "/portfolio" in low or head.startswith("/portfolio"):
-        return "dashboard"
-    if "/status" in low or head.startswith("/status"):
         return "dashboard"
     if "/panel" in low or head.startswith("/panel"):
         return "dashboard"
@@ -198,6 +230,13 @@ def _resolve_fast_action(text: str) -> str | None:
     for needle, action in _FAST_TRADE_CN:
         if needle in raw:
             return action
+
+    for sub in FAST_COMMANDS["status_brief"]:
+        if sub.startswith("/"):
+            if sub.lower() in low:
+                return "status_brief"
+        elif sub in raw:
+            return "status_brief"
 
     for sub in FAST_COMMANDS["dashboard"]:
         if sub.startswith("/"):
@@ -597,7 +636,7 @@ def _dashboard_sync_fast_path() -> tuple[dict, dict, dict]:
 
     import live_trader
 
-    snap = portfolio_snapshot.get_latest_cache()
+    snap = portfolio_snapshot.get_local_cache()
     st = trade_scheduler.read_scheduler_state()
     stats = live_trader.get_live_stats()
     return snap, st, stats
@@ -610,7 +649,7 @@ async def _dispatch_fast_action(
     uid: int,
     action: str,
 ) -> None:
-    """Execute fast path: trade panel or ``render_dashboard_text`` (no Jarvis ``chat_reply``)."""
+    """Execute fast path: trade panel / 看板 / 速报（无 Jarvis ``chat_reply`` / ``classify_intent``）。"""
     mark_gateway_user_activity()
     global USER_MODE
     store = await _session_store_async(context.application)
@@ -628,16 +667,17 @@ async def _dispatch_fast_action(
         except Exception:
             logger.exception("fast path refresh_once enqueue")
 
-    if action not in ("refresh_dashboard", "dashboard"):
+    if action not in ("refresh_dashboard", "dashboard", "status_brief"):
         return
 
-    # 持仓/余额/面板：只读内存热缓存；刷新类仅后台排队 refresh，仍立即用旧缓存渲染（零等待）
+    # 只读 ``get_local_cache()``；刷新类仅后台排队 refresh_once，主流程不 await 拉链上/OKX
     snap, st, stats = _dashboard_sync_fast_path()
     try:
-        from gateway.tg_front import build_dashboard_keyboard, render_dashboard_text
-
-        body = render_dashboard_text(USER_MODE, snap, st, stats)
         kb = build_dashboard_keyboard(bool(st.get("active")))
+        if action == "status_brief":
+            body = render_status_brief_text(USER_MODE, snap, st, stats)
+        else:
+            body = render_dashboard_text(USER_MODE, snap, st, stats)
         await update.message.reply_text(
             body,
             reply_markup=kb,
@@ -994,6 +1034,15 @@ async def _jarvis_semantic_route(
     if not text:
         return
 
+    # FAST_MAP：脊髓反射，禁止进入 classify_intent / 任何 LLM
+    jm = _jarvis_fast_map_match(text)
+    if jm == "dashboard":
+        await _dispatch_fast_action(update, context, uid=uid, action="dashboard")
+        return
+    if jm == "status_brief":
+        await _dispatch_fast_action(update, context, uid=uid, action="status_brief")
+        return
+
     # 看板 / 主控：整句命中即走快路径，禁止进入意图分类或 LLM
     if text in ("看板", "主控"):
         await _dispatch_fast_action(update, context, uid=uid, action="dashboard")
@@ -1335,7 +1384,7 @@ def main() -> None:
         len(token),
     )
     logger.info(
-        "Fast Path Initialized: FAST_COMMANDS (dashboard/refresh) + trade_panel triggers active."
+        "Fast Path Initialized: FAST_MAP + FAST_COMMANDS (dashboard/status_brief/refresh) + trade_panel."
     )
 
     if mode in ("terminal", "bloomberg", "conv", "state"):

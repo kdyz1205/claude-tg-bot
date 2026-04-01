@@ -532,7 +532,7 @@ def render_home_text(mode: str) -> str:
     except ImportError:
         live_trader = None  # type: ignore[misc, assignment]
 
-    snap = portfolio_snapshot.get_latest_cache()
+    snap = portfolio_snapshot.get_local_cache()
     st = trade_scheduler.read_scheduler_state()
     stats = live_trader.get_live_stats() if live_trader else {}
     return render_dashboard_text(mode, snap, st, stats)
