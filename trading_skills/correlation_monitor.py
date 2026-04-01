@@ -792,3 +792,14 @@ class CorrelationHedgeMonitor:
             f"CorrelationHedgeMonitor(lookback={self.lookback}, "
             f"symbols={loaded})"
         )
+
+
+def stat_arb_spread_signal(
+    close_a: np.ndarray,
+    close_b: np.ndarray,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """OLS log-price spread Z-score pair hint (delta-neutral legs); see ``trading.pairs_trading``."""
+    from trading.pairs_trading import pairs_trading_signal
+
+    return pairs_trading_signal(close_a, close_b, **kwargs)

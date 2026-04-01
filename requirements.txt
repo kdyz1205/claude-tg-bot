@@ -1,6 +1,7 @@
 # Core
 python-telegram-bot>=22.0
 python-dotenv>=1.0
+watchdog>=4.0
 
 # AI Providers (all optional - CLI mode doesn't need these)
 anthropic>=0.80.0

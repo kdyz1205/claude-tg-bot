@@ -325,7 +325,11 @@ async def _validate_token(mint: str, cfg: dict) -> tuple[bool, str]:
 # RISK CONTROLS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _check_risk_controls(amount_sol: float, cfg: dict) -> tuple[bool, str]:
+async def _check_risk_controls(
+    amount_sol: float,
+    cfg: dict,
+    signal_data: dict | None = None,
+) -> tuple[bool, str]:
     """Pre-trade risk check. Returns (allowed, reason)."""
     import secure_wallet
 
@@ -358,6 +362,14 @@ async def _check_risk_controls(amount_sol: float, cfg: dict) -> tuple[bool, str]
             max_trade = min(max_trade, float(cap))
         except (TypeError, ValueError):
             pass
+    try:
+        from trading.kelly_sizing import clamped_kelly_max_sol
+
+        kmax = clamped_kelly_max_sol(float(balance), cfg, signal_data=signal_data)
+        if kmax is not None and kmax > 0:
+            max_trade = min(max_trade, kmax)
+    except Exception:
+        pass
     if amount_sol > max_trade:
         return False, f"Trade {amount_sol:.4f} SOL > max {max_trade:.4f} SOL (pct {cfg.get('max_trade_pct', 15)}%{' + max_trade_sol cap' if cap is not None else ''})"
 
@@ -429,7 +441,7 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
         pass
 
     # Risk check
-    allowed, reason = await _check_risk_controls(amount_sol, cfg)
+    allowed, reason = await _check_risk_controls(amount_sol, cfg, signal_data)
     if not allowed:
         logger.warning(f"Trade blocked: {reason}")
         return None
@@ -471,6 +483,17 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
         val_cfg["min_liquidity_usd"] = max(
             float(val_cfg.get("min_liquidity_usd", 0) or 0),
             GOD_DEX_MIN_LIQUIDITY_USD,
+        )
+    if signal_data and signal_data.get("smart_money_copy"):
+        try:
+            val_cfg["min_liquidity_usd"] = float(
+                os.environ.get("SMART_MONEY_COPY_MIN_LIQ_USD")
+                or cfg.get("smart_money_copy_min_liq_usd", 25_000)
+            )
+        except (TypeError, ValueError):
+            val_cfg["min_liquidity_usd"] = 25_000.0
+        val_cfg["min_mcap_usd"] = float(
+            cfg.get("smart_money_copy_min_mcap_usd", 0) or 0
         )
 
     # Token safety check
@@ -1697,3 +1720,43 @@ def _symbol_to_mint(symbol: str) -> Optional[str]:
     if symbol in _MINT_MAP:
         return _MINT_MAP[symbol]
     return None
+
+
+def install_smart_money_copy_trade_bridge() -> None:
+    """
+    Register the async handler for ``trading.smart_money_copy_hook`` so consensus
+    signals can call :func:`buy_token` when ``SMART_MONEY_COPY_TRADE_ENABLED=1``.
+    Safe to call multiple times (re-registers the same handler).
+    """
+    from trading.smart_money_copy_hook import register_copy_trade_handler
+
+    async def _on_smart_money_consensus(
+        *,
+        contract: str,
+        token: str,
+        buys: list,
+        source: str = "",
+        **_: Any,
+    ) -> None:
+        mint = (contract or "").strip()
+        if not mint:
+            logger.warning("smart_money_copy: empty contract/mint, skip")
+            return
+        try:
+            amt = float(os.environ.get("SMART_MONEY_COPY_TRADE_SOL") or "0.1")
+        except (TypeError, ValueError):
+            amt = 0.1
+        if amt <= 0:
+            logger.debug("smart_money_copy: SMART_MONEY_COPY_TRADE_SOL <= 0, skip")
+            return
+        sig: dict[str, Any] = {
+            "smart_money_copy": True,
+            "source": source,
+            "smart_money_buys": buys,
+            "kelly_win_rate": float(os.environ.get("SMART_MONEY_COPY_KELLY_P") or 0.55),
+            "kelly_b": float(os.environ.get("SMART_MONEY_COPY_KELLY_B") or 1.2),
+        }
+        await buy_token(mint, amt, symbol=(token or "")[:32], signal_data=sig)
+
+    register_copy_trade_handler(_on_smart_money_consensus)
+    logger.info("smart_money_copy_trade_bridge: handler installed")

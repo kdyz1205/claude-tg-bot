@@ -3100,7 +3100,14 @@ async def trade_dashboard_command(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
 
-    text = await _build_trading_dashboard()
+    try:
+        text = await asyncio.wait_for(_build_trading_dashboard(), timeout=75.0)
+    except asyncio.TimeoutError:
+        await _safe_reply(
+            update.message,
+            "⏳ /trade 面板数据拉取超时（75s）。请稍后重试，或先开 /chain 点刷新。",
+        )
+        return
     if okx_lines:
         text = "\n".join(okx_lines) + "\n\n" + text
     kb = _build_dashboard_keyboard()
@@ -3602,7 +3609,16 @@ async def chain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid = update.effective_user.id if update.effective_user else None
-    await _reply_chain_dashboard_multipart(update.message, context, uid)
+    try:
+        await asyncio.wait_for(
+            _reply_chain_dashboard_multipart(update.message, context, uid),
+            timeout=90.0,
+        )
+    except asyncio.TimeoutError:
+        await _safe_reply(
+            update.message,
+            "⏳ /chain 面板生成超时（90s）。请点本条下的 🔄 刷新或稍后重试。",
+        )
 
 
 async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8262,6 +8278,21 @@ def _telegram_command_handlers():
     }
 
 
+async def handle_unknown_slash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """已注册 CommandHandler 未覆盖的斜杠：明确提示，避免「发了没反应」。"""
+    if not update.message or not update.effective_user:
+        return
+    if not _is_authorized(update.effective_user.id):
+        return
+    raw = (update.message.text or "").strip().split(maxsplit=1)
+    cmd = raw[0] if raw else ""
+    await _safe_reply(
+        update.message,
+        f"❓ `{cmd}` 未注册或已从菜单下线。当前有效列表见侧栏或发 /help。",
+        parse_mode="Markdown",
+    )
+
+
 def create_application():
     app = (
         ApplicationBuilder()
@@ -8282,6 +8313,7 @@ def create_application():
     app.add_error_handler(error_handler)
 
     register_command_handlers(app, auth_filter, _telegram_command_handlers())
+    app.add_handler(MessageHandler(auth_filter & filters.COMMAND, handle_unknown_slash_command))
 
     # Callbacks — panel first, then DEX trading, then session control, then quick actions, then safety confirmations
     app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
@@ -8622,6 +8654,12 @@ def create_application():
                     except Exception:
                         pass
                 _smart_tracker._send = _smart_send
+                try:
+                    import live_trader
+
+                    live_trader.install_smart_money_copy_trade_bridge()
+                except Exception as _sm_bridge_e:
+                    logger.warning("Smart money copy-trade bridge: %s", _sm_bridge_e)
                 await _smart_tracker.start()
                 logger.info("SmartMoneyTracker started")
         except Exception as e:

@@ -38,14 +38,19 @@ logger = logging.getLogger(__name__)
 # 全库唯一 CLI 飞行：禁止并发多个 claude-code 进程（内存与交互爆炸）
 CLI_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(1)
 
-# Windows/npm.cmd: argv for ``-p`` must stay small (~8k) or CreateProcess fails with
-# "The command line is too long." Long prompts spill to a temp file (see async_claude_code_prompt).
+# Windows CreateProcess: **entire** command line ≈ 8191 chars (exe path + every argv).
+# ``-p`` alone must be small; long prompts spill to a temp file (async_claude_code_prompt).
 _CLI_PROMPT_INLINE_MAX = int(
     os.environ.get(
         "CLAUDE_CLI_PROMPT_INLINE_MAX",
-        "6000" if os.name == "nt" else "24000",
+        "1200" if os.name == "nt" else "24000",
     )
 )
+
+
+def _estimate_windows_cmdline_chars(argv: list[str]) -> int:
+    """Rough character count for CreateProcess lpCommandLine budget (8191 limit)."""
+    return sum(len(a) + 3 for a in argv)
 
 # ─── Screenshot Forwarding ────────────────────────────────────────────────────
 
@@ -512,15 +517,16 @@ async def async_claude_code_prompt(
     if not Path(exe).is_file():
         return "", f"Claude CLI not found: {exe}", None
 
-    body = (prompt or "").strip()
-    if not body:
+    full_text = (prompt or "").strip()
+    if not full_text:
         return "", "empty prompt", None
 
     tmp_path: str | None = None
     try:
-        if len(body) > _CLI_PROMPT_INLINE_MAX:
-            import tempfile
+        import tempfile
 
+        body = full_text
+        if len(body) > _CLI_PROMPT_INLINE_MAX:
             fd, tmp_path = tempfile.mkstemp(
                 suffix=".txt", prefix="ca_cli_", text=True, dir=BOT_PROJECT_DIR
             )
@@ -531,20 +537,52 @@ async def async_claude_code_prompt(
                 f"File: {tmp_path}"
             )
 
-        args: list[str] = [
-            exe,
-            "-p",
-            body,
-            "--output-format",
-            "json",
-            "--dangerously-skip-permissions",
-        ]
         r = _normalize_cli_resume_id(resume)
-        if r:
-            args.extend(["--resume", r])
+
+        def _argv(p_inline: str) -> list[str]:
+            a = [
+                exe,
+                "-p",
+                p_inline,
+                "--output-format",
+                "json",
+                "--dangerously-skip-permissions",
+            ]
+            if r:
+                a.extend(["--resume", r])
+            return a
+
+        args = _argv(body)
+
+        # 8191 上限统计的是整条命令行；resume / 长 exe 路径可能让「已 spill」仍爆
+        if os.name == "nt" and _estimate_windows_cmdline_chars(args) > 7800:
+            if tmp_path is None:
+                fd2, tmp_path = tempfile.mkstemp(
+                    suffix=".txt", prefix="ca_cli_", text=True, dir=BOT_PROJECT_DIR
+                )
+                os.close(fd2)
+                Path(tmp_path).write_text(full_text, encoding="utf-8")
+            body = f"Read UTF-8 task: {tmp_path}"
+            args = _argv(body)
+            if _estimate_windows_cmdline_chars(args) > 7800:
+                short_dir = Path(os.environ.get("TEMP") or tempfile.gettempdir())
+                try:
+                    alt = short_dir / f"ca_{os.getpid()}_{int(time.time() * 1000) & 0xFFFF_FFFF:x}.txt"
+                    alt.write_text(full_text, encoding="utf-8")
+                    try:
+                        if tmp_path:
+                            os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    tmp_path = str(alt)
+                    body = f"Read UTF-8 task: {tmp_path}"
+                    args = _argv(body)
+                except OSError as e:
+                    logger.warning("async_claude_code_prompt: short-path spill failed: %s", e)
 
         wd = cwd or BOT_PROJECT_DIR
         proc: asyncio.subprocess.Process | None = None
+        out_b, err_b = b"", b""
         async with CLI_SEMAPHORE:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -569,6 +607,10 @@ async def async_claude_code_prompt(
                 )
                 await _kill_cli_subprocess(proc)
                 return "", f"timeout after {tlim}s", None
+            except Exception as e:
+                logger.exception("async_claude_code_prompt: communicate failed")
+                await _kill_cli_subprocess(proc)
+                return "", str(e)[:800], None
 
         err_tail = (err_b or b"").decode("utf-8", errors="replace")[-4000:]
         text, sid = _parse_claude_cli_stdout(out_b or b"")
