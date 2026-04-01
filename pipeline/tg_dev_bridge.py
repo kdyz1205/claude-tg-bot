@@ -7,9 +7,10 @@ default (see ``TG_DEV_USE_HTTP``). Pass ``on_stdout_line`` for live TG chunks.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pipeline.cli_bridge import (
     CliDevRunResult as TgDevRunResult,
@@ -18,11 +19,14 @@ from pipeline.cli_bridge import (
     run_claude_dev_prompt as run_dev_prompt,
 )
 
+_logger = logging.getLogger(__name__)
+
 __all__ = [
     "TgDevRunResult",
     "find_claude_executable",
     "format_telegram_report",
     "git_changed_files",
+    "process_dev_task",
     "run_dev_prompt",
     "run_dev_prompt_with_stream",
 ]
@@ -105,3 +109,42 @@ def format_telegram_report(result: TgDevRunResult) -> str:
     if len(text) > 4090:
         text = text[:4087] + "..."
     return text
+
+
+async def process_dev_task(
+    *,
+    bot: Any,
+    chat_id: int,
+    prompt: str,
+    cwd: Optional[Path] = None,
+    timeout_sec: Optional[int] = 600,
+    min_interval_sec: float = 3.0,
+) -> None:
+    """Run dev CLI in background task; use PTB ``application.create_task`` / ``create_task``."""
+
+    async def _stream_chunk(t: str) -> None:
+        try:
+            await bot.send_message(chat_id=chat_id, text=t[:4090])
+        except Exception as ex:
+            _logger.debug("process_dev_task stream chunk: %s", ex)
+
+    try:
+        result = await run_dev_prompt_with_stream(
+            prompt,
+            _stream_chunk,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            min_interval_sec=min_interval_sec,
+        )
+        if result.ok and result.modified_files:
+            text = "✅ 自动编程完成。您的代码库已被修改。"
+        else:
+            text = format_telegram_report(result)
+    except Exception as e:
+        _logger.exception("process_dev_task: %s", e)
+        text = f"❌ 桥接执行异常：{e!s}"
+    text = text[:4096]
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        _logger.warning("process_dev_task report send failed: %s", e)

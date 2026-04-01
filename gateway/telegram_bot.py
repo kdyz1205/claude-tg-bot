@@ -26,7 +26,11 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
+
+from pipeline.tg_dev_bridge import process_dev_task
 
 from gateway.tg_front import (
     GW_CB,
@@ -403,16 +407,8 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         chat_reply,
         classify_intent,
         execute_trade_from_user_text,
-        llm_backend_configured,
         user_semantic_lock,
     )
-
-    if not llm_backend_configured():
-        await update.message.reply_text(
-            "⚙️ 未配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY（或本地 Ollama），"
-            "Jarvis 无法调用意图模型。"
-        )
-        return
 
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
@@ -477,8 +473,10 @@ async def handle_gateway_callback(
     chat_id = query.message.chat_id
     message_id = query.message.message_id
 
-    asyncio.create_task(
-        _gw_panel_work(application, bot, chat_id, message_id, uid, parsed[0], parsed[1])
+    action, arg = parsed
+    _gw_schedule(
+        application,
+        _gw_panel_work(application, bot, chat_id, message_id, uid, action, arg),
     )
 
 
@@ -509,6 +507,9 @@ class TelegramBot:
         )
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("dev", cmd_dev))
+        app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text)
+        )
         pat = re.compile(rf"^{re.escape(GW_CB)}:")
         app.add_handler(CallbackQueryHandler(handle_gateway_callback, pattern=pat))
         return app
