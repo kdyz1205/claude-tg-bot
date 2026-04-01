@@ -8000,7 +8000,30 @@ async def handle_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ─── PID Lock (prevent dual instances) ────────────────────────────────────────
 
-_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.pid")
+
+def _get_pid_file() -> str:
+    """
+    One poller per Telegram bot token (跨 worktree / 多目录).
+
+    仅 ``bot.py`` 的 .bot.pid 无法阻止「主仓库 python run.py + 其它目录 python bot.py」
+    双进程抢 getUpdates；故用 token 哈希写入 LOCALAPPDATA（或 ~/.cache）。
+    """
+    import hashlib
+
+    tok = (getattr(config, "TELEGRAM_BOT_TOKEN", None) or "").strip()
+    if not tok or tok == "your_token_here":
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.pid")
+    digest = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16]
+    if sys.platform == "win32":
+        root = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or "."
+        base = os.path.join(root, "claude_tg_bot_locks")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".cache", "claude_tg_bot_locks")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, f"{digest}.pid")
 
 def _is_python_process(pid):
     """Check if PID is alive and is a Python process.
@@ -8044,13 +8067,15 @@ def _acquire_pid_lock():
     killed = False
     my_pid = os.getpid()
 
-    # 1. Check PID file
-    if os.path.exists(_PID_FILE):
+    pid_file = _get_pid_file()
+
+    # 1. Check global PID file (same token, any entry point / 目录)
+    if os.path.exists(pid_file):
         try:
-            with open(_PID_FILE, "r", encoding="utf-8") as _pf:
+            with open(pid_file, "r", encoding="utf-8") as _pf:
                 old_pid = int(_pf.read().strip())
             if old_pid != my_pid and _is_python_process(old_pid):
-                logger.warning(f"Killing previous bot instance (PID {old_pid})")
+                logger.warning(f"Killing previous bot instance (PID {old_pid}) from lock {pid_file}")
                 print(f"Killing previous bot instance (PID {old_pid})")
                 try:
                     if sys.platform == "win32":
@@ -8066,22 +8091,31 @@ def _acquire_pid_lock():
         except (ValueError, IOError):
             pass
 
-    # 2. Scan for orphan bot.py processes (belt and suspenders)
+    # 2. Scan for orphan pollers: bot.py、run.py、gateway（同仓库路径特征）
     if sys.platform == "win32":
         try:
             import subprocess as _sp3
+            ps = (
+                "$me=" + str(my_pid) + "; "
+                "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                "Where-Object { "
+                "$cl = $_.CommandLine; "
+                "($cl) -and ($_.ProcessId -ne $me) -and "
+                "($cl -match 'claude_tg_bot|claude-tg-bot') -and "
+                "($cl -match 'bot\\.py|run\\.py|gateway\\.telegram_bot|-m gateway\\.telegram_bot') "
+                "} | Select-Object -ExpandProperty ProcessId"
+            )
             result = _sp3.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-WmiObject Win32_Process | Where-Object { $_.Name -like 'python*' -and $_.CommandLine -like '*bot.py*' -and $_.ProcessId -ne " + str(my_pid) + " } | Select-Object -ExpandProperty ProcessId"],
-                capture_output=True, text=True, timeout=10,
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=15,
             )
             for line in result.stdout.strip().split("\n"):
                 line = line.strip()
                 if line and line.isdigit():
                     orphan_pid = int(line)
                     if orphan_pid != my_pid:
-                        logger.warning(f"Killing orphan bot.py process (PID {orphan_pid})")
-                        print(f"Killing orphan bot.py process (PID {orphan_pid})")
+                        logger.warning(f"Killing orphan Telegram poller (PID {orphan_pid})")
+                        print(f"Killing orphan Telegram poller (PID {orphan_pid})")
                         try:
                             _sp3.run(["taskkill", "/PID", str(orphan_pid), "/F"],
                                      capture_output=True, timeout=5)
@@ -8092,7 +8126,7 @@ def _acquire_pid_lock():
             logger.debug(f"Orphan scan failed: {e}")
 
     # 3. Write our PID
-    with open(_PID_FILE, "w", encoding="utf-8") as f:
+    with open(pid_file, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
 
     # 4. If we killed something, wait for Telegram's long-poll to expire
@@ -8104,11 +8138,12 @@ def _acquire_pid_lock():
 def _release_pid_lock():
     """Remove PID file on clean exit."""
     try:
-        if os.path.exists(_PID_FILE):
-            with open(_PID_FILE, "r", encoding="utf-8") as _pf:
+        pid_file = _get_pid_file()
+        if os.path.exists(pid_file):
+            with open(pid_file, "r", encoding="utf-8") as _pf:
                 pid_in_file = int(_pf.read().strip())
             if pid_in_file == os.getpid():
-                os.remove(_PID_FILE)
+                os.remove(pid_file)
     except Exception:
         pass
 
@@ -8395,6 +8430,14 @@ def create_application():
 
     # Register commands in Telegram menu + start background loops
     async def post_init(application):
+        # 确保走 polling：若曾误设 webhook，会导致本机收不到消息
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=False)
+            me = await application.bot.get_me()
+            logger.info("Telegram: @%s id=%s — webhook cleared, using polling", me.username, me.id)
+        except Exception as e:
+            logger.warning("delete_webhook/get_me failed: %s", e)
+
         # Register commands FIRST (before any background tasks that might fail)
         try:
             await application.bot.set_my_commands(telegram_menu_bot_commands())

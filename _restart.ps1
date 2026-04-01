@@ -12,7 +12,7 @@ if (-not (Test-Path (Join-Path $here "bot.py"))) {
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ForEach-Object {
     $cl = $_.CommandLine
     if ($null -eq $cl) { return }
-    if ($cl -like '*bot.py*' -or $cl -like '*gateway.telegram_bot*' -or $cl -like '*-m gateway.telegram_bot*') {
+    if ($cl -like '*bot.py*' -or $cl -like '*run.py*' -or $cl -like '*gateway.telegram_bot*' -or $cl -like '*-m gateway.telegram_bot*') {
         Write-Host "Stopping PID $($_.ProcessId): $cl"
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
