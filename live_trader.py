@@ -1497,6 +1497,8 @@ class LiveTrader:
                 if now_ts - _last_funding_delta_exec_ts.get(mint_dn, 0) < cooldown:
                     continue
 
+                import secure_wallet
+
                 balance = await secure_wallet.get_sol_balance()
                 if not balance:
                     continue
