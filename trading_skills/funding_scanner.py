@@ -1,17 +1,16 @@
 """
 Funding Rate Arbitrage Scanner for OKX perpetual futures.
 
-Scans OKX USDT-margined perpetual swaps for funding-rate arbitrage
-opportunities.  When the funding rate deviates meaningfully from zero a
-delta-neutral strategy (short perp + long spot, or vice-versa) can harvest
-the periodic funding payments.
+Targets **extreme positive funding** (longs pay shorts): delta-neutral harvest is
+**DEX spot long + OKX perp short**, collecting periodic funding from the crowded long side.
 
 The scanner:
   1. Fetches current and predicted funding rates for a configurable symbol list.
-  2. Computes annualised rates and filters by a minimum threshold.
+  2. Filters to **positive** funding only; computes annualised rate (longs pay shorts).
   3. Analyses historical persistence, trend, and mean-reversion risk.
-  4. Estimates expected PnL net of round-trip trading costs.
-  5. Returns opportunities ranked by annualised rate.
+  4. Estimates expected PnL net of round-trip trading costs (incl. slippage model).
+  5. When Solana mint is known and DexScreener best-pool liquidity ≥ min threshold,
+     sets ``execute_delta_neutral_buy_compat: True`` for ``live_trader`` routing.
 
 Designed for production use: proper session management, rate limiting,
 graceful error handling, structured logging, and full type coverage.
@@ -38,7 +37,8 @@ FUNDING_HISTORY_PATH = "/api/v5/public/funding-rate-history"
 MARK_PRICE_PATH = "/api/v5/public/mark-price"
 
 # ---------------------------------------------------------------------------
-# Default instrument list -- major USDT-margined perpetual swaps
+# Default instrument list -- USDT-margined perpetual swaps (OKX instId)
+# Includes majors + Solana-mapped bases for DEX+perp delta-neutral execute path.
 # ---------------------------------------------------------------------------
 DEFAULT_SYMBOLS: list[str] = [
     "BTC-USDT-SWAP",
@@ -49,13 +49,63 @@ DEFAULT_SYMBOLS: list[str] = [
     "AVAX-USDT-SWAP",
     "LINK-USDT-SWAP",
     "ADA-USDT-SWAP",
+    "JUP-USDT-SWAP",
+    "RAY-USDT-SWAP",
+    "ORCA-USDT-SWAP",
+    "BONK-USDT-SWAP",
+    "WIF-USDT-SWAP",
+    "JTO-USDT-SWAP",
+    "PYTH-USDT-SWAP",
+    "RENDER-USDT-SWAP",
+    "HNT-USDT-SWAP",
+    "TNSR-USDT-SWAP",
+    "W-USDT-SWAP",
+    "MOBILE-USDT-SWAP",
 ]
 
-# Assumed round-trip trading cost (taker fee both legs) as a fraction.
-DEFAULT_ROUND_TRIP_COST = 0.001  # 0.1%
+# Round-trip: taker both legs + conservative per-leg slippage (delta-neutral = 4 fills over life).
+DEFAULT_TAKER_FEE_FRAC = 0.0005   # 5 bps per leg (taker)
+DEFAULT_SLIPPAGE_FRAC = 0.00025  # 2.5 bps per leg (slippage model)
+DEFAULT_ROUND_TRIP_COST = (DEFAULT_TAKER_FEE_FRAC + DEFAULT_SLIPPAGE_FRAC) * 2
 
 # OKX funds every 8 h → 3 periods per day.
 FUNDING_PERIODS_PER_DAY = 3
+
+# Minimum DEX (Solana) spot pool liquidity (USD) to arm automated delta-neutral execute.
+MIN_DEX_SPOT_POOL_USD_DEFAULT = 50_000.0
+
+# OKX SWAP base asset → Solana mint (Jupiter / live_trader hedge universe). Unknown → no auto-exec flag.
+OKX_BASE_TO_SOLANA_MINT: dict[str, str] = {
+    "SOL": "So11111111111111111111111111111111111111112",
+    "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "RAY": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "ORCA": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+    "PIXEL": "Di4B2JSRykk27QcD9oe9sjqff1kTW4mf23bfDePwEKLu",
+    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "WIF": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "JTO": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
+    "PYTH": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "RENDER": "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof",
+    "HNT": "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux",
+    "TNSR": "TNSRxcUxoT9xBG3de7PiJyTDYu7kskLqcpddxnEJAS6",
+    "W": "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ",
+    "MOBILE": "mb1eu7TzEc71KxDpsmsKoucSSuuoGLv1drys1oP2jh6",
+}
+
+
+def okx_swap_inst_to_base(inst_id: str) -> str:
+    """BTC-USDT-SWAP → BTC."""
+    s = inst_id.upper().strip()
+    for suf in ("-USDT-SWAP", "-SWAP"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+            break
+    return s.split("-")[0] if "-" in s else s
+
+
+def okx_swap_inst_to_hedge_symbol(inst_id: str) -> str:
+    """BTC-USDT-SWAP → BTCUSDT (OKXExecutor / open_position)."""
+    return f"{okx_swap_inst_to_base(inst_id)}USDT"
 
 
 class FundingRateScanner:
@@ -66,11 +116,16 @@ class FundingRateScanner:
     symbols:
         OKX instrument IDs to monitor.  Defaults to *DEFAULT_SYMBOLS*.
     min_rate_threshold:
-        Minimum absolute funding rate (in %) per period to flag.
+        Minimum **positive** funding rate (in %) per period to flag.
         Default ``0.01`` means 0.01 %.
     annualized_threshold:
-        Minimum annualised rate (in %) for an opportunity to be included.
+        Minimum **positive** annualised rate (in %) for an opportunity to be included.
         Default ``10.0`` %.
+    min_dex_spot_pool_usd:
+        DexScreener best-pool USD liquidity required to set
+        ``execute_delta_neutral_buy_compat`` (default 50_000).
+    require_positive_funding:
+        If True (default), ignore negative funding (shorts-pay-longs) regimes.
     max_rps:
         Maximum HTTP requests per second (rate-limiter).
     session_timeout:
@@ -83,12 +138,16 @@ class FundingRateScanner:
         min_rate_threshold: float = 0.01,
         annualized_threshold: float = 10.0,
         *,
+        min_dex_spot_pool_usd: float = MIN_DEX_SPOT_POOL_USD_DEFAULT,
+        require_positive_funding: bool = True,
         max_rps: int = 10,
         session_timeout: float = 10.0,
     ) -> None:
         self.symbols = symbols or list(DEFAULT_SYMBOLS)
         self.min_rate_threshold = min_rate_threshold
         self.annualized_threshold = annualized_threshold
+        self.min_dex_spot_pool_usd = float(min_dex_spot_pool_usd)
+        self.require_positive_funding = require_positive_funding
 
         self._max_rps = max_rps
         self._min_interval = 1.0 / max(max_rps, 1)
@@ -234,6 +293,37 @@ class FundingRateScanner:
                 return float(rec["markPx"])
 
         raise RuntimeError(f"Mark price not found for {symbol}")
+
+    async def fetch_dex_spot_liquidity_usd(self, mint: str) -> float:
+        """Best DexScreener-reported USD liquidity for *mint* (largest pool)."""
+        if not mint or len(mint) < 32:
+            return 0.0
+        session = await self._ensure_session()
+        await self._throttle()
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return 0.0
+                body: dict = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("DexScreener fetch failed mint=%s… err=%s", mint[:8], exc)
+            return 0.0
+        pairs = body.get("pairs") or []
+        if not isinstance(pairs, list) or not pairs:
+            return 0.0
+        best = 0.0
+        for p in pairs:
+            if not isinstance(p, dict):
+                continue
+            liq = (p.get("liquidity") or {}) if isinstance(p.get("liquidity"), dict) else {}
+            try:
+                u = float(liq.get("usd", 0) or 0)
+            except (TypeError, ValueError):
+                u = 0.0
+            if u > best:
+                best = u
+        return best
 
     # ------------------------------------------------------------------
     # Analytics
@@ -445,9 +535,9 @@ class FundingRateScanner:
                 f"Annualised {abs(annualized):.1f}% via {direction.replace('_', ' ')}"
             )
         if persistence["trend"] == "increasing" and rate_pct > 0:
-            rec_parts.append("rate trending higher -- favorable")
-        elif persistence["trend"] == "decreasing" and rate_pct < 0:
-            rec_parts.append("rate trending more negative -- favorable")
+            rec_parts.append("positive rate trending higher — larger long crowding / carry")
+        elif persistence["trend"] == "decreasing" and rate_pct > 0:
+            rec_parts.append("positive rate cooling — carry may compress")
         if mr_risk >= 0.6:
             rec_parts.append("elevated mean-reversion risk -- consider smaller size")
         if risk_level == "high":
@@ -472,16 +562,17 @@ class FundingRateScanner:
     # ------------------------------------------------------------------
 
     async def scan(self) -> list[dict]:
-        """Scan all configured symbols and return ranked opportunities.
+        """Scan all configured symbols and return **positive** funding opportunities.
 
         Returns
         -------
         list[dict]
-            Opportunities sorted descending by absolute annualised rate.
-            Only includes entries whose annualised rate meets the threshold.
+            Longs-pay-shorts regimes only, sorted by annualised rate descending.
+            ``execute_delta_neutral_buy_compat`` is True when a Solana mint is mapped
+            and DexScreener spot liquidity ≥ ``min_dex_spot_pool_usd``.
         """
         logger.info(
-            "Starting funding-rate scan for %d symbols", len(self.symbols)
+            "Starting extreme-positive funding scan for %d symbols", len(self.symbols)
         )
 
         results: list[dict] = []
@@ -500,17 +591,39 @@ class FundingRateScanner:
             current_rate = funding["fundingRate"]
             predicted_rate = funding["nextFundingRate"]
 
-            # Quick threshold gate (raw fraction → pct)
-            if abs(current_rate * 100) < self.min_rate_threshold:
-                logger.debug(
-                    "%s rate %.6f%% below threshold", symbol, current_rate * 100
-                )
-                return None
+            if self.require_positive_funding:
+                if current_rate <= 0:
+                    return None
+                if current_rate * 100 < self.min_rate_threshold:
+                    logger.debug(
+                        "%s positive rate %.6f%% below threshold",
+                        symbol,
+                        current_rate * 100,
+                    )
+                    return None
+            else:
+                if abs(current_rate * 100) < self.min_rate_threshold:
+                    return None
 
             analysis = self.analyze_opportunity(current_rate, history, mark)
 
-            if abs(analysis["annualized_rate"]) < self.annualized_threshold:
-                return None
+            ann = analysis["annualized_rate"]
+            if self.require_positive_funding:
+                if ann < self.annualized_threshold:
+                    return None
+            else:
+                if abs(ann) < self.annualized_threshold:
+                    return None
+
+            base = okx_swap_inst_to_base(symbol)
+            sol_mint = OKX_BASE_TO_SOLANA_MINT.get(base, "") or ""
+            hedge_symbol = okx_swap_inst_to_hedge_symbol(symbol)
+            dex_liq = 0.0
+            execute_delta_neutral_buy_compat = False
+            if sol_mint:
+                dex_liq = await self.fetch_dex_spot_liquidity_usd(sol_mint)
+                if dex_liq >= self.min_dex_spot_pool_usd:
+                    execute_delta_neutral_buy_compat = True
 
             # Derive next funding time as ISO string
             nft_raw = funding.get("nextFundingTime", "")
@@ -523,6 +636,12 @@ class FundingRateScanner:
 
             return {
                 "symbol": symbol,
+                "okx_inst_id": symbol,
+                "base_asset": base,
+                "hedge_symbol": hedge_symbol,
+                "solana_mint": sol_mint or None,
+                "dex_spot_liquidity_usd": round(dex_liq, 2),
+                "execute_delta_neutral_buy_compat": execute_delta_neutral_buy_compat,
                 "predicted_rate": round(predicted_rate * 100, 6),
                 "next_funding_time": nft_iso,
                 **analysis,
@@ -538,11 +657,13 @@ class FundingRateScanner:
             if entry is not None:
                 results.append(entry)
 
-        results.sort(key=lambda x: abs(x["annualized_rate"]), reverse=True)
+        results.sort(key=lambda x: x["annualized_rate"], reverse=True)
 
         logger.info(
-            "Scan complete: %d opportunities from %d symbols",
+            "Scan complete: %d positive-funding opportunities from %d symbols "
+            "(%d armed for delta-neutral execute)",
             len(results),
             len(self.symbols),
+            sum(1 for r in results if r.get("execute_delta_neutral_buy_compat")),
         )
         return results

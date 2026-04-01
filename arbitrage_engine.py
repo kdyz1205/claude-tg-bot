@@ -5,6 +5,11 @@ WebSocket feeds (OKX + Bybit + Binance) for real-time prices on core pairs.
 REST scan every 5 minutes for full Top-50 market coverage with volume filter.
 Fee + slippage adjusted net profit — only positive-EV signals emitted.
 
+**Funding (extreme positive) — delta-neutral carry:** use
+:func:`scan_funding_delta_neutral_signals` (OKX perp funding + DexScreener SOL pool
+liquidity). Results feed ``live_trader`` when ``execute_delta_neutral_buy_compat``
+is True and ``funding_delta_execution_enabled`` is on in live config.
+
 Signal flow:
   1. WS price tick → _evaluate_arb → if spread > MIN_SPREAD_PCT
                                        AND volume > MIN_VOLUME_USDT
@@ -19,7 +24,7 @@ import os
 import time
 from datetime import datetime, date
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -55,6 +60,9 @@ TG_MSG_LIMIT = 4096              # Telegram message character limit
 SMART_WALLETS_FILE = ".smart_wallets.json"
 MAX_WALLETS_ARB_SIGNALS = 50      # max arb signals kept in .smart_wallets.json
 
+# Positive funding → DEX spot long + OKX perp short (aligned with funding_scanner).
+FUNDING_DELTA_MIN_DEX_POOL_USD = 50_000.0
+
 
 # ── Symbol format helpers ─────────────────────────────────────────────────────
 
@@ -71,6 +79,35 @@ def _to_binance(pair: str) -> str:
 # Pre-build reverse maps
 _BYBIT_TO_CANONICAL   = {_to_bybit(s): s   for s in SYMBOLS}
 _BINANCE_TO_CANONICAL = {_to_binance(s): s  for s in SYMBOLS}
+
+
+async def scan_funding_delta_neutral_signals(
+    *,
+    symbols: Optional[list[str]] = None,
+    min_rate_threshold: float = 0.01,
+    annualized_threshold: float = 10.0,
+    min_dex_spot_pool_usd: float = FUNDING_DELTA_MIN_DEX_POOL_USD,
+    require_positive_funding: bool = True,
+) -> List[dict]:
+    """
+    OKX **extreme positive funding** scan with DexScreener SOL liquidity gate.
+
+    Each dict may include ``execute_delta_neutral_buy_compat`` for
+    ``live_trader.execute_delta_neutral_buy`` (DEX Jupiter buy ∥ OKX short).
+    """
+    from trading_skills.funding_scanner import FundingRateScanner
+
+    scanner = FundingRateScanner(
+        symbols=symbols,
+        min_rate_threshold=min_rate_threshold,
+        annualized_threshold=annualized_threshold,
+        min_dex_spot_pool_usd=min_dex_spot_pool_usd,
+        require_positive_funding=require_positive_funding,
+    )
+    try:
+        return await scanner.scan()
+    finally:
+        await scanner.close()
 
 
 # ── Main engine ───────────────────────────────────────────────────────────────
