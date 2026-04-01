@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass
 from typing import Callable, Awaitable
 
@@ -38,9 +39,10 @@ from dashboard import (
     tg_gw_build_main_keyboard,
     tg_gw_build_positions_keyboard,
     tg_gw_render_home_text,
-    tg_gw_render_positions_loading_text,
+    tg_gw_render_positions_stale_with_refresh_banner,
     tg_gw_render_positions_text,
     tg_gw_render_strategy_text,
+    tg_gw_sanitize_for_markdown,
 )
 from tracker.session_store import SessionStore
 
@@ -82,6 +84,9 @@ def _allowed_user_ids() -> set[int]:
 
 _ALLOWED = _allowed_user_ids()
 
+_STORE: SessionStore | None = None
+_STORE_INIT_LOCK = threading.Lock()
+
 
 def _is_authorized(user_id: int) -> bool:
     if not _ALLOWED:
@@ -90,7 +95,20 @@ def _is_authorized(user_id: int) -> bool:
 
 
 def _session_store() -> SessionStore:
-    return SessionStore()
+    """Single process-wide store so prefs are not re-read from disk on every tap."""
+    global _STORE
+    with _STORE_INIT_LOCK:
+        if _STORE is None:
+            _STORE = SessionStore()
+        return _STORE
+
+
+def _gw_pos_refresh_lock(app: Application, chat_id: int, message_id: int) -> asyncio.Lock:
+    locks: dict[tuple[int, int], asyncio.Lock] = app.bot_data.setdefault("_gw_pos_locks", {})
+    key = (chat_id, message_id)
+    if key not in locks:
+        locks[key] = asyncio.Lock()
+    return locks[key]
 
 
 def _parse_gw_callback(data: str) -> tuple[str, str] | None:
@@ -115,6 +133,8 @@ async def _safe_edit(
     reply_markup,
     parse_mode: str = "Markdown",
 ) -> None:
+    if parse_mode == "Markdown":
+        text = tg_gw_sanitize_for_markdown(text)
     try:
         await query.edit_message_text(
             text,
@@ -140,8 +160,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⛔ 未授权使用此网关机器人。")
         return
     store = _session_store()
-    mode = store.get_telegram_panel_mode(uid)
-    text = tg_gw_render_home_text(mode)
+    mode = store.get_trade_mode(uid)
+    text = tg_gw_sanitize_for_markdown(tg_gw_render_home_text(mode))
     kb = tg_gw_build_main_keyboard(mode)
     await update.message.reply_text(
         text,
@@ -172,13 +192,13 @@ async def handle_gateway_callback(
 
     action, arg = parsed
     store = _session_store()
-    mode = store.get_telegram_panel_mode(uid)
+    mode = store.get_trade_mode(uid)
 
     await query.answer()
 
     if action == "mode":
         new_mode = "live" if arg == "live" else "paper"
-        store.set_telegram_panel_mode(uid, new_mode)
+        store.set_trade_mode(uid, new_mode)
         mode = new_mode
         await _safe_edit(
             query,
@@ -204,45 +224,57 @@ async def handle_gateway_callback(
         return
 
     if action == "pos":
+        try:
+            from trading import portfolio_snapshot
+
+            snap_now = portfolio_snapshot.get_snapshot()
+        except Exception:
+            snap_now = None
+
         await _safe_edit(
             query,
-            tg_gw_render_positions_loading_text(mode),
+            tg_gw_render_positions_stale_with_refresh_banner(mode, snap_now),
             tg_gw_build_positions_keyboard(),
         )
 
         bot = context.bot
+        application = context.application
         chat_id = query.message.chat_id
         message_id = query.message.message_id
 
         async def _fetch_and_refresh() -> None:
-            try:
-                from trading import portfolio_snapshot
+            lock = _gw_pos_refresh_lock(application, chat_id, message_id)
+            async with lock:
+                try:
+                    from trading import portfolio_snapshot
 
-                await portfolio_snapshot.refresh_once()
-                snap = portfolio_snapshot.get_snapshot()
-            except Exception as e:
-                logger.exception("gateway positions refresh: %s", e)
-                snap = None
-            mode_now = _session_store().get_telegram_panel_mode(uid)
-            body = tg_gw_render_positions_text(mode_now, snap)
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=body,
-                    reply_markup=tg_gw_build_positions_keyboard(),
-                    parse_mode="Markdown",
+                    await portfolio_snapshot.refresh_once()
+                    snap = portfolio_snapshot.get_snapshot()
+                except Exception as e:
+                    logger.exception("gateway positions refresh: %s", e)
+                    snap = None
+                mode_now = _session_store().get_trade_mode(uid)
+                body = tg_gw_sanitize_for_markdown(
+                    tg_gw_render_positions_text(mode_now, snap)
                 )
-            except Exception:
                 try:
                     await bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=message_id,
                         text=body,
                         reply_markup=tg_gw_build_positions_keyboard(),
+                        parse_mode="Markdown",
                     )
-                except Exception as e2:
-                    logger.warning("background edit positions failed: %s", e2)
+                except Exception:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=body,
+                            reply_markup=tg_gw_build_positions_keyboard(),
+                        )
+                    except Exception as e2:
+                        logger.warning("background edit positions failed: %s", e2)
 
         asyncio.create_task(_fetch_and_refresh())
         return

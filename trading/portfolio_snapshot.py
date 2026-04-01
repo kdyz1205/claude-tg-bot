@@ -4,6 +4,8 @@ Background portfolio snapshot for Telegram UI + web dashboard.
 Heavy work (wallet RPC, OKX signed REST, DEX price refresh) runs on an asyncio
 polling loop. Handlers read only get_snapshot() — O(1) memory copy.
 
+OKX, wallet, and DEX legs refresh concurrently via asyncio.gather.
+
 Optional: set REDIS_URL to mirror JSON at key claude_tg_bot:portfolio (TTL 180s).
 """
 
@@ -145,96 +147,105 @@ async def _label_wallet_tokens(raw: list[dict]) -> list[dict]:
     return out
 
 
-async def refresh_once() -> None:
-    """One full refresh — call from background loop or explicit refresh."""
-    global _data
-    snap = _empty()
-    snap["updated_at"] = time.time()
-    err_parts: list[str] = []
+async def _leg_sol_ticker() -> tuple[tuple[float, float], list[str]]:
+    errs: list[str] = []
+    try:
+        return await _fetch_sol_ticker(), errs
+    except Exception as e:
+        errs.append(f"ticker:{e}")
+        with _lock:
+            return (float(_data.get("sol_price") or 0), float(_data.get("sol_chg_pct") or 0)), errs
 
-    sol_p, sol_c = await _fetch_sol_ticker()
-    snap["sol_price"] = sol_p
-    snap["sol_chg_pct"] = sol_c
 
-    # ── Wallet ──
+async def _leg_wallet() -> tuple[dict[str, Any], list[str]]:
+    errs: list[str] = []
+    default_wallet = _empty()["wallet"]
     try:
         import secure_wallet as wallet
-
-        if wallet.wallet_exists():
-            tks = None
-            try:
-                bal = await asyncio.wait_for(wallet.get_sol_balance(), timeout=4.0)
-            except Exception:
-                bal = 0.0
-            raw: list[dict] = []
-            try:
-                tks = await asyncio.wait_for(wallet.get_token_balances(), timeout=8.0)
-                if tks:
-                    raw = sorted(tks, key=lambda x: float(x.get("amount") or 0), reverse=True)[:14]
-            except Exception as e:
-                err_parts.append(f"wallet_tokens:{e}")
-            pk = ""
-            try:
-                pk = wallet.get_public_key() or ""
-            except Exception:
-                pk = ""
-            short_pk = f"{pk[:6]}…{pk[-4:]}" if len(pk) > 12 else (pk or "")
-            labeled = await _label_wallet_tokens(raw)
-            tc = len(tks) if tks is not None else len(labeled)
-            snap["wallet"] = {
-                "ok": True,
-                "pubkey_short": short_pk,
-                "sol_bal": float(bal or 0),
-                "token_count": tc,
-                "tokens": labeled,
-            }
     except ImportError:
-        pass
-    except Exception as e:
-        err_parts.append(f"wallet:{e}")
-        snap["wallet"]["error"] = str(e)[:200]
+        return default_wallet, errs
 
-    # ── OKX (authenticated) ──
+    if not wallet.wallet_exists():
+        return default_wallet, errs
+
+    tks = None
+    try:
+        bal = await asyncio.wait_for(wallet.get_sol_balance(), timeout=4.0)
+    except Exception:
+        bal = 0.0
+    raw: list[dict] = []
+    try:
+        tks = await asyncio.wait_for(wallet.get_token_balances(), timeout=8.0)
+        if tks:
+            raw = sorted(tks, key=lambda x: float(x.get("amount") or 0), reverse=True)[:14]
+    except Exception as e:
+        errs.append(f"wallet_tokens:{e}")
+    pk = ""
+    try:
+        pk = wallet.get_public_key() or ""
+    except Exception:
+        pk = ""
+    short_pk = f"{pk[:6]}…{pk[-4:]}" if len(pk) > 12 else (pk or "")
+    labeled = await _label_wallet_tokens(raw)
+    tc = len(tks) if tks is not None else len(labeled)
+    block = {
+        "ok": True,
+        "pubkey_short": short_pk,
+        "sol_bal": float(bal or 0),
+        "token_count": tc,
+        "tokens": labeled,
+    }
+    return block, errs
+
+
+async def _leg_okx() -> tuple[dict[str, Any], list[str]]:
+    errs: list[str] = []
+    block: dict[str, Any] = copy.deepcopy(_empty()["okx"])
     try:
         from trading.okx_executor import OKXExecutor
 
         ex = OKXExecutor()
         ex.load_state()
-        snap["okx"]["has_keys"] = ex.has_api_keys()
-        if ex.has_api_keys():
-            bal_r = await asyncio.wait_for(ex.get_account_balance(), timeout=12.0)
-            if bal_r.get("ok"):
-                snap["okx"]["ok"] = True
-                snap["okx"]["total_equity_usd"] = float(bal_r.get("total_equity") or 0)
-                snap["okx"]["usdt_available"] = float(bal_r.get("usdt_available") or 0)
-            else:
-                snap["okx"]["error"] = str(bal_r.get("reason", "balance_failed"))[:200]
-            pos_raw = await asyncio.wait_for(ex.get_exchange_positions(), timeout=12.0)
-            rows: list[dict[str, Any]] = []
-            for p in pos_raw or []:
-                try:
-                    pos_sz = float(p.get("pos", 0) or 0)
-                except (TypeError, ValueError):
-                    pos_sz = 0.0
-                if abs(pos_sz) < 1e-12:
-                    continue
-                rows.append(
-                    {
-                        "instId": p.get("instId", ""),
-                        "pos": pos_sz,
-                        "notionalUsd": float(p.get("notionalUsd", 0) or 0),
-                        "avgPx": float(p.get("avgPx", 0) or 0),
-                        "upl": float(p.get("upl", 0) or 0),
-                        "uplRatio": float(p.get("uplRatio", 0) or 0),
-                        "posSide": p.get("posSide", ""),
-                    }
-                )
-            snap["okx"]["positions"] = rows
+        block["has_keys"] = ex.has_api_keys()
+        if not ex.has_api_keys():
+            return block, errs
+        bal_r = await asyncio.wait_for(ex.get_account_balance(), timeout=12.0)
+        if bal_r.get("ok"):
+            block["ok"] = True
+            block["total_equity_usd"] = float(bal_r.get("total_equity") or 0)
+            block["usdt_available"] = float(bal_r.get("usdt_available") or 0)
+        else:
+            block["error"] = str(bal_r.get("reason", "balance_failed"))[:200]
+        pos_raw = await asyncio.wait_for(ex.get_exchange_positions(), timeout=12.0)
+        rows: list[dict[str, Any]] = []
+        for p in pos_raw or []:
+            try:
+                pos_sz = float(p.get("pos", 0) or 0)
+            except (TypeError, ValueError):
+                pos_sz = 0.0
+            if abs(pos_sz) < 1e-12:
+                continue
+            rows.append(
+                {
+                    "instId": p.get("instId", ""),
+                    "pos": pos_sz,
+                    "notionalUsd": float(p.get("notionalUsd", 0) or 0),
+                    "avgPx": float(p.get("avgPx", 0) or 0),
+                    "upl": float(p.get("upl", 0) or 0),
+                    "uplRatio": float(p.get("uplRatio", 0) or 0),
+                    "posSide": p.get("posSide", ""),
+                }
+            )
+        block["positions"] = rows
     except Exception as e:
-        err_parts.append(f"okx:{e}")
-        snap["okx"]["error"] = str(e)[:200]
+        errs.append(f"okx:{e}")
+        block["error"] = str(e)[:200]
+    return block, errs
 
-    # ── DEX tracked positions ──
+
+async def _leg_dex() -> tuple[dict[str, Any], list[str]]:
+    errs: list[str] = []
+    block: dict[str, Any] = copy.deepcopy(_empty()["dex"])
     try:
         import dex_trader as dex
 
@@ -244,14 +255,67 @@ async def refresh_once() -> None:
         val = sum(
             float(x.get("current_value_sol", x.get("amount_sol", 0)) or 0) for x in open_p
         )
-        snap["dex"]["positions"] = copy.deepcopy(open_p)
-        snap["dex"]["total_invested_sol"] = inv
-        snap["dex"]["total_value_sol"] = val
+        block["positions"] = copy.deepcopy(open_p)
+        block["total_invested_sol"] = inv
+        block["total_value_sol"] = val
     except ImportError:
         pass
     except Exception as e:
-        err_parts.append(f"dex:{e}")
-        snap["dex"]["error"] = str(e)[:200]
+        errs.append(f"dex:{e}")
+        block["error"] = str(e)[:200]
+    return block, errs
+
+
+async def refresh_once() -> None:
+    """One full refresh — concurrent legs, then merge into global snapshot."""
+    global _data
+    snap = _empty()
+    snap["updated_at"] = time.time()
+    err_parts: list[str] = []
+
+    results = await asyncio.gather(
+        _leg_sol_ticker(),
+        _leg_wallet(),
+        _leg_okx(),
+        _leg_dex(),
+        return_exceptions=True,
+    )
+
+    (sol_p, sol_c) = (0.0, 0.0)
+    if isinstance(results[0], BaseException):
+        err_parts.append(f"ticker:{results[0]}")
+        with _lock:
+            sol_p, sol_c = float(_data.get("sol_price") or 0), float(_data.get("sol_chg_pct") or 0)
+    else:
+        (sol_p, sol_c), e0 = results[0]
+        err_parts.extend(e0)
+
+    if isinstance(results[1], BaseException):
+        err_parts.append(f"wallet:{results[1]}")
+        snap["wallet"]["error"] = str(results[1])[:200]
+    else:
+        wblk, e1 = results[1]
+        snap["wallet"] = wblk
+        err_parts.extend(e1)
+
+    if isinstance(results[2], BaseException):
+        err_parts.append(f"okx:{results[2]}")
+        snap["okx"]["error"] = str(results[2])[:200]
+    else:
+        oblk, e2 = results[2]
+        snap["okx"] = oblk
+        err_parts.extend(e2)
+
+    if isinstance(results[3], BaseException):
+        err_parts.append(f"dex:{results[3]}")
+        snap["dex"]["error"] = str(results[3])[:200]
+    else:
+        dblk, e3 = results[3]
+        snap["dex"] = dblk
+        err_parts.extend(e3)
+
+    snap["sol_price"] = sol_p
+    snap["sol_chg_pct"] = sol_c
 
     if err_parts:
         snap["last_error"] = "; ".join(err_parts)[:500]

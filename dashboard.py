@@ -475,6 +475,18 @@ except ImportError:  # pragma: no cover
 GW_CB = "gw"
 
 
+def tg_gw_sanitize_for_markdown(text: str) -> str:
+    """Reduce Telegram legacy Markdown parse failures on dynamic snapshot lines."""
+    if not text:
+        return text
+    try:
+        from providers import _sanitize_telegram_markdown
+
+        return _sanitize_telegram_markdown(text)
+    except Exception:
+        return text
+
+
 def tg_gw_mode_label(mode: str) -> str:
     m = (mode or "paper").lower()
     if m == "live":
@@ -559,6 +571,16 @@ def tg_gw_render_positions_loading_text(mode: str) -> str:
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "⏳ 正在获取链上与交易所数据，请稍候…"
     )
+
+
+def tg_gw_render_positions_stale_with_refresh_banner(mode: str, snap: dict | None) -> str:
+    """
+    Instant paint path: show last cached snapshot (if any) plus a refresh line,
+    so the UI is never blank while ``refresh_once`` runs in the background.
+    """
+    if snap and float(snap.get("updated_at") or 0) > 0:
+        return _tg_gw_format_snapshot(mode, snap) + "\n\n⏳ _正在后台同步最新数据…_"
+    return tg_gw_render_positions_loading_text(mode)
 
 
 def _tg_gw_format_snapshot(mode: str, snap: dict) -> str:

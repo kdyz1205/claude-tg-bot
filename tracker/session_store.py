@@ -194,6 +194,14 @@ class SessionStore:
         self._save_telegram_prefs()
         logger.info("Telegram panel mode for user %s -> %s", user_id, m)
 
+    def get_trade_mode(self, user_id: int) -> str:
+        """Alias for UI trade context: ``paper`` | ``live`` (persisted with panel prefs)."""
+        return self.get_telegram_panel_mode(user_id)
+
+    def set_trade_mode(self, user_id: int, mode: str) -> None:
+        """Alias for :meth:`set_telegram_panel_mode`."""
+        self.set_telegram_panel_mode(user_id, mode)
+
     def update(self, session: SessionState):
         """Update a session's state."""
         self.sessions[session.session_id] = session
