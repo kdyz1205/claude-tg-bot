@@ -19,8 +19,8 @@ Telegram Gateway — PTB：极简全自动看板。
   ``SESSION_COMMANDER_JARVIS_FILTER_SESSION`` — 本机 watch 只消费 resolve 后等于该名的任务（并行 drain）。
   ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
   配置总线：写 ``session_commander_config.json`` 的 ``active_skills``；God 引擎用 **watchdog** 监听 JSON 并 ``reload_skills``。
-  斜杠：仅 ``/start`` 为网关原生面板；``/trade`` ``/live`` ``/chain`` 等委托 ``bot`` 模块处理器。
-  其余请用语义对话。
+  斜杠：``/start`` 网关面板；``/trade``、``/t`` 委托 ``bot.trade_dashboard_command``。
+  其它 ``/…`` 与纯文本相同，走 Jarvis 语义路由（classify_intent → CHAT/TRADE/AUTO_DEV 等）。
 
 Run:   python -m gateway.telegram_bot
 """
@@ -372,22 +372,6 @@ async def _gw_panel_work(
             logger.warning("gateway panel error edit failed: %s", e2)
 
 
-async def handle_deprecated_slash_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """未单独注册的斜杠：提示用侧栏菜单或自然语言。"""
-    if not update.effective_user or not update.message:
-        return
-    if not _is_authorized(update.effective_user.id):
-        return
-    mark_gateway_user_activity()
-    await update.message.reply_text(
-        "📎 该斜杠未在网关注册。\n"
-        "请用侧栏菜单里的：/start /trade /live /chain /portfolio /status /help\n"
-        "或直接用中文说需求（策略、造物、风控等）→ Jarvis。"
-    )
-
-
 def _make_bot_delegate(handler_attr: str):
     """把 ``bot`` 模块里已有的 CommandHandler 逻辑挂到网关进程上。"""
 
@@ -418,17 +402,8 @@ def _make_bot_delegate(handler_attr: str):
     return _handler
 
 
-# (telegram command, bot.py async handler attribute)
-_GATEWAY_BOT_DELEGATES: tuple[tuple[str, str], ...] = (
-    ("trade", "trade_dashboard_command"),
-    ("live", "live_command"),
-    ("chain", "chain_command"),
-    ("portfolio", "portfolio_command"),
-    ("status", "status_command"),
-    ("help", "help_command"),
-)
-
-# ``terminal_ui`` 等仍 ``from gateway.telegram_bot import cmd_trade``
+# 仅 /trade 委托 bot.py；其余斜杠不走 CommandHandler，由 Jarvis 语义路由处理。
+# ``terminal_ui`` 仍 ``from gateway.telegram_bot import cmd_trade``
 cmd_trade = _make_bot_delegate("trade_dashboard_command")
 
 
@@ -453,20 +428,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """非命令纯文本：CHAT / TRADE / AUTO_DEV。"""
+async def _jarvis_semantic_route(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, uid: int
+) -> None:
+    """Jarvis：纯文本或未注册斜杠（/start、/trade 已由 CommandHandler 吃掉）。"""
     global USER_MODE
-    if not update.effective_user or not update.message:
+    if not update.message:
         return
-    uid = update.effective_user.id
-    if not _is_authorized(uid):
-        return
-    mark_gateway_user_activity()
     text = (update.message.text or "").strip()
     if not text:
-        return
-    # 斜杠指令必须由 CommandHandler 处理；此处杜绝误入 Jarvis 语义层（含漏注册或边界情况）
-    if text.startswith("/"):
         return
 
     from gateway.jarvis_semantic import (
@@ -606,6 +576,34 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(reply[:4096])
 
 
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """非命令纯文本 → Jarvis。"""
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        return
+    mark_gateway_user_activity()
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    await _jarvis_semantic_route(update, context, uid=uid)
+
+
+async def handle_slash_as_semantic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """除 /start、/trade、/t 外，其余斜杠整段交给 Jarvis（与纯文本同路由）。"""
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        return
+    mark_gateway_user_activity()
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    await _jarvis_semantic_route(update, context, uid=uid)
+
+
 async def handle_gateway_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -662,11 +660,13 @@ class TelegramBot:
             .post_shutdown(_gw_post_shutdown)
             .build()
         )
-        # CommandHandler 必须在全局 MessageHandler 之前注册，保证斜杠指令绝对优先
+        # CommandHandler 仅 /start /trade；其它斜杠由 Jarvis 语义层处理（与纯文本同路径）
+        from gateway.handlers.router import NON_START_TRADE_SLASH
+
         app.add_handler(CommandHandler("start", cmd_start))
-        for cmd_name, attr in _GATEWAY_BOT_DELEGATES:
-            app.add_handler(CommandHandler(cmd_name, _make_bot_delegate(attr)))
-        app.add_handler(MessageHandler(filters.COMMAND, handle_deprecated_slash_command))
+        app.add_handler(CommandHandler("trade", cmd_trade))
+        app.add_handler(CommandHandler("t", cmd_trade))
+        app.add_handler(MessageHandler(NON_START_TRADE_SLASH, handle_slash_as_semantic))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text)
         )

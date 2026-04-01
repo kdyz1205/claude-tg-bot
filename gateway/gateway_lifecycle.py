@@ -15,7 +15,7 @@ import os
 
 from telegram.ext import Application
 
-from tg_registry.catalog import minimal_slash_menu_commands
+from tg_registry.catalog import get_core_menu_commands
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +23,8 @@ BOT_DATA_AUTO_RESEARCH_TASK_KEY = "_gw_auto_research_task"
 
 
 def standard_bot_commands():
-    """
-    与 ``python bot.py`` 使用同一短菜单（``tg_registry.catalog``），避免侧栏显示一堆却无法响应。
-    """
-    return minimal_slash_menu_commands()
+    """与主进程同一套侧栏菜单（``get_core_menu_commands``）。"""
+    return get_core_menu_commands()
 
 
 async def sync_slash_command_menu(bot) -> None:
