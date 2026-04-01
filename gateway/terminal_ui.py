@@ -75,8 +75,6 @@ def _get_redis():
     global _REDIS_CLIENT
     if _redis_mod is None:
         return None
-    import os
-
     url = os.environ.get("TERMINAL_REDIS_URL") or os.environ.get("REDIS_URL")
     if not url:
         return None
@@ -484,8 +482,11 @@ async def on_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     q = update.callback_query
     if not q or not q.data or not update.effective_user:
         return ConversationHandler.END
-    data = q.data
     uid = update.effective_user.id
+    if not _is_authorized(uid):
+        await q.answer("⛔ 未授权", show_alert=True)
+        return ConversationHandler.END
+    data = q.data
     s = get_session(uid)
 
     if data == "term:main_menu" or data == "term:main_menu_refresh":
@@ -581,12 +582,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_non_address_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    """Keep conversation state; nudge UX (address interceptor already ran in group -1)."""
-    if update.message:
-        await update.message.reply_text(
-            "使用下方 **Inline** 按钮切换页面，或直接粘贴 **EVM / Solana** 合约地址。",
-            parse_mode="Markdown",
-        )
+    """Keep conversation state; no extra messages (terminal stays in-place)."""
     uid = update.effective_user.id if update.effective_user else 0
     s = get_session(uid)
     return {

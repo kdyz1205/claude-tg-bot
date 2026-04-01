@@ -1,14 +1,18 @@
 """
-Telegram Gateway — lightweight **trading panel** entry (paper / live, positions, strategy).
+Telegram Gateway — PTB entry with two UI modes:
 
-Uses python-telegram-bot (same stack as bot.py). All callback routes **edit the same
-message** via `edit_message_text` — no callback-driven `reply_text` spam.
+1. **panel** (default) — dashboard-backed trading home / positions / strategy
+   (`GW_CB:*` callbacks, in-place `edit_message_text`).
 
-Heavy chain / exchange reads run in `asyncio.create_task` after showing a loading line.
+2. **terminal** — Bloomberg-style state machine: `ConversationHandler`, global
+   contract-address interceptor, 2s API throttle on hot refresh. See
+   `gateway.terminal_ui`.
 
-Run:  python -m gateway.telegram_bot
-Env:  TELEGRAM_BOT_TOKEN (required)
-      GATEWAY_TELEGRAM_USER_IDS="123,456" optional allow-list (empty = any user)
+Run:   python -m gateway.telegram_bot
+Env:   TELEGRAM_BOT_TOKEN (required)
+       GATEWAY_UI=panel|terminal   (default: panel)
+       GATEWAY_TELEGRAM_USER_IDS="123,456" optional allow-list (empty = any user)
+       TERMINAL_REDIS_URL or REDIS_URL optional session mirror for terminal mode
 """
 
 from __future__ import annotations
@@ -51,6 +55,16 @@ class TelegramMessage:
     text: str
     user_id: int
     username: str
+    message_id: int
+
+
+@dataclass
+class TelegramCallbackQuery:
+    """Minimal callback shape for harness code that imports from `gateway`."""
+
+    chat_id: int
+    user_id: int
+    data: str
     message_id: int
 
 
@@ -296,7 +310,22 @@ class TelegramBot:
 
 
 def main() -> None:
-    TelegramBot().run()
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        level=logging.INFO,
+    )
+    mode = (os.environ.get("GATEWAY_UI") or "panel").strip().lower()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is required.")
+
+    if mode in ("terminal", "bloomberg", "conv", "state"):
+        from gateway.terminal_ui import build_terminal_application
+
+        build_terminal_application(token).run_polling(allowed_updates=Update.ALL_TYPES)
+        return
+
+    TelegramBot(token).run()
 
 
 if __name__ == "__main__":
