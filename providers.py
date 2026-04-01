@@ -16,6 +16,87 @@ from safety import is_dangerous, request_permission
 
 logger = logging.getLogger(__name__)
 
+
+class TransientProviderExhausted(Exception):
+    """All transient retries for a single provider HTTP call were exhausted."""
+
+    def __init__(self, cause: BaseException | None):
+        self.cause = cause
+        super().__init__(str(cause) if cause else "transient retries exhausted")
+
+
+def _is_transient_anthropic_error(e: BaseException) -> bool:
+    err = str(e).lower()
+    if "credit" in err or "billing" in err or "balance" in err:
+        return False
+    if "authentication" in err or "invalid x-api-key" in err or "401" in err or "403" in err and "forbidden" in err:
+        return False
+    markers = (
+        "429", "502", "503", "529", "overloaded", "rate limit", "ratelimit", "too many requests",
+        "timeout", "timed out", "connection reset", "connection aborted", "econnreset",
+        "temporarily unavailable", "bad gateway", "service unavailable", "try again",
+    )
+    return any(m in err for m in markers)
+
+
+def _is_transient_openai_error(e: BaseException) -> bool:
+    err = str(e).lower()
+    if "credit" in err or "billing" in err or "quota" in err or "insufficient" in err:
+        return False
+    if "incorrect api key" in err or "invalid_api_key" in err or "401" in err:
+        return False
+    markers = (
+        "429", "502", "503", "rate_limit", "rate limit", "timeout", "timed out",
+        "connection reset", "econnreset", "bad gateway", "service unavailable",
+        "overloaded", "try again", "internal server error",
+    )
+    return any(m in err for m in markers)
+
+
+async def _anthropic_messages_create_with_retries(client, **kwargs):
+    last_exc: BaseException | None = None
+    n = getattr(config, "API_TRANSIENT_RETRIES", 4)
+    for attempt in range(n):
+        try:
+            return await client.messages.create(**kwargs)
+        except Exception as e:
+            last_exc = e
+            if not _is_transient_anthropic_error(e):
+                raise
+            delay = min(45.0, (1.6 ** attempt) * 2.0)
+            logger.warning(
+                "[Claude API] transient error attempt %s/%s: %s — sleeping %.1fs",
+                attempt + 1,
+                n,
+                e,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise TransientProviderExhausted(last_exc)
+
+
+async def _openai_chat_completion_with_retries(client, **kwargs):
+    last_exc: BaseException | None = None
+    n = getattr(config, "API_TRANSIENT_RETRIES", 4)
+    for attempt in range(n):
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_exc = e
+            if not _is_transient_openai_error(e):
+                raise
+            delay = min(45.0, (1.6 ** attempt) * 2.0)
+            logger.warning(
+                "[OpenAI API] transient error attempt %s/%s: %s — sleeping %.1fs",
+                attempt + 1,
+                n,
+                e,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise TransientProviderExhausted(last_exc)
+
+
 SYSTEM_PROMPT = """You are an expert software engineer remotely controlling a Windows 11 computer via Telegram. You are the user's hands and eyes on their machine.
 
 ## Your Role
@@ -384,8 +465,8 @@ async def _send_text(text, chat_id, context, parse_mode=None):
 
 # ─── Claude ───────────────────────────────────────────────────────────────────
 
-async def process_claude(messages, chat_id, context, selected_tools=None):
-    """Returns (success: bool, error_type: str|None)"""
+async def process_claude(messages, chat_id, context, selected_tools=None, *, model: str | None = None):
+    """Returns (success: bool, error_type: str|None). Uses AsyncAnthropic with transient retry pool."""
     if not config.ANTHROPIC_API_KEY:
         return False, "no_key"
     try:
@@ -394,29 +475,30 @@ async def process_claude(messages, chat_id, context, selected_tools=None):
         return False, "no_package"
 
     tools = selected_tools or TOOL_DEFINITIONS
-    client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY, timeout=120.0)
+    model_used = model or config.CLAUDE_MODEL
+    timeout_sec = getattr(config, "API_REQUEST_TIMEOUT_SEC", 120.0)
+    client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY, timeout=timeout_sec)
 
     try:
         iteration = 0
         for iteration in range(config.MAX_TOOL_ITERATIONS):
             try:
-                response = await client.messages.create(
-                    model=config.CLAUDE_MODEL,
+                response = await _anthropic_messages_create_with_retries(
+                    client,
+                    model=model_used,
                     max_tokens=8192,
                     system=SYSTEM_PROMPT,
                     tools=tools,
                     messages=messages,
                 )
+            except TransientProviderExhausted:
+                return False, "transient_exhausted"
             except Exception as e:
                 err = str(e).lower()
                 if "credit" in err or "billing" in err or "balance" in err:
                     return False, "billing"
                 if "authentication" in err or "invalid x-api-key" in err:
                     return False, "auth"
-                if "overloaded" in err or "529" in err:
-                    logger.warning("Claude overloaded, retrying in 3s...")
-                    await asyncio.sleep(3)
-                    continue
                 return False, str(e)
 
             logger.info(f"[Claude] iter={iteration} stop_reason={response.stop_reason} blocks={len(response.content)}")
@@ -494,7 +576,7 @@ async def process_claude(messages, chat_id, context, selected_tools=None):
 
 # ─── OpenAI ───────────────────────────────────────────────────────────────────
 
-async def process_openai(messages, chat_id, context, selected_tools=None):
+async def process_openai(messages, chat_id, context, selected_tools=None, *, model: str | None = None):
     if not config.OPENAI_API_KEY:
         return False, "no_key"
     try:
@@ -502,7 +584,9 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
     except ImportError:
         return False, "no_package"
 
-    client = AsyncOpenAI(api_key=config.OPENAI_API_KEY, timeout=120.0)
+    timeout_sec = getattr(config, "API_REQUEST_TIMEOUT_SEC", 120.0)
+    client = AsyncOpenAI(api_key=config.OPENAI_API_KEY, timeout=timeout_sec)
+    model_used = model or config.OPENAI_MODEL
 
     try:
         # Build OpenAI message list from simple text history
@@ -540,22 +624,21 @@ async def process_openai(messages, chat_id, context, selected_tools=None):
 
         for iteration in range(config.MAX_TOOL_ITERATIONS):
             try:
-                resp = await client.chat.completions.create(
-                    model=config.OPENAI_MODEL,
+                resp = await _openai_chat_completion_with_retries(
+                    client,
+                    model=model_used,
                     messages=oai_msgs,
                     tools=_tools_openai(selected_tools),
                     max_tokens=8192,
                 )
+            except TransientProviderExhausted:
+                return False, "transient_exhausted"
             except Exception as e:
                 err = str(e).lower()
                 if "credit" in err or "billing" in err or "quota" in err or "insufficient" in err:
                     return False, "billing"
                 if "incorrect api key" in err or "authentication" in err:
                     return False, "auth"
-                if "rate_limit" in err or "429" in err:
-                    logger.warning("OpenAI rate limited, retrying in 3s...")
-                    await asyncio.sleep(3)
-                    continue
                 return False, str(e)
 
             if not resp.choices:
