@@ -13,6 +13,8 @@ AUTO_DEV / 造物走 ``pipeline.cli_bridge.run_claude_dev_prompt`` 的 **dev 队
 流式 NDJSON（额度恢复后便于 TG 逐段编辑）：``JARVIS_CHAT_STREAM_JSON=1``（``--output-format stream-json`` + ``--verbose``）；
 可选 ``CLAUDE_STREAM_INCLUDE_PARTIAL=1`` 打开 ``--include-partial-messages``。
 可选 ``JARVIS_CHAT_TIMEOUT_SEC``（秒，默认参考 ``config.API_REQUEST_TIMEOUT_SEC``，上限 600）。
+CLI 报额度耗尽时经 ``trigger_alert`` 推送告警，并由 ``browser_agents``（默认 Kimi → DeepSeek）
+走浏览器影子通道兜底（``JARVIS_SHADOW_PLATFORMS`` / ``JARVIS_BROWSER_CDP_URL``）。
 """
 
 from __future__ import annotations
@@ -428,12 +430,19 @@ _JARVIS_CHAT_SYSTEM = """你是 Jarvis，长官的专属高频量化作战副官
 
 回答长度默认控制在必要最小；若长官明确要求深度推演再展开。"""
 
-_JARVIS_CHAT_ERR_USER = "本地 CLI 未就绪、超时或无输出；请确认本机已登录 Claude Code 并可用 `claude` 命令。"
+_JARVIS_CHAT_ERR_USER = (
+    "本地 Claude CLI 无有效输出或未就绪；请确认本机已安装 Claude Code 且 `claude` 可执行并已登录。"
+)
 _JARVIS_CHAT_ERR_AUTH = (
-    "本地 CLI 未登录或订阅会话失效。请在终端运行 `claude` 完成登录，并确认订阅有效。"
+    "本地 CLI 未登录或会话失效。请在终端运行 `claude` 完成登录，并确认订阅有效。"
 )
 _JARVIS_CHAT_ERR_CLI = "未检测到本机 `claude` 可执行文件。请安装 Claude Code CLI 或将其加入 PATH。"
-_JARVIS_CHAT_ERR_TIMEOUT = "本地 CLI 响应超时。请稍后重试或检查本机网络与订阅状态。"
+_JARVIS_CHAT_ERR_TIMEOUT = "本地 CLI 响应超时。请稍后重试或检查本机负载与订阅状态。"
+_JARVIS_QUOTA_SHADOW_OK = "长官，订阅额度已干爆，已为您切换至 Kimi/DeepSeek 临时大脑。"
+_JARVIS_QUOTA_SHADOW_FAIL = (
+    "长官，订阅额度已干爆，影子部队（Kimi/DeepSeek 浏览器通道）未能接通；"
+    "请在本机登录 kimi.moonshot.cn / chat.deepseek.com，并配置 JARVIS_BROWSER_CDP_URL（推荐）或 JARVIS_BROWSER_USER_DATA_DIR。"
+)
 
 # 与 agents.sessions 的 8_000_000+ 虚拟 id 错开，按 Telegram uid 稳定映射多轮记忆
 _JARVIS_GW_CHAT_BASE = 71_000_000
@@ -442,6 +451,82 @@ _JARVIS_GW_CHAT_MOD = 89_000_000
 
 def _jarvis_gateway_chat_id(uid: int) -> int:
     return _JARVIS_GW_CHAT_BASE + (abs(int(uid)) % _JARVIS_GW_CHAT_MOD)
+
+
+def _jarvis_shadow_browser_config():
+    """Playwright 配置：优先 CDP 复用已登录 Chrome，其次 user_data_dir。"""
+    from browser_agents.base import BrowserConfig
+
+    cdp = (
+        (os.environ.get("JARVIS_BROWSER_CDP_URL") or os.environ.get("PLAYWRIGHT_CDP") or "")
+        .strip()
+    )
+    udata = (os.environ.get("JARVIS_BROWSER_USER_DATA_DIR") or "").strip()
+    if not udata and os.name == "nt":
+        udata = os.path.join(
+            os.path.expanduser("~"), "AppData", "Local", "Google", "Chrome", "User Data"
+        )
+    elif not udata:
+        udata = os.path.join(os.path.expanduser("~"), ".config", "google-chrome")
+    headless_raw = (os.environ.get("JARVIS_BROWSER_HEADLESS") or "1").strip().lower()
+    headless = headless_raw in ("1", "true", "yes", "on")
+    try:
+        timeout_ms = int((os.environ.get("JARVIS_BROWSER_TIMEOUT_MS") or "120000").strip())
+    except ValueError:
+        timeout_ms = 120_000
+    timeout_ms = max(30_000, min(600_000, timeout_ms))
+    return BrowserConfig(
+        headless=headless,
+        cdp_url=cdp,
+        user_data_dir="" if cdp else udata,
+        timeout_ms=timeout_ms,
+    )
+
+
+async def _browser_shadow_reply(system_prompt: str, user_text: str) -> tuple[str, str]:
+    """
+    CLI 额度耗尽后的备份通道：按 ``JARVIS_SHADOW_PLATFORMS`` 顺序尝试浏览器 Agent（模拟点击 + 抓取回复）。
+
+    Returns:
+        ``(reply, platform_key)`` 成功时 platform_key 为小写平台名；失败为 ``("", "")``.
+    """
+    from browser_agents import get_browser_agent
+
+    raw = (os.environ.get("JARVIS_SHADOW_PLATFORMS") or "kimi,deepseek").strip()
+    platforms = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    if not platforms:
+        platforms = ["kimi", "deepseek"]
+
+    cfg = _jarvis_shadow_browser_config()
+    combined = (
+        f"{(system_prompt or '')[:12_000]}\n\n--- 长官指令 ---\n\n{(user_text or '')[:80_000]}"
+    )
+
+    for plat in platforms:
+        try:
+            agent = get_browser_agent(plat, cfg)
+        except ValueError:
+            logger.warning("jarvis shadow: unknown platform %r", plat)
+            continue
+        except Exception as e:
+            logger.warning("jarvis shadow: get_browser_agent %r: %s", plat, e)
+            continue
+        try:
+            result = await agent.execute(combined)
+        except Exception as e:
+            logger.warning("jarvis shadow execute %r: %s", plat, e)
+            continue
+        out = (result.output or "").strip()
+        if result.success and out:
+            logger.info("jarvis shadow ok platform=%s chars=%d", plat, len(out))
+            return out, plat
+        logger.warning(
+            "jarvis shadow empty platform=%s success=%s err=%s",
+            plat,
+            result.success,
+            (result.error or "")[:200],
+        )
+    return "", ""
 
 
 def _jarvis_chat_timeout_sec() -> float:
@@ -488,6 +573,17 @@ async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
     except Exception as e:
         logger.exception("jarvis chat_reply transport uid=%s: %s", uid, e)
         return "", _JARVIS_CHAT_ERR_USER
+
+    if diag == "quota_exhausted":
+        logger.warning("jarvis chat_reply CLI quota exhausted uid=%s chat_id=%s", uid, chat_id)
+        shadow, plat = await _browser_shadow_reply(_JARVIS_CHAT_SYSTEM, t)
+        if shadow:
+            if plat in ("kimi", "moonshot", "deepseek"):
+                intro = _JARVIS_QUOTA_SHADOW_OK
+            else:
+                intro = f"长官，订阅额度已干爆，已为您切换至 {plat} 临时网页通道。"
+            return f"{intro}\n\n{shadow}", ""
+        return "", _JARVIS_QUOTA_SHADOW_FAIL
 
     if diag == "auth":
         logger.warning("jarvis chat_reply CLI auth uid=%s chat_id=%s", uid, chat_id)

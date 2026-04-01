@@ -24,7 +24,7 @@ import skill_library
 import auto_research
 import vital_signs
 import memory_engine as _memory_engine
-from self_monitor import self_monitor as _self_monitor
+from self_monitor import self_monitor as _self_monitor, trigger_alert
 
 # ─── SessionManager (multi-project routing) ──────────────────────────────────
 try:
@@ -805,6 +805,23 @@ _GATEWAY_CLI_AUTH_HINTS = (
     "api key 发给",
 )
 
+# Claude Code CLI subscription / monthly cap (stderr or echoed in stdout)
+_GATEWAY_CLI_QUOTA_HINTS = (
+    "you've hit your limit",
+    "you’ve hit your limit",
+    "hit your limit",
+    "quota exceeded",
+    "usage limit exceeded",
+    "exceeded your usage limit",
+    "billing limit",
+    "insufficient quota",
+)
+
+
+def _gateway_cli_quota_exhausted(blob_lower: str) -> bool:
+    b = blob_lower or ""
+    return any(h in b for h in _GATEWAY_CLI_QUOTA_HINTS)
+
 
 async def _jarvis_gateway_cli_chat_impl(
     system_prompt: str,
@@ -813,7 +830,13 @@ async def _jarvis_gateway_cli_chat_impl(
     chat_id: int,
     timeout_sec: float,
 ) -> tuple[str, str]:
-    """Single-turn gateway chat (used inside PersistentClaudeCLI tunnel)."""
+    """
+    Single-turn gateway chat (used inside PersistentClaudeCLI tunnel).
+
+    One ``claude -p`` turn with per-``chat_id`` ``--resume`` (``_claude_sessions``).
+    Returns ``(reply, "")`` on success, or ``("", diag)`` where ``diag`` is
+    ``auth`` | ``cli_missing`` | ``timeout`` | ``quota_exhausted`` | ``empty`` | ``error`` for callers to map UX.
+    """
     sys_t = (system_prompt or "").strip()
     usr_t = (user_text or "").strip()
     if not usr_t:
@@ -871,6 +894,22 @@ async def _jarvis_gateway_cli_chat_impl(
 
     if "timeout" in err_l or "timeout after" in err_l:
         return "", "timeout"
+
+    if _gateway_cli_quota_exhausted(blob_l):
+        try:
+            await trigger_alert(
+                "claude_cli_quota",
+                "Claude CLI reported subscription/usage limit (e.g. You've hit your limit). Shadow browser fallback may activate.",
+                severity="warning",
+            )
+        except Exception:
+            logger.exception("trigger_alert claude_cli_quota failed")
+        _self_monitor.record_service_failure("claude_cli_gateway", "quota_exhausted")
+        # 降级：丢弃 resume，下一轮从新会话起算，避免卡死在坏 session
+        _claude_sessions.pop(chat_id, None)
+        _session_timestamps.pop(chat_id, None)
+        _save_sessions()
+        return "", "quota_exhausted"
 
     if not out:
         if "claude cli not found" in err_l or "not found" in err_l and "claude" in err_l:
@@ -1672,6 +1711,16 @@ async def _run_llm_turn(
             and any(p in response.lower() for p in _ERROR_PATTERNS["rate"])
         ):
             logger.warning("Claude CLI rate limit in short response: %s", response[:200])
+            if _gateway_cli_quota_exhausted(response.lower()):
+                try:
+                    await trigger_alert(
+                        "claude_cli_quota",
+                        "Claude CLI (main turn): subscription/usage cap in model output (e.g. hit your limit).",
+                        severity="warning",
+                    )
+                except Exception:
+                    logger.exception("trigger_alert claude_cli_quota main turn")
+                _self_monitor.record_service_failure("claude_cli", "quota_exhausted")
             cooldown = _get_rate_limit_cooldown()
             _rate_limit_consecutive += 1
             _rate_limited_until = time.time() + cooldown
@@ -1691,7 +1740,17 @@ async def _run_llm_turn(
                 _save_sessions()
                 response = "__AUTH_ERROR__"
                 new_session_id = None
-            elif "rate limit" in err_lower or "429" in err_text:
+            elif "rate limit" in err_lower or "429" in err_text or _gateway_cli_quota_exhausted(err_lower):
+                if _gateway_cli_quota_exhausted(err_lower):
+                    try:
+                        await trigger_alert(
+                            "claude_cli_quota",
+                            "Claude CLI (stderr): subscription/usage cap detected.",
+                            severity="warning",
+                        )
+                    except Exception:
+                        logger.exception("trigger_alert claude_cli_quota stderr")
+                    _self_monitor.record_service_failure("claude_cli", "quota_exhausted")
                 cooldown = _get_rate_limit_cooldown()
                 _rate_limit_consecutive += 1
                 _rate_limited_until = time.time() + cooldown

@@ -20,8 +20,8 @@ Telegram Gateway — PTB：极简全自动看板。
   ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
   配置总线：写 ``session_commander_config.json`` 的 ``active_skills``；God 引擎用 **watchdog** 监听 JSON 并 ``reload_skills``。
   斜杠：``/start`` 网关面板；``/trade``、``/t`` 委托 ``bot.trade_dashboard_command``。
-  其它 ``/…`` 与纯文本相同，默认走 Jarvis 语义路由；**FAST_ACTION_MAP** 在 LLM 与 ``chat_reply`` 之前拦截：
-  中文「卖出/买入/下单…」→ 直接唤起 ``/trade`` 面板；「持仓/余额/资产」→ 主看板；「状态/监控」→ 速报；斜杠 ``/trade``、``/t``、``/portfolio``、``/status`` 同理。
+  其它 ``/…`` 与纯文本相同，默认走 Jarvis 语义路由；**FAST_ACTION_MAP** + **FAST_COMMANDS** 在 LLM 与 ``chat_reply`` 之前拦截：
+  中文「卖出/买入/下单…」→ ``/trade`` 面板；「持仓/余额/状态/面板…」→ ``render_dashboard_text``；「刷新…」→ 后台 ``refresh_once`` 后同看板；斜杠 ``/trade``、``/t``、``/portfolio``、``/status``、``/refresh`` 同理。
 
 Run:   python -m gateway.telegram_bot
 """
@@ -91,8 +91,8 @@ def _text_triggers_ledger_resync(text: str) -> bool:
     return False
 
 
-# 脊髓反射 · FAST_ACTION_MAP：中文子串（有序）+ 斜杠命令头；不经 classify_intent / chat_reply
-_FAST_ACTION_CN: tuple[tuple[str, str], ...] = (
+# 极速反射区：交易中文子串（有序）+ FAST_COMMANDS 看板/刷新；不经 classify_intent / chat_reply
+_FAST_TRADE_CN: tuple[tuple[str, str], ...] = (
     ("卖出", "trade_panel"),
     ("卖币", "trade_panel"),
     ("抛售", "trade_panel"),
@@ -103,19 +103,31 @@ _FAST_ACTION_CN: tuple[tuple[str, str], ...] = (
     ("开仓", "trade_panel"),
     ("交易面板", "trade_panel"),
     ("极速交易", "trade_panel"),
-    ("持仓", "portfolio"),
-    ("仓位", "portfolio"),
-    ("余额", "portfolio"),
-    ("资产", "portfolio"),
-    ("状态", "status"),
-    ("监控", "status"),
 )
+
+# 看板：``dashboard`` = 快照看板；``refresh_dashboard`` = 后台 refresh_once 后再渲染
+FAST_COMMANDS: dict[str, tuple[str, ...]] = {
+    "refresh_dashboard": ("刷新", "刷新资产", "重载快照", "更新快照", "/refresh"),
+    "dashboard": (
+        "持仓",
+        "仓位",
+        "余额",
+        "资产",
+        "状态",
+        "监控",
+        "面板",
+        "看板",
+        "/portfolio",
+        "/status",
+        "/panel",
+    ),
+}
 
 
 def _resolve_fast_action(text: str) -> str | None:
     """
-    Return ``trade_panel`` | ``portfolio`` | ``status`` | ``None``.
-    Slash: /trade, /t, /portfolio, /status (supports @botname).
+    Return ``trade_panel`` | ``refresh_dashboard`` | ``dashboard`` | ``None``.
+    刷新优先于看板子串；交易子串在刷新之后、看板之前。斜杠支持 ``@botname``。
     """
     raw = (text or "").strip()
     if not raw:
@@ -128,14 +140,33 @@ def _resolve_fast_action(text: str) -> str | None:
         return "trade_panel"
     if head in ("/t",) or head.startswith("/t@"):
         return "trade_panel"
+    if "/refresh" in low or head.startswith("/refresh"):
+        return "refresh_dashboard"
     if "/portfolio" in low or head.startswith("/portfolio"):
-        return "portfolio"
+        return "dashboard"
     if "/status" in low or head.startswith("/status"):
-        return "status"
+        return "dashboard"
+    if "/panel" in low or head.startswith("/panel"):
+        return "dashboard"
 
-    for needle, action in _FAST_ACTION_CN:
+    for sub in FAST_COMMANDS["refresh_dashboard"]:
+        if sub.startswith("/"):
+            if sub.lower() in low:
+                return "refresh_dashboard"
+        elif sub in raw:
+            return "refresh_dashboard"
+
+    for needle, action in _FAST_TRADE_CN:
         if needle in raw:
             return action
+
+    for sub in FAST_COMMANDS["dashboard"]:
+        if sub.startswith("/"):
+            if sub.lower() in low:
+                return "dashboard"
+        elif sub in raw:
+            return "dashboard"
+
     return None
 
 
@@ -290,7 +321,7 @@ async def _dispatch_fast_action(
     uid: int,
     action: str,
 ) -> None:
-    """Execute FAST_ACTION_MAP hit: local cache only, no Jarvis ``chat_reply``."""
+    """Execute fast path: trade panel or ``render_dashboard_text`` (no Jarvis ``chat_reply``)."""
     mark_gateway_user_activity()
     global USER_MODE
     store = await _session_store_async(context.application)
@@ -300,25 +331,28 @@ async def _dispatch_fast_action(
         await cmd_trade(update, context)
         return
 
+    if action == "refresh_dashboard":
+        try:
+            from trading import portfolio_snapshot
+
+            asyncio.create_task(portfolio_snapshot.refresh_once())
+        except Exception:
+            logger.exception("fast path refresh_once enqueue")
+
+    if action not in ("refresh_dashboard", "dashboard"):
+        return
+
     snap, st, stats = _dashboard_sync()
     try:
-        from gateway.tg_front import (
-            build_dashboard_keyboard,
-            render_dashboard_text,
-            render_status_brief_text,
-        )
+        from gateway.tg_front import build_dashboard_keyboard, render_dashboard_text
 
-        if action == "portfolio":
-            body = render_dashboard_text(USER_MODE, snap, st, stats)
-            kb = build_dashboard_keyboard(bool(st.get("active")))
-            await update.message.reply_text(
-                body,
-                reply_markup=kb,
-                parse_mode="MarkdownV2",
-            )
-        elif action == "status":
-            body = render_status_brief_text(USER_MODE, snap, st, stats)
-            await update.message.reply_text(body, parse_mode="MarkdownV2")
+        body = render_dashboard_text(USER_MODE, snap, st, stats)
+        kb = build_dashboard_keyboard(bool(st.get("active")))
+        await update.message.reply_text(
+            body,
+            reply_markup=kb,
+            parse_mode="MarkdownV2",
+        )
     except Exception as e:
         logger.exception("fast action dispatch failed action=%s", action)
         try:

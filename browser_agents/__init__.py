@@ -13,6 +13,8 @@ Supported platforms:
 - Grok (grok.com)
 - Claude Web (claude.ai)
 - Claude Code Web (claude.ai/code)
+- Kimi (kimi.moonshot.cn)
+- DeepSeek (chat.deepseek.com)
 - Codex (chatgpt.com/codex or similar)
 """
 
@@ -21,6 +23,8 @@ from browser_agents.chatgpt import ChatGPTAgent
 from browser_agents.grok import GrokAgent
 from browser_agents.claude_web import ClaudeWebAgent
 from browser_agents.claude_code_web import ClaudeCodeWebAgent
+from browser_agents.kimi import KimiAgent
+from browser_agents.deepseek import DeepSeekAgent
 
 PLATFORM_AGENTS = {
     "gpt": ChatGPTAgent,
@@ -29,6 +33,9 @@ PLATFORM_AGENTS = {
     "claude_web": ClaudeWebAgent,
     "claude_code": ClaudeCodeWebAgent,
     "codex": ChatGPTAgent,  # Codex runs within ChatGPT interface
+    "kimi": KimiAgent,
+    "moonshot": KimiAgent,
+    "deepseek": DeepSeekAgent,
 }
 
 
@@ -43,5 +50,6 @@ def get_browser_agent(platform: str, config: BrowserConfig | None = None) -> Bro
 __all__ = [
     "BrowserAgent", "BrowserConfig", "AgentResult",
     "ChatGPTAgent", "GrokAgent", "ClaudeWebAgent", "ClaudeCodeWebAgent",
+    "KimiAgent", "DeepSeekAgent",
     "get_browser_agent", "PLATFORM_AGENTS",
 ]
