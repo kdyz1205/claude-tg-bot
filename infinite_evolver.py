@@ -825,6 +825,9 @@ def _run_subprocess_backtest(
     env = os.environ.copy()
     env["BACKTEST_DATA_PATH"] = tmp_data_path
     env["PYTHONPATH"] = str(BASE)
+    # Subprocess strategy scripts must not hammer OKX/CoinGecko from worker pools.
+    env["EVOLVER_BACKTEST_OFFLINE_ONLY"] = "1"
+    env["BACKTEST_OFFLINE_ONLY"] = "1"
 
     try:
         r = subprocess.run(

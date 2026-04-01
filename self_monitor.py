@@ -277,7 +277,6 @@ class SelfMonitor:
         self._MAX_SERVICES = 50
         self._overall_state: str = self.STATE_HEALTHY
         self._consecutive_msg_failures: int = 0
-        self._silence_alerted: bool = False  # Only alert once per silence period
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -341,7 +340,6 @@ class SelfMonitor:
         """Call when a message is successfully processed."""
         self._last_successful_msg_time = time.time()
         self._consecutive_msg_failures = 0
-        self._silence_alerted = False  # Reset so next silence period gets one alert
         # Update overall state
         if self._overall_state != self.STATE_HEALTHY:
             logger.info("Bot recovered to HEALTHY state")
@@ -663,20 +661,6 @@ class SelfMonitor:
                         "value": top_count,
                     })
 
-        # 5. No messages for a long time (if we ever received any)
-        # Alert ONCE when silence exceeds 1 hour, then stop.
-        # _silence_alerted is reset when a successful message is processed.
-        if self._last_successful_msg_time > 0 and not self._silence_alerted:
-            silence = now - self._last_successful_msg_time
-            if silence > 3600:
-                self._silence_alerted = True  # Only alert once per silence period
-                anomalies.append({
-                    "type": "message_silence",
-                    "severity": "warning",
-                    "message": f"No successful messages for {_format_duration(silence)}. Bot state: {self._overall_state}",
-                    "value": silence,
-                })
-
         return anomalies
 
     # ── alerts ───────────────────────────────────────────────────────────
@@ -698,6 +682,13 @@ class SelfMonitor:
     async def _fire_alerts(self, anomalies: list[dict]) -> None:
         import inspect
         now = time.time()
+
+        # Bot is healthy: do not push heuristic self-monitor noise to Telegram.
+        # Explicit subsystem alerts from trigger_alert() use type prefix "ext:" (trading, repair, filters, etc.).
+        if self._overall_state == self.STATE_HEALTHY:
+            anomalies = [a for a in anomalies if str(a.get("type", "")).startswith("ext:")]
+        if not anomalies:
+            return
 
         # Deduplicate: skip anomalies of the same type sent recently
         # NOTE: key uses ONLY the type, not message content — messages like
@@ -1297,8 +1288,8 @@ code_repair = CodeSelfRepair()
 async def trigger_alert(alert_type: str, message: str, *, severity: str = "warning") -> None:
     """Subsystem hook: record in error window and notify registered alert handlers.
 
-    Dedup uses anomaly ``type``; external alerts are namespaced to avoid clashing
-    with internal monitor keys (e.g. message_silence).
+    Dedup uses anomaly ``type``; external alerts are namespaced (``ext:...``) so they still
+    reach Telegram when the bot is in STATE_HEALTHY, unlike internal heuristic anomalies.
     """
     text = f"[{alert_type}] {message}"
     self_monitor.record_error(text[:500])

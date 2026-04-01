@@ -44,6 +44,11 @@ JUPITER_TOKEN_LIST = "https://token.jup.ag/strict"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
+# God / delta-neutral DEX hard rails (meme liquidity + slippage + gas headroom)
+GOD_DEX_MIN_LIQUIDITY_USD = 10_000.0
+GOD_MAX_JUPITER_SLIPPAGE_BPS = 200
+GOD_GAS_RESERVE_SOL = 0.015
+
 # ── Risk Control Defaults ──
 DEFAULT_LIVE_CONFIG = {
     "enabled": False,
@@ -411,8 +416,15 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
             logger.warning("llm trade guard error: %s", e)
             return None
 
+    val_cfg = dict(cfg)
+    if signal_data and signal_data.get("god_engine"):
+        val_cfg["min_liquidity_usd"] = max(
+            float(val_cfg.get("min_liquidity_usd", 0) or 0),
+            GOD_DEX_MIN_LIQUIDITY_USD,
+        )
+
     # Token safety check
-    valid, val_reason = await _validate_token(mint, cfg)
+    valid, val_reason = await _validate_token(mint, val_cfg)
     if not valid:
         logger.warning(f"Token rejected: {val_reason}")
         return None
@@ -425,6 +437,8 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
     # Get quote
     amount_lamports = int(amount_sol * 1_000_000_000)
     cap_bps = int(cfg.get("max_slippage_bps", 100))
+    if signal_data and signal_data.get("god_engine"):
+        cap_bps = min(cap_bps, GOD_MAX_JUPITER_SLIPPAGE_BPS)
     bps = min(cap_bps, dex_trader.compute_dynamic_slippage_bps(0, 0))
     quote = await _get_jupiter_quote(SOL_MINT, mint, amount_lamports, bps)
     if not quote:
@@ -765,9 +779,38 @@ async def _run_delta_neutral_with_recovery(
 
     execu = _shared_hedge_okx_executor()
     cfg = _load_config()
+    sig = signal_data or {}
+
+    if sig.get("god_engine"):
+        import secure_wallet as _sw
+
+        bal = await _sw.get_sol_balance()
+        if bal is None:
+            return {
+                "ok": False,
+                "reason": "god_balance_unknown",
+                "dex": None,
+                "hedge": None,
+                "notional_usd": 0.0,
+            }
+        reserve = max(float(cfg.get("min_sol_reserve", 0.05)), GOD_GAS_RESERVE_SOL)
+        amount_sol = min(float(amount_sol), max(0.0, float(bal) - reserve))
+        if amount_sol < 0.01:
+            logger.warning(
+                "delta-neutral god: insufficient SOL after reserve (bal=%.4f reserve=%.4f)",
+                bal,
+                reserve,
+            )
+            return {
+                "ok": False,
+                "reason": "god_insufficient_sol",
+                "dex": None,
+                "hedge": None,
+                "notional_usd": 0.0,
+            }
+
     sol_p = await _get_sol_price_usd()
     usd = max(1.0, float(amount_sol) * float(sol_p))
-    sig = signal_data or {}
 
     async def _dex_leg() -> Any:
         return await buy_token(mint, amount_sol, symbol, signal_data=sig)

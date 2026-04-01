@@ -93,6 +93,28 @@ _ALLOWED = _allowed_user_ids()
 _STORE: SessionStore | None = None
 
 
+async def _gw_post_init(application: Application) -> None:
+    """Bind heavy work to PTB’s loop via ``application.create_task`` (see god_orchestrator)."""
+    logger.info("Gateway Telegram post_init — polling loop ready")
+
+
+async def _gw_post_shutdown(application: Application) -> None:
+    try:
+        from pipeline.god_orchestrator import stop_autonomous_engine
+
+        await stop_autonomous_engine()
+    except Exception:
+        logger.exception("Gateway post_shutdown: god engine stop failed")
+
+
+def _gw_schedule(application: Application, coro) -> asyncio.Task:
+    """Prefer PTB task scheduling so work shares the official polling event loop."""
+    fn = getattr(application, "create_task", None)
+    if fn is not None:
+        return fn(coro)
+    return asyncio.create_task(coro)
+
+
 def _session_store_lock(application: Application) -> asyncio.Lock:
     return application.bot_data.setdefault("_gw_session_store_init_lock", asyncio.Lock())
 
@@ -305,7 +327,7 @@ async def _gw_panel_work(
         if action == "mode":
             new_mode = "live" if arg == "live" else "paper"
             USER_MODE = new_mode
-            asyncio.create_task(_persist_user_mode(application, uid, new_mode))
+            _gw_schedule(application, _persist_user_mode(application, uid, new_mode))
             await _safe_edit_markdown(
                 bot,
                 chat_id,
@@ -343,7 +365,11 @@ async def _gw_panel_work(
                 except Exception as e:
                     logger.debug("god alert send: %s", e)
 
-            started = await start_autonomous_engine(alert_sender=_god_alert, paper_mode=False)
+            started = await start_autonomous_engine(
+                alert_sender=_god_alert,
+                paper_mode=False,
+                application=application,
+            )
             if started:
                 GOD_ENGINE_ACTIVE = True
                 await _safe_edit_markdown(
@@ -386,8 +412,9 @@ async def _gw_panel_work(
                     render_positions_text(USER_MODE, snap, refreshing=True),
                     build_positions_keyboard(),
                 )
-            asyncio.create_task(
-                _followup_positions_refresh(application, bot, chat_id, message_id)
+            _gw_schedule(
+                application,
+                _followup_positions_refresh(application, bot, chat_id, message_id),
             )
             return
     except Exception as e:
@@ -432,8 +459,9 @@ async def handle_gateway_callback(
     chat_id = query.message.chat_id
     message_id = query.message.message_id
 
-    asyncio.create_task(
-        _gw_panel_work(application, bot, chat_id, message_id, uid, action, arg)
+    _gw_schedule(
+        application,
+        _gw_panel_work(application, bot, chat_id, message_id, uid, action, arg),
     )
 
 
@@ -455,7 +483,13 @@ class TelegramBot:
         return handler
 
     def build_application(self) -> Application:
-        app = Application.builder().token(self.token).build()
+        app = (
+            Application.builder()
+            .token(self.token)
+            .post_init(_gw_post_init)
+            .post_shutdown(_gw_post_shutdown)
+            .build()
+        )
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("panel", cmd_panel))
         app.add_handler(CommandHandler("dev", cmd_dev))

@@ -46,6 +46,8 @@ _stop_event: Optional[asyncio.Event] = None
 _bg_tasks: list[asyncio.Task[Any]] = []
 _alert_sender: Optional[Callable[[str], Awaitable[None]]] = None
 _trip_once = threading.Event()
+# When set, forge/radar tasks use PTB ``Application.create_task`` (same loop as polling).
+_telegram_create_task: Optional[Callable[..., Any]] = None
 
 
 def is_god_hard_stop() -> bool:
@@ -175,6 +177,13 @@ async def _trip_kill_switch_async(message: str) -> None:
     os._exit(1)
 
 
+def _spawn_loop_task(coro: Any, *, name: str) -> asyncio.Task[Any]:
+    fn = _telegram_create_task
+    if fn is not None:
+        return fn(coro, name=name)
+    return asyncio.create_task(coro, name=name)
+
+
 async def _forge_loop(stop: asyncio.Event) -> None:
     from infinite_evolver import infinite_evolver
 
@@ -182,12 +191,20 @@ async def _forge_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
         if is_god_hard_stop():
             break
+        prev = os.environ.get("EVOLVER_BACKTEST_OFFLINE_ONLY")
+        os.environ["EVOLVER_BACKTEST_OFFLINE_ONLY"] = "1"
         try:
-            await infinite_evolver._sweep()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception("God forge sweep error: %s", e)
+            try:
+                await infinite_evolver._sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("God forge sweep error: %s", e)
+        finally:
+            if prev is None:
+                os.environ.pop("EVOLVER_BACKTEST_OFFLINE_ONLY", None)
+            else:
+                os.environ["EVOLVER_BACKTEST_OFFLINE_ONLY"] = prev
         try:
             await refresh_global_best_from_evolver_state()
         except Exception as e:
@@ -236,6 +253,14 @@ async def _god_radar_once() -> None:
     inst = cfg.get("neural_okx_inst") or "BTC-USDT-SWAP"
     stream = await ensure_stream_started(inst, window=max(512, seq_len * 4))
     tens = await stream.build_model_tensor(seq_len=seq_len)
+    try:
+        from trading.local_ohlcv_cache import write_live_1m_snapshot
+
+        snap = await stream.snapshot_ohlcv()
+        if len(snap) >= 64:
+            await asyncio.to_thread(write_live_1m_snapshot, stream.inst_id, snap)
+    except Exception as e:
+        logger.debug("tensor cache snapshot: %s", e)
     if tens is None:
         return
 
@@ -250,8 +275,8 @@ async def _god_radar_once() -> None:
     balance = await secure_wallet.get_sol_balance()
     if not balance:
         return
-    reserve = float(cfg.get("min_sol_reserve", 0.05))
-    trade_sol = min(TRADE_NOTIONAL_SOL, max(0.01, balance - reserve))
+    gas_floor = max(float(cfg.get("min_sol_reserve", 0.05)), 0.015)
+    trade_sol = min(TRADE_NOTIONAL_SOL, max(0.01, balance - gas_floor))
 
     hedge_sym = cfg.get("neural_hedge_symbol") or "SOLUSDT"
     sigd = {
@@ -333,13 +358,14 @@ async def start_autonomous_engine(
     alert_sender: Optional[Callable[[str], Awaitable[None]]] = None,
     *,
     paper_mode: bool = False,
+    application: Any = None,
 ) -> bool:
     """
     Spawn two daemon tasks: forge (evolver sweeps) + radar (live tensor → Δ-neutral).
 
     Returns False if already running. ``paper_mode`` runs forge only (radar idles).
     """
-    global _running, _stop_event, _bg_tasks, _alert_sender
+    global _running, _stop_event, _bg_tasks, _alert_sender, _telegram_create_task
 
     if _running:
         logger.info("God engine already running")
@@ -347,6 +373,13 @@ async def start_autonomous_engine(
 
     reset_god_session_guard()
     _alert_sender = alert_sender
+    if application is not None and hasattr(application, "create_task"):
+        _telegram_create_task = lambda coro, name=None: application.create_task(  # type: ignore[misc]
+            coro,
+            name=name,
+        )
+    else:
+        _telegram_create_task = None
     _stop_event = asyncio.Event()
     _stop_event.clear()
     _bg_tasks = []
@@ -358,8 +391,8 @@ async def start_autonomous_engine(
 
     _running = True
 
-    t_forge = asyncio.create_task(_forge_loop(_stop_event), name="god_forge")
-    t_radar = asyncio.create_task(
+    t_forge = _spawn_loop_task(_forge_loop(_stop_event), name="god_forge")
+    t_radar = _spawn_loop_task(
         _radar_loop(_stop_event, paper_mode=paper_mode),
         name="god_radar",
     )
@@ -376,7 +409,7 @@ async def start_autonomous_engine(
 
 async def stop_autonomous_engine() -> None:
     """Cancel forge/radar tasks (no process exit)."""
-    global _running, _stop_event, _bg_tasks
+    global _running, _stop_event, _bg_tasks, _telegram_create_task
 
     if not _running:
         return
@@ -392,3 +425,4 @@ async def stop_autonomous_engine() -> None:
         except asyncio.CancelledError:
             pass
     _bg_tasks = []
+    _telegram_create_task = None

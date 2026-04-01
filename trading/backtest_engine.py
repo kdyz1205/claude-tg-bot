@@ -91,16 +91,42 @@ class BacktestResult:
         )
 
 
+def _offline_backtest_enforced() -> bool:
+    return os.environ.get("EVOLVER_BACKTEST_OFFLINE_ONLY", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 async def fetch_ohlcv(
     symbol: str, bar: str = "4H", limit: int = 1000, use_cache: bool = True
 ) -> np.ndarray:
     """Fetch OHLCV from OKX and return as numpy array [ts, o, h, l, c, vol].
 
     Caches results to avoid repeated API calls.
+    When ``EVOLVER_BACKTEST_OFFLINE_ONLY=1``, **no HTTP** — disk cache / live WSS snapshot only.
     """
     base = symbol.upper().replace("USDT", "").replace("-", "")
     inst_id = f"{base}-USDT-SWAP"
     cache_file = DATA_CACHE_DIR / f"{inst_id}_{bar}_{limit}.npy"
+
+    if _offline_backtest_enforced():
+        from trading.local_ohlcv_cache import load_offline_ohlcv
+
+        off = load_offline_ohlcv(inst_id, bar, limit)
+        if off is not None and len(off) >= 80:
+            log.info(
+                "fetch_ohlcv OFFLINE %s %s rows=%d (no HTTP)",
+                inst_id,
+                bar,
+                len(off),
+            )
+            return off
+        raise ValueError(
+            f"Offline backtest: no local OHLCV for {inst_id} {bar}. "
+            f"Run radar / warm cache or place {cache_file.name} under _data_cache/."
+        )
 
     if use_cache and cache_file.exists():
         age_hours = (time.time() - cache_file.stat().st_mtime) / 3600
