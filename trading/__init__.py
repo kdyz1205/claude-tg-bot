@@ -2,7 +2,12 @@
 
 from .indicators import sma, ema, atr, bb_upper, bb_lower, slope
 from .okx_executor import (
-    OKXExecutor, Position, TradeRecord, RiskLimits, AgentState,
+    OKXExecutor,
+    OKXDeltaNeutralExecutor,
+    Position,
+    TradeRecord,
+    RiskLimits,
+    AgentState,
 )
 from .strategy_brain import StrategyBrain, LessonsLedger, PreTradeChecklist
 from .backtest_engine import (
@@ -14,7 +19,12 @@ from .reflection import ReflectionEngine, reflection_engine
 from .continuous_learner import ContinuousLearner, continuous_learner
 
 __all__ = [
-    "OKXExecutor", "Position", "TradeRecord", "RiskLimits", "AgentState",
+    "OKXExecutor",
+    "OKXDeltaNeutralExecutor",
+    "Position",
+    "TradeRecord",
+    "RiskLimits",
+    "AgentState",
     "StrategyBrain", "LessonsLedger", "PreTradeChecklist",
     "sma", "ema", "atr", "bb_upper", "bb_lower", "slope",
     "run_backtest", "quick_backtest", "BacktestConfig", "BacktestResult", "fetch_ohlcv",

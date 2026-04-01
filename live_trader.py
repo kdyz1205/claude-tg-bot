@@ -11,11 +11,14 @@ from typing import Optional
 
 import httpx
 
+import dex_trader
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
 POSITIONS_FILE = BASE_DIR / "_live_positions.json"
 LIVE_CONFIG_FILE = BASE_DIR / "_live_config.json"
+POLY_EXECUTIONS_FILE = BASE_DIR / "_poly_executions.json"
 
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
@@ -42,6 +45,30 @@ DEFAULT_LIVE_CONFIG = {
     "starting_balance_sol": 0,    # set on first start
     "daily_pnl_sol": 0,
     "daily_reset_ts": 0,
+    # Phase 11–12: neural → DEX buy + OKX perp hedge (off by default)
+    "neural_execution_enabled": False,
+    "neural_confidence_threshold": 0.85,
+    "neural_okx_inst": "BTC-USDT-SWAP",
+    "neural_hedge_symbol": "SOLUSDT",
+    "neural_dex_mint": "",
+    "neural_poll_sec": 45,
+    "hedge_leg_retry_count": 8,
+    "hedge_leg_retry_delay_sec": 0.35,
+    "dex_leg_retry_count": 3,
+    # Polymarket：Gamma/CLOB 概率差扫描 + CLOB 处决（默认关闭）
+    "poly_enabled": False,
+    "poly_oracle_interval_sec": 3600,
+    "poly_edge_threshold_pct": 15.0,
+    "poly_bankroll_usd": 500.0,
+    "poly_fractional_kelly": 0.25,
+    "poly_max_stake_usd": 200.0,
+    "poly_min_stake_usd": 5.0,
+    "poly_order_type": "FOK",
+    "poly_max_markets_scan": 80,
+    "poly_min_liquidity_usd": 5000.0,
+    "poly_require_unrestricted": True,
+    "poly_dedupe_hours": 24,
+    "poly_max_orders_per_scan": 1,
 }
 
 
@@ -156,26 +183,13 @@ async def _execute_jupiter_swap(quote: dict, user_pubkey: str) -> Optional[str]:
         # Submit signed transaction
         signed_b64 = b64.b64encode(signed_bytes).decode()
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.mainnet-beta.solana.com",
-                json={
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "sendTransaction",
-                    "params": [
-                        signed_b64,
-                        {"encoding": "base64", "skipPreflight": False,
-                         "preflightCommitment": "confirmed", "maxRetries": 3}
-                    ]
-                }
-            )
-            result = resp.json()
-            if "error" in result:
-                logger.error(f"TX submit error: {result['error']}")
-                return None
-            sig = result.get("result")
+        sig = await dex_trader.submit_signed_tx_base64(
+            signed_b64,
+            skip_preflight=False,
+        )
+        if sig:
             logger.info(f"Swap TX submitted: {sig}")
-            return sig
+        return sig
 
     except Exception as e:
         logger.error(f"Swap execution error: {e}")
@@ -346,13 +360,20 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
 
     # Get quote
     amount_lamports = int(amount_sol * 1_000_000_000)
-    slippage = cfg.get("max_slippage_bps", 100)
-    quote = await _get_jupiter_quote(SOL_MINT, mint, amount_lamports, slippage)
+    cap_bps = int(cfg.get("max_slippage_bps", 100))
+    bps = min(cap_bps, dex_trader.compute_dynamic_slippage_bps(0, 0))
+    quote = await _get_jupiter_quote(SOL_MINT, mint, amount_lamports, bps)
     if not quote:
         return None
 
     # Check price impact
     price_impact = float(quote.get("priceImpactPct", 0) or 0)
+    bps2 = min(cap_bps, dex_trader.compute_dynamic_slippage_bps(price_impact, 0))
+    if bps2 != bps:
+        quote = await _get_jupiter_quote(SOL_MINT, mint, amount_lamports, bps2)
+        if not quote:
+            return None
+        price_impact = float(quote.get("priceImpactPct", 0) or 0)
     if price_impact > 2.0:
         logger.warning(f"Price impact too high: {price_impact:.2f}%")
         return None
@@ -432,10 +453,9 @@ async def sell_token(position_id: str, reason: str = "manual") -> Optional[dict]
     # Sell all tokens back to SOL
     raw_amount = int(token_bal["amount"] * (10 ** token_bal["decimals"]))
     cfg = _load_config()
-    quote = await _get_jupiter_quote(
-        pos["mint"], SOL_MINT, raw_amount,
-        cfg.get("max_slippage_bps", 100)
-    )
+    cap_bps = int(cfg.get("max_slippage_bps", 100))
+    sbps = min(cap_bps, dex_trader.compute_dynamic_slippage_bps(0, 0))
+    quote = await _get_jupiter_quote(pos["mint"], SOL_MINT, raw_amount, sbps)
     if not quote:
         return None
 
@@ -604,6 +624,472 @@ def format_live_status() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PHASE 12 — Delta-neutral: concurrent legs + legged recovery + locks
+# ══════════════════════════════════════════════════════════════════════════════
+
+_mint_delta_locks: dict[str, asyncio.Lock] = {}
+_neural_pipeline_lock = asyncio.Lock()
+_shared_hedge_okx: Any = None
+
+
+def _shared_hedge_okx_executor():
+    """Single OKXExecutor for hedge legs — reuses aiohttp TCP pool across trades."""
+    global _shared_hedge_okx
+    from trading.okx_executor import OKXExecutor
+
+    if _shared_hedge_okx is None:
+        _shared_hedge_okx = OKXExecutor()
+    _shared_hedge_okx.load_state()
+    return _shared_hedge_okx
+
+
+def _mint_delta_lock(mint: str) -> asyncio.Lock:
+    if mint not in _mint_delta_locks:
+        _mint_delta_locks[mint] = asyncio.Lock()
+    return _mint_delta_locks[mint]
+
+
+def _dex_leg_success(dex_r: Any) -> bool:
+    return isinstance(dex_r, dict) and bool(dex_r.get("tx_signature"))
+
+
+def _hedge_leg_success(hed_r: Any) -> bool:
+    return isinstance(hed_r, dict) and hed_r.get("ok") is True
+
+
+async def _run_delta_neutral_with_recovery(
+    mint: str,
+    amount_sol: float,
+    symbol: str,
+    hedge_symbol: str,
+    signal_data: Optional[dict],
+) -> dict:
+    """
+    True concurrent DEX buy + OKX short (gather). On legged fill:
+    - DEX ok / hedge fail → retry hedge; then emergency DEX sell + alert.
+    - Hedge ok / DEX fail → retry DEX; then emergency OKX flatten + alert.
+    """
+    from self_monitor import trigger_alert
+
+    execu = _shared_hedge_okx_executor()
+    cfg = _load_config()
+    sol_p = await _get_sol_price_usd()
+    usd = max(1.0, float(amount_sol) * float(sol_p))
+    sig = signal_data or {}
+
+    h_retries = max(1, int(cfg.get("hedge_leg_retry_count", 8)))
+    h_delay = float(cfg.get("hedge_leg_retry_delay_sec", 0.35))
+    d_retries = max(1, int(cfg.get("dex_leg_retry_count", 3)))
+
+    async def _dex_leg() -> Any:
+        return await buy_token(mint, amount_sol, symbol, signal_data=sig)
+
+    async def _hedge_leg() -> Any:
+        return await execu.open_position_with_retry(hedge_symbol, "short", usd)
+
+    dex_r, hed_r = await asyncio.gather(
+        _dex_leg(),
+        _hedge_leg(),
+        return_exceptions=True,
+    )
+    if isinstance(dex_r, BaseException):
+        logger.error("DEX leg raised: %s", dex_r, exc_info=True)
+        dex_r = None
+    if isinstance(hed_r, BaseException):
+        hed_r = {"ok": False, "reason": str(hed_r)}
+
+    dex_ok = _dex_leg_success(dex_r)
+    hedge_ok = _hedge_leg_success(hed_r)
+
+    # ── Retry hedge only (naked long risk) ─────────────────────────────
+    if dex_ok and not hedge_ok:
+        for i in range(h_retries):
+            await asyncio.sleep(h_delay)
+            logger.warning(
+                "Hedge retry %s/%s after DEX fill mint=%s",
+                i + 1,
+                h_retries,
+                mint[:8],
+            )
+            hed_r = await execu.open_position_with_retry(
+                hedge_symbol, "short", usd, max_retries=3
+            )
+            if _hedge_leg_success(hed_r):
+                hedge_ok = True
+                break
+        if dex_ok and not hedge_ok:
+            await trigger_alert(
+                "NAKED_LONG_RISK",
+                f"DEX filled but OKX short failed after {h_retries} retries mint={mint}. Emergency selling spot.",
+                severity="critical",
+            )
+            pid = dex_r.get("id") if isinstance(dex_r, dict) else None
+            if pid:
+                await sell_token(pid, "emergency_hedge_failed")
+            return {
+                "ok": False,
+                "reason": "naked_long_rolled_back",
+                "dex": dex_r,
+                "hedge": hed_r,
+                "notional_usd": usd,
+            }
+
+    # ── Retry DEX only (naked short on perp) ───────────────────────────
+    if hedge_ok and not dex_ok:
+        for j in range(d_retries):
+            await asyncio.sleep(h_delay)
+            logger.warning(
+                "DEX buy retry %s/%s hedge already on %s",
+                j + 1,
+                d_retries,
+                hedge_symbol,
+            )
+            dex_r = await buy_token(mint, amount_sol, symbol, signal_data=sig)
+            if _dex_leg_success(dex_r):
+                dex_ok = True
+                break
+        if hedge_ok and not dex_ok:
+            await trigger_alert(
+                "NAKED_SHORT_RISK",
+                f"OKX short on {hedge_symbol} but DEX buy failed after {d_retries} tries. Flattening hedge.",
+                severity="critical",
+            )
+            flat = await execu.close_position(hedge_symbol, reason="emergency_dex_failed")
+            await execu.aclose()
+            return {
+                "ok": False,
+                "reason": "naked_short_flattened",
+                "dex": dex_r,
+                "hedge": hed_r,
+                "flatten": flat,
+                "notional_usd": usd,
+            }
+
+    if dex_ok and hedge_ok:
+        return {
+            "ok": True,
+            "dex": dex_r,
+            "hedge": hed_r,
+            "notional_usd": usd,
+        }
+
+    await trigger_alert(
+        "DELTA_NEUTRAL_ABORT",
+        f"Both legs failed mint={mint[:8]} hedge={hedge_symbol}",
+        severity="warning",
+    )
+    return {
+        "ok": False,
+        "reason": "both_legs_failed",
+        "dex": dex_r,
+        "hedge": hed_r,
+        "notional_usd": usd,
+    }
+
+
+async def execute_delta_neutral_buy(
+    mint: str,
+    amount_sol: float,
+    symbol: str,
+    hedge_symbol: str,
+    signal_data: Optional[dict] = None,
+) -> dict:
+    """
+    Per-mint mutex: no concurrent duplicate delta-neutral stacks on same mint.
+    """
+    async with _mint_delta_lock(mint):
+        return await _run_delta_neutral_with_recovery(
+            mint, amount_sol, symbol, hedge_symbol, signal_data
+        )
+
+
+class LiveExecutionGateway:
+    """
+    Optional facade: neural-style routing with position lock (one flight per mint).
+    """
+
+    def __init__(self):
+        self._active_mints: set[str] = set()
+        self._gate = asyncio.Lock()
+
+    async def execute_atomic_hedge(
+        self,
+        mint: str,
+        amount_sol: float,
+        symbol: str,
+        hedge_symbol: str,
+        signal_data: Optional[dict] = None,
+    ) -> dict:
+        async with self._gate:
+            if mint in self._active_mints:
+                return {"ok": False, "reason": "mint_already_in_flight"}
+            self._active_mints.add(mint)
+        try:
+            return await execute_delta_neutral_buy(
+                mint, amount_sol, symbol, hedge_symbol, signal_data
+            )
+        finally:
+            self._active_mints.discard(mint)
+
+
+_live_execution_gateway: Optional[LiveExecutionGateway] = None
+
+
+def get_live_execution_gateway() -> LiveExecutionGateway:
+    global _live_execution_gateway
+    if _live_execution_gateway is None:
+        _live_execution_gateway = LiveExecutionGateway()
+    return _live_execution_gateway
+
+
+async def _neural_delta_neutral_once(send_func=None) -> None:
+    """StrategyBrain.live_predict; global mutex prevents stacked signals."""
+    cfg = _load_config()
+    if not cfg.get("neural_execution_enabled"):
+        return
+
+    async with _neural_pipeline_lock:
+        mint = (cfg.get("neural_dex_mint") or "").strip()
+        if not mint or len(mint) < 32:
+            return
+
+        try:
+            from trading.live_tensor_stream import ensure_stream_started
+            from trading.strategy_brain import get_default_strategy_brain
+        except ImportError as e:
+            logger.debug("Neural bridge import failed: %s", e)
+            return
+
+        brain = get_default_strategy_brain()
+        await brain.reload_singularity_weights(force=False)
+        seq_len = 64
+        if brain._singularity_bundle:
+            seq_len = int(brain._singularity_bundle.get("seq_len", 64))
+
+        inst = cfg.get("neural_okx_inst") or "BTC-USDT-SWAP"
+        stream = await ensure_stream_started(inst, window=max(512, seq_len * 4))
+        tens = await stream.build_model_tensor(seq_len=seq_len)
+        if tens is None:
+            return
+
+        pred = await brain.live_predict(tens)
+        if not pred:
+            return
+        thr = float(cfg.get("neural_confidence_threshold", 0.85))
+        if pred.get("confidence", 0) < thr or pred.get("action") != "long":
+            return
+
+        import secure_wallet
+
+        balance = await secure_wallet.get_sol_balance()
+        if not balance:
+            return
+        trade_sol = min(
+            balance * cfg.get("max_trade_pct", 15.0) / 100.0,
+            balance - cfg.get("min_sol_reserve", 0.05),
+        )
+        trade_sol = max(0.01, trade_sol)
+        hedge_sym = cfg.get("neural_hedge_symbol") or "SOLUSDT"
+        sigd = {
+            "source": "strategy_brain_neural",
+            "confidence": pred.get("confidence"),
+            "prob_up": pred.get("prob_up"),
+            "neural": pred,
+        }
+        gw = get_live_execution_gateway()
+        out = await gw.execute_atomic_hedge(
+            mint, trade_sol, mint[:8], hedge_sym, signal_data=sigd,
+        )
+        logger.info("Delta-neutral neural exec: %s", out)
+        if send_func:
+            try:
+                await send_func(
+                    f"🧠 Neural Δ-neutral ok={out.get('ok')}\n{out.get('reason', '')}\n"
+                    f"USD~{out.get('notional_usd', 0):.0f}"
+                )
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POLYMARKET — sk_poly_oracle + poly_executor
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _poly_kelly_stake_usd(
+    belief_p: float,
+    ask_price: float,
+    bankroll_usd: float,
+    fractional_kelly: float,
+    max_stake_usd: float,
+    min_stake_usd: float,
+) -> float:
+    """二元合约买入：在价 ask 支付，真概率 belief_p；全额凯利 f=(p-π)/(1-π)，再乘 fractional。"""
+    p = max(0.001, min(0.999, float(belief_p)))
+    pi = max(0.001, min(0.999, float(ask_price)))
+    if p <= pi:
+        return 0.0
+    denom = 1.0 - pi
+    if denom <= 1e-9:
+        return 0.0
+    f_full = (p - pi) / denom
+    f_full = max(0.0, min(1.0, f_full))
+    stake = float(fractional_kelly) * f_full * float(bankroll_usd)
+    stake = min(stake, float(max_stake_usd))
+    if stake < float(min_stake_usd):
+        return 0.0
+    return stake
+
+
+def _load_poly_executions() -> list:
+    try:
+        if POLY_EXECUTIONS_FILE.exists():
+            with open(POLY_EXECUTIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+def _save_poly_executions(rows: list):
+    try:
+        tmp = str(POLY_EXECUTIONS_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rows[-500:], f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(POLY_EXECUTIONS_FILE))
+    except Exception as e:
+        logger.error("Poly executions save failed: %s", e)
+
+
+def _poly_token_recently_executed(token_id: str, dedupe_hours: float) -> bool:
+    cutoff = time.time() - max(1.0, float(dedupe_hours)) * 3600.0
+    for row in _load_poly_executions():
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("token_id")) != str(token_id):
+            continue
+        ts = float(row.get("ts") or 0)
+        if ts >= cutoff:
+            return True
+    return False
+
+
+async def _poly_oracle_scan_and_execute(send_func=None) -> None:
+    cfg = _load_config()
+    if not cfg.get("poly_enabled"):
+        return
+
+    try:
+        from skills.sk_poly_oracle import scan_probability_edges
+        from trading.poly_executor import PolyExecutor
+    except ImportError as e:
+        logger.warning("Polymarket modules unavailable: %s", e)
+        return
+
+    thr = float(cfg.get("poly_edge_threshold_pct", 15.0))
+    max_mk = int(cfg.get("poly_max_markets_scan", 80))
+    min_liq = float(cfg.get("poly_min_liquidity_usd", 5000.0))
+    unrestricted = bool(cfg.get("poly_require_unrestricted", True))
+
+    try:
+        opportunities = await scan_probability_edges(
+            min_edge_pct=thr,
+            max_markets=max_mk,
+            min_liquidity_usd=min_liq,
+            require_unrestricted=unrestricted,
+        )
+    except Exception as e:
+        logger.exception("Poly oracle scan failed: %s", e)
+        return
+
+    if not opportunities:
+        logger.info("Poly oracle: no edges ≥ %.1f%%", thr)
+        return
+
+    bankroll = float(cfg.get("poly_bankroll_usd", 500.0))
+    fk = float(cfg.get("poly_fractional_kelly", 0.25))
+    cap = float(cfg.get("poly_max_stake_usd", 200.0))
+    floor = float(cfg.get("poly_min_stake_usd", 5.0))
+    otype = str(cfg.get("poly_order_type") or "FOK").strip().upper()
+    dedupe_h = float(cfg.get("poly_dedupe_hours", 24))
+    max_n = max(1, int(cfg.get("poly_max_orders_per_scan", 1)))
+
+    execu = PolyExecutor()
+    done = 0
+    for opp in opportunities:
+        if done >= max_n:
+            break
+        if not isinstance(opp, dict):
+            continue
+        tid = str(opp.get("token_id") or "")
+        if not tid:
+            continue
+        if _poly_token_recently_executed(tid, dedupe_h):
+            continue
+
+        p = float(opp.get("oracle_prob") or 0)
+        ask = float(opp.get("entry_ask") or 0)
+        min_sz = float(opp.get("order_min_size") or 5)
+
+        stake_usd = _poly_kelly_stake_usd(p, ask, bankroll, fk, cap, floor)
+        if stake_usd <= 0:
+            continue
+
+        size_shares = stake_usd / max(ask, 1e-6)
+        if size_shares < min_sz:
+            size_shares = float(min_sz)
+            stake_usd = size_shares * ask
+
+        if stake_usd > cap:
+            size_shares = cap / max(ask, 1e-6)
+            stake_usd = cap
+
+        result = await execu.open_position(
+            token_id=tid,
+            price=ask,
+            size_shares=size_shares,
+            order_type=otype,
+        )
+
+        rows = _load_poly_executions()
+        rows.append(
+            {
+                "ts": time.time(),
+                "token_id": tid,
+                "condition_id": opp.get("condition_id"),
+                "edge_pct": opp.get("edge_pct"),
+                "stake_usd": round(stake_usd, 2),
+                "ok": bool(result.get("ok")),
+                "order_id": result.get("order_id"),
+            }
+        )
+        _save_poly_executions(rows)
+
+        if result.get("ok") and send_func:
+            q = (opp.get("question") or "")[:120]
+            msg = (
+                "⚔️ **Polymarket 战报**\n"
+                f"市场: {q}\n"
+                f"结果: {opp.get('outcome_name', '?')}\n"
+                f"概率差: {opp.get('edge_pct')}% (Γ {p:.3f} vs 盘口 ~{opp.get('market_mid', 0):.3f})\n"
+                f"凯利名义: ~${stake_usd:.2f} | 份额 {size_shares:.2f} @ {ask:.3f}\n"
+                f"订单: `{result.get('order_id') or 'ok'}`"
+            )
+            try:
+                await send_func(msg)
+            except Exception:
+                pass
+
+        if result.get("ok"):
+            done += 1
+        else:
+            logger.warning("Poly order failed: %s", result.get("reason", result))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LIVE TRADING ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -616,6 +1102,8 @@ class LiveTrader:
         self._task: Optional[asyncio.Task] = None
         self._last_pos_check = 0.0
         self._last_sig_scan = 0.0
+        self._last_neural_ts = 0.0
+        self._last_poly_oracle_ts = 0.0
 
     async def start(self):
         if self._running:
@@ -636,6 +1124,7 @@ class LiveTrader:
         self._running = True
         self._last_pos_check = 0.0
         self._last_sig_scan = 0.0
+        self._last_poly_oracle_ts = 0.0
         self._task = asyncio.create_task(self._loop())
         logger.info("LiveTrader started")
 
@@ -696,6 +1185,33 @@ class LiveTrader:
             if not self._running:
                 break
 
+            if _is_poly_market_signal(sig):
+                if not cfg.get("poly_execution_enabled"):
+                    logger.debug("POLY_MARKET signal skipped: poly_execution_enabled=False")
+                    continue
+                try:
+                    from trading.poly_executor import execute_poly_market_signal_async
+
+                    poly_r = await execute_poly_market_signal_async(sig, cfg)
+                except Exception as e:
+                    logger.error("Polymarket execution error: %s", e)
+                    continue
+                if poly_r.get("ok") and self._send:
+                    msg = (
+                        f"\U0001f3af **POLY CLOB**\n"
+                        f"token: `{str(poly_r.get('token_id', ''))[:24]}…`\n"
+                        f"~${poly_r.get('usdc_approx', 0):.2f} @ {poly_r.get('price', 0):.4f}\n"
+                        f"resp: `{str(poly_r.get('response', ''))[:180]}`"
+                    )
+                    try:
+                        await self._send(msg)
+                    except Exception:
+                        pass
+                elif not poly_r.get("ok"):
+                    logger.warning("Polymarket signal not executed: %s", poly_r.get("reason"))
+                await asyncio.sleep(2)
+                continue
+
             symbol = sig.get("symbol", "")
             direction = sig.get("direction", "")
             score = float(sig.get("combined_score", 0) or 0)
@@ -753,6 +1269,13 @@ class LiveTrader:
                 now = time.time()
                 ci = max(10.0, float(cfg.get("check_interval", 30)))
                 si = max(60.0, float(cfg.get("scan_interval", 300)))
+                n_int = max(20.0, float(cfg.get("neural_poll_sec", 45)))
+
+                if cfg.get("neural_execution_enabled") and (
+                    self._last_neural_ts == 0 or (now - self._last_neural_ts) >= n_int
+                ):
+                    self._last_neural_ts = time.time()
+                    await _neural_delta_neutral_once(self._send)
 
                 if self._last_pos_check == 0 or (now - self._last_pos_check) >= ci:
                     self._last_pos_check = time.time()
@@ -766,7 +1289,8 @@ class LiveTrader:
                 now = time.time()
                 next_p = self._last_pos_check + ci
                 next_s = self._last_sig_scan + si
-                wait = min(next_p, next_s) - now
+                next_n = self._last_neural_ts + n_int if cfg.get("neural_execution_enabled") else 1e18
+                wait = min(next_p, next_s, next_n) - now
                 wait = max(1.0, min(wait, 120.0))
                 await asyncio.sleep(wait)
 
@@ -800,6 +1324,14 @@ _MINT_MAP = {
     "W": "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ",
     "MOBILE": "mb1eu7TzEc71KxDpsmsKoucSSuuoGLv1drys1oP2jh6",
 }
+
+
+def _is_poly_market_signal(sig: dict) -> bool:
+    """Route to Polymarket CLOB when signal is explicitly tagged."""
+    if sig.get("poly_market") is True:
+        return True
+    t = (sig.get("type") or sig.get("venue") or sig.get("market_type") or "")
+    return str(t).upper() == "POLY_MARKET"
 
 
 def _symbol_to_mint(symbol: str) -> Optional[str]:

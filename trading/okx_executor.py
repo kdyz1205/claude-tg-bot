@@ -19,9 +19,14 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import httpx
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None  # type: ignore
 
 try:
     from dotenv import load_dotenv
@@ -155,11 +160,46 @@ class OKXExecutor:
         self._price_cache: dict[str, float] = {}
         self._price_cache_ts: dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self._aio_session: Optional["aiohttp.ClientSession"] = None
+        self._aio_session_lock = asyncio.Lock()
+        self._okx_http_spacing_lock = asyncio.Lock()
+        self._last_okx_http_ts: float = 0.0
+        self._min_http_interval_sec: float = 0.095
         if self.api_key:
             log.info("OKX API key loaded — live trading available")
 
     def has_api_keys(self) -> bool:
         return bool(self.api_key and self.api_secret and self.passphrase)
+
+    async def _get_aio_session(self) -> Optional["aiohttp.ClientSession"]:
+        if aiohttp is None:
+            return None
+        async with self._aio_session_lock:
+            if self._aio_session is None or self._aio_session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit_per_host=24,
+                    keepalive_timeout=60,
+                    enable_cleanup_closed=True,
+                )
+                timeout = aiohttp.ClientTimeout(total=20, connect=10)
+                self._aio_session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                )
+            return self._aio_session
+
+    async def aclose(self) -> None:
+        async with self._aio_session_lock:
+            if self._aio_session and not self._aio_session.closed:
+                await self._aio_session.close()
+            self._aio_session = None
+
+    async def _okx_http_spacing(self) -> None:
+        async with self._okx_http_spacing_lock:
+            gap = time.time() - self._last_okx_http_ts
+            if gap < self._min_http_interval_sec:
+                await asyncio.sleep(self._min_http_interval_sec - gap)
+            self._last_okx_http_ts = time.time()
 
     # ── Price data ────────────────────────────────────────────────────────
 
@@ -167,14 +207,21 @@ class OKXExecutor:
         now = time.time()
         if symbol in self._price_cache and now - self._price_cache_ts.get(symbol, 0) < 5:
             return self._price_cache[symbol]
+        inst_id = self._inst_id(symbol)
         try:
-            inst_id = self._inst_id(symbol)
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    f"{OKX_REST_BASE}/api/v5/market/ticker",
-                    params={"instId": inst_id},
-                )
-                data = resp.json()
+            session = await self._get_aio_session()
+            if session is not None:
+                await self._okx_http_spacing()
+                url = f"{OKX_REST_BASE}/api/v5/market/ticker"
+                async with session.get(url, params={"instId": inst_id}) as resp:
+                    data = await resp.json()
+            else:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"{OKX_REST_BASE}/api/v5/market/ticker",
+                        params={"instId": inst_id},
+                    )
+                    data = resp.json()
             if data.get("code") == "0" and data.get("data"):
                 price = float(data["data"][0]["last"])
                 self._price_cache[symbol] = price
@@ -421,15 +468,24 @@ class OKXExecutor:
             return {"code": "-1", "msg": "No API keys configured"}
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
         headers = self._make_headers(timestamp, method, path, body)
+        url = f"{OKX_REST_BASE}{path}"
         try:
+            session = await self._get_aio_session()
+            if session is not None:
+                await self._okx_http_spacing()
+                if method == "GET":
+                    async with session.get(url, headers=headers) as resp:
+                        return await resp.json()
+                async with session.post(url, headers=headers, data=body) as resp:
+                    return await resp.json()
             async with httpx.AsyncClient(timeout=15.0) as client:
                 if method == "GET":
-                    resp = await client.get(f"{OKX_REST_BASE}{path}", headers=headers)
+                    resp = await client.get(url, headers=headers)
                 else:
-                    resp = await client.post(
-                        f"{OKX_REST_BASE}{path}", headers=headers, content=body
-                    )
+                    resp = await client.post(url, headers=headers, content=body)
                 return resp.json()
+        except asyncio.TimeoutError:
+            return {"code": "-1", "msg": "timeout"}
         except Exception as e:
             return {"code": "-1", "msg": str(e)}
 
@@ -580,3 +636,61 @@ class OKXExecutor:
         self.state.daily_pnl = 0.0
         self.state.daily_trades = 0
         self.state.last_daily_reset = time.time()
+
+    async def open_position_with_retry(
+        self,
+        symbol: str,
+        side: str,
+        size_usd: float,
+        max_retries: int = 4,
+    ) -> dict:
+        """REST order placement with exponential backoff (Phase 12)."""
+        delay = 0.4
+        last: dict = {"ok": False, "reason": "no_attempt"}
+        for attempt in range(max(1, max_retries)):
+            last = await self.open_position(symbol, side, size_usd)
+            if last.get("ok"):
+                return last
+            log.warning(
+                "OKX open retry %s/%s %s %s: %s",
+                attempt + 1,
+                max_retries,
+                side,
+                symbol,
+                last.get("reason"),
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.85, 12.0)
+        return last
+
+
+class OKXDeltaNeutralExecutor:
+    """
+    Facade for hedge legs (delta-neutral). Reuses OKXExecutor connection pool + signing.
+    Compatible with live_trader emergency flatten paths.
+    """
+
+    def __init__(self, executor: OKXExecutor | None = None):
+        self._ex = executor or OKXExecutor()
+        self._ex.load_state()
+
+    @property
+    def inner(self) -> OKXExecutor:
+        return self._ex
+
+    async def execute_hedge_short(self, symbol: str, notional_usd: float) -> dict[str, Any]:
+        r = await self._ex.open_position_with_retry(symbol, "short", notional_usd)
+        if r.get("ok"):
+            return {"status": "SUCCESS", "detail": r}
+        return {"status": "FAILED", "error": r.get("reason", "unknown")}
+
+    async def emergency_flatten_short(self, symbol: str, reason: str = "emergency") -> dict[str, Any]:
+        if symbol not in self._ex.state.positions:
+            return {"ok": True, "reason": "no_local_position"}
+        pos = self._ex.state.positions[symbol]
+        if pos.side != "short":
+            return {"ok": False, "reason": f"position_not_short:{pos.side}"}
+        return await self._ex.close_position(symbol, reason=reason)
+
+    async def close(self) -> None:
+        await self._ex.aclose()
