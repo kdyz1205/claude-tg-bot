@@ -107,6 +107,20 @@ if not LLM_HTTP_FALLBACK_MODELS:
         ) if m
     ]
 
+# ─── Sentiment feed → event DEX sniper (gateway /feed) ───────────────────────
+try:
+    SENTIMENT_EXTREME_LONG_THRESHOLD = float(os.getenv("SENTIMENT_EXTREME_LONG_THRESHOLD", "0.8"))
+except ValueError:
+    SENTIMENT_EXTREME_LONG_THRESHOLD = 0.8
+try:
+    EVENT_SNIPER_SOL = float(os.getenv("EVENT_SNIPER_SOL", "0.05"))
+except ValueError:
+    EVENT_SNIPER_SOL = 0.05
+try:
+    EVENT_MIN_LIQUIDITY_USD = float(os.getenv("EVENT_MIN_LIQUIDITY_USD", "50000"))
+except ValueError:
+    EVENT_MIN_LIQUIDITY_USD = 50_000.0
+
 # ─── Conversation & Processing ────────────────────────────────────────────────
 MAX_CONVERSATION_HISTORY = 80
 MAX_TOOL_ITERATIONS = 25

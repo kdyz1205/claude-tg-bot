@@ -1428,3 +1428,8 @@ class PostTradeAnalyzer:
             "kurtosis": None,
             "tail_ratio": None,
         }
+
+
+def analyze_trades_as_dicts(trades: list[dict]) -> dict:
+    """Batch post-mortem for plain trade dicts (no OHLCV); used by loss_immunity / APIs."""
+    return PostTradeAnalyzer().analyze_batch(trades, dfs=None)

@@ -30,7 +30,11 @@ from telegram.ext import (
     filters,
 )
 
-from pipeline.tg_dev_bridge import process_dev_task
+from pipeline.tg_dev_bridge import (
+    process_chaos_immunity_task,
+    process_dev_task,
+    process_wallet_clone_task,
+)
 
 from gateway.tg_front import (
     GW_CB,
@@ -360,6 +364,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 _DEV_CMD = re.compile(r"^/dev(?:@\w+)?\s*(.*)$", re.IGNORECASE | re.DOTALL)
 
 
+async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """喂养通道：链接或新闻正文 → 极速情绪 + 实体；极端看涨 + 流动性则事件小单。"""
+    global USER_MODE
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
+        return
+    store = await _session_store_async(context.application)
+    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
+    from gateway.sentiment_feed import process_sentiment_feed
+
+    parts = context.args or []
+    blob = " ".join(parts).strip()
+    if not blob and update.message.reply_to_message:
+        blob = (update.message.reply_to_message.text or "").strip()
+    if not blob:
+        await update.message.reply_text(
+            "用法：/feed <推特/新闻链接 或 正文>\n"
+            "也可回复一条消息发送 /feed（引用原消息）。\n"
+            "单独发一条 http(s) 链接也会自动走本通道。"
+        )
+        return
+    await update.message.reply_text("⚡ Jarvis 极速模型分析中…")
+    try:
+        out = await process_sentiment_feed(blob, user_mode=USER_MODE)
+    except Exception as e:
+        logger.exception("cmd_feed: %s", e)
+        out = f"❌ 分析失败: {e!s}"
+    await update.message.reply_text(out[:4096])
+
+
 async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -376,6 +413,48 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    from gateway.jarvis_semantic import classify_intent
+
+    row = await classify_intent(prompt, uid=uid)
+    if str(row.get("intent") or "").upper() == "CHAOS_IMMUNITY":
+        await update.message.reply_text(
+            "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
+            "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
+        )
+        _gw_schedule(
+            context.application,
+            process_chaos_immunity_task(
+                bot=context.bot,
+                chat_id=update.message.chat_id,
+                uid=uid,
+                dev_timeout_sec=900,
+                min_interval_sec=3.0,
+            ),
+        )
+        return
+
+    if str(row.get("intent") or "").upper() == "WALLET_CLONE":
+        addr = row.get("extracted_address")
+        if not addr:
+            await update.message.reply_text("未识别到有效的 0x 钱包地址。")
+            return
+        await update.message.reply_text(
+            "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
+        )
+        _gw_schedule(
+            context.application,
+            process_wallet_clone_task(
+                bot=context.bot,
+                chat_id=update.message.chat_id,
+                wallet_address=str(addr),
+                timeout_sec=600,
+                min_interval_sec=3.0,
+            ),
+        )
+        return
+
+    sub_intent = row.get("sub_intent")
+
     await update.message.reply_text(
         "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
     )
@@ -387,6 +466,7 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             prompt=prompt,
             timeout_sec=600,
             min_interval_sec=3.0,
+            sub_intent=sub_intent,
         ),
     )
 
@@ -409,17 +489,66 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         execute_trade_from_user_text,
         user_semantic_lock,
     )
+    from gateway.sentiment_feed import is_single_url_message, process_sentiment_feed
 
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
     application = context.application
 
+    if is_single_url_message(text):
+        await update.message.reply_text("⚡ Jarvis 拉取链接并分析情绪…")
+        try:
+            out = await process_sentiment_feed(text, user_mode=USER_MODE)
+        except Exception as e:
+            logger.exception("sentiment_feed url shortcut: %s", e)
+            out = f"❌ 分析失败: {e!s}"
+        await update.message.reply_text(out[:4096])
+        return
+
     async with user_semantic_lock(uid):
         row = await classify_intent(text, uid=uid)
         intent = str(row.get("intent") or "CHAT").upper()
 
+        if intent == "CHAOS_IMMUNITY":
+            await update.message.reply_text(
+                "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
+                "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
+            )
+            _gw_schedule(
+                application,
+                process_chaos_immunity_task(
+                    bot=context.bot,
+                    chat_id=update.message.chat_id,
+                    uid=uid,
+                    dev_timeout_sec=900,
+                    min_interval_sec=3.0,
+                ),
+            )
+            return
+
+        if intent == "WALLET_CLONE":
+            addr = row.get("extracted_address")
+            if not addr:
+                await update.message.reply_text("未识别到有效的 0x 钱包地址。")
+                return
+            await update.message.reply_text(
+                "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
+            )
+            _gw_schedule(
+                application,
+                process_wallet_clone_task(
+                    bot=context.bot,
+                    chat_id=update.message.chat_id,
+                    wallet_address=str(addr),
+                    timeout_sec=600,
+                    min_interval_sec=3.0,
+                ),
+            )
+            return
+
         if intent == "AUTO_DEV":
             req = (row.get("extracted_requirement") or "").strip() or text
+            sub_intent = row.get("sub_intent")
             await update.message.reply_text(
                 "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
             )
@@ -431,6 +560,7 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     prompt=req,
                     timeout_sec=600,
                     min_interval_sec=3.0,
+                    sub_intent=sub_intent,
                 ),
             )
             return
@@ -506,6 +636,7 @@ class TelegramBot:
             .build()
         )
         app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("feed", cmd_feed))
         app.add_handler(CommandHandler("dev", cmd_dev))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text)

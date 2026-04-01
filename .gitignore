@@ -90,6 +90,7 @@ _restart.ps1
 .system_prompt.txt
 action_memory.json
 evolution_log.jsonl
+_risk_events.jsonl
 
 # Knowledge and session data
 .knowledge/

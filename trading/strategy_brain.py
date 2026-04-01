@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from .indicators import sma, ema, atr, bb_upper, bb_lower, slope
+from .moe_gate import run_moe_gate
 from .okx_executor import OKXExecutor, Position, TradeRecord
 from trading_skills.drawdown_guardian import DrawdownGuardian, status_triggers_hard_kill
 
@@ -480,6 +481,12 @@ class StrategyBrain:
             max_daily_loss_pct=self.executor.risk.max_daily_loss_pct,
         )
         self._guardian_daily_anchor_ts: float = 0.0
+        try:
+            from trading import loss_immunity
+
+            loss_immunity.set_telegram_notify(self._notify)
+        except Exception:
+            pass
 
     async def _notify(self, text: str):
         if self._send_callback:
@@ -785,9 +792,51 @@ class StrategyBrain:
                     self._last_signals[symbol] = {**signal, "blocked": True, "block_reasons": failures}
                     continue
 
+                self._cycle_phase = "moe_debate"
+                try:
+                    moe_candles = await self.executor.get_ohlcv(
+                        symbol, SIGNAL_INTERVAL, limit=300
+                    )
+                    moe_ok, moe_detail = await run_moe_gate(
+                        symbol=symbol,
+                        signal=signal,
+                        candles=moe_candles,
+                    )
+                except Exception as e:
+                    log.warning("MoE gate error %s: %s — blocking open", symbol, e)
+                    moe_ok, moe_detail = False, {"error": str(e)}
+                if not moe_ok:
+                    reasons = [moe_detail.get("veto_reason") or "moe_quorum_or_veto"]
+                    _audit_log(
+                        {
+                            "event": "moe_blocked",
+                            "symbol": symbol,
+                            "detail": moe_detail,
+                        }
+                    )
+                    self._last_signals[symbol] = {
+                        **signal,
+                        "blocked": True,
+                        "block_reasons": reasons,
+                        "moe_detail": moe_detail,
+                    }
+                    continue
+
                 self._cycle_phase = "execute"
                 size = signal["confidence"] * self.executor.risk.max_position_pct * self.executor.state.equity
-                result = await self.executor.open_position(symbol, signal["action"], size)
+                risk_context = {
+                    "confidence": float(signal.get("confidence") or 0.0),
+                    "volatility_regime": str(signal.get("volatility_regime") or ""),
+                    "market_regime": str(self.lessons.market_regime or ""),
+                    "liquidity_ratio": float(signal.get("liquidity_ratio") or 1.0),
+                    "spread_bps": float(signal.get("spread_bps") or 0.0),
+                }
+                result = await self.executor.open_position(
+                    symbol,
+                    signal["action"],
+                    size,
+                    risk_context=risk_context,
+                )
                 if result["ok"]:
                     log.info(
                         "Opened %s %s @ %.2f size=$%.0f conf=%.2f",
