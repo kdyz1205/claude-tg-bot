@@ -18,9 +18,12 @@ import logging
 import os
 import time
 from datetime import datetime, date
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import aiohttp
+
+from self_monitor import trigger_alert
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +91,7 @@ class ArbEngine:
         self._alert_cooldown: dict[str, float] = {}       # cooldown_key → last_ts
         self._history: list[dict] = []                    # all recorded opportunities
         self._scan_stats = {"scanned": 0, "qualified": 0, "alerted": 0, "reset_ts": time.time()}
-        self._wallets_lock = __import__('threading').Lock()
+        self._wallets_lock = asyncio.Lock()
         self._load_history()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -835,3 +838,154 @@ def format_arb_today(summary: dict) -> str:
 # ── Module-level singleton ────────────────────────────────────────────────────
 
 arb_engine = ArbEngine()
+
+
+# ── Async DEX-style trade helper (mock REST; for live_trader / experiments) ──
+# Distinct from ArbEngine (WS+REST *monitoring*).
+
+
+@dataclass
+class TradeIntention:
+    token_pair: str
+    action: str  # 'BUY' or 'SELL'
+    amount: float
+    expected_price: float
+    max_slippage_bps: int = 50
+
+
+class AsyncRateLimiter:
+    """Token-bucket style limiter; does not hold the lock while sleeping."""
+
+    def __init__(self, rate_limit: int, time_window: float = 1.0):
+        self.rate_limit = rate_limit
+        self.time_window = time_window
+        self.tokens = float(rate_limit)
+        self.last_update = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self.last_update
+                rate = self.rate_limit / self.time_window
+                self.tokens = min(
+                    self.rate_limit,
+                    self.tokens + elapsed * rate,
+                )
+                self.last_update = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+            await asyncio.sleep(0.05)
+
+
+class DexArbitrageExecutor:
+    """Delayed aiohttp session, rate cap, semaphore, slippage guard (mock URLs)."""
+
+    def __init__(self, api_keys: Dict[str, str]):
+        self.api_keys = api_keys
+        self.session: aiohttp.ClientSession | None = None
+        self.rate_limiter = AsyncRateLimiter(rate_limit=10, time_window=1.0)
+        self.execution_semaphore = asyncio.Semaphore(5)
+
+    async def _init_session(self) -> None:
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=5.0, connect=2.0)
+            self.session = aiohttp.ClientSession(timeout=timeout)
+
+    async def close(self) -> None:
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None
+
+    async def execute_trade(self, intention: TradeIntention) -> Dict[str, Any]:
+        await self._init_session()
+        await self.rate_limiter.acquire()
+        assert self.session is not None
+
+        async with self.execution_semaphore:
+            try:
+                if intention.expected_price <= 0:
+                    await trigger_alert(
+                        "ArbitrageInvalidPrice",
+                        f"expected_price<=0 pair={intention.token_pair}",
+                        severity="warning",
+                    )
+                    return {"status": "FAILED", "reason": "INVALID_EXPECTED_PRICE"}
+
+                quote_url = (
+                    f"https://api.dex.exchange/v1/quote?pair={intention.token_pair}"
+                )
+                async with self.session.get(quote_url) as resp:
+                    resp.raise_for_status()
+                    quote_data = await resp.json()
+
+                try:
+                    actual_price = float(quote_data["price"])
+                except (KeyError, TypeError, ValueError) as e:
+                    await trigger_alert(
+                        "ArbitrageQuoteParseError",
+                        f"{intention.token_pair}: {e}",
+                        severity="warning",
+                    )
+                    return {"status": "FAILED", "reason": "BADQUOTE"}
+
+                slip = abs(actual_price - intention.expected_price) / intention.expected_price
+                max_slip = intention.max_slippage_bps / 10000.0
+                if slip > max_slip:
+                    await trigger_alert(
+                        "SlippageProtection",
+                        f"{intention.token_pair} exp={intention.expected_price} act={actual_price}",
+                        severity="warning",
+                    )
+                    return {"status": "ABORTED", "reason": "SLIPPAGE_TOO_HIGH"}
+
+                bps = intention.max_slippage_bps / 10000.0
+                if intention.action == "BUY":
+                    lim = actual_price * (1 + bps)
+                else:
+                    lim = actual_price * (1 - bps)
+                payload = {
+                    "pair": intention.token_pair,
+                    "side": intention.action,
+                    "amount": intention.amount,
+                    "price_limit": lim,
+                }
+                key = self.api_keys.get("dex", "")
+                if not key:
+                    await trigger_alert(
+                        "ArbitrageConfigError",
+                        "missing api_keys['dex']",
+                        severity="error",
+                    )
+                    return {"status": "FAILED", "reason": "NO_API_KEY"}
+
+                trade_url = "https://api.dex.exchange/v1/trade"
+                async with self.session.post(
+                    trade_url,
+                    json=payload,
+                    headers={"X-API-KEY": key},
+                ) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+
+                return {"status": "SUCCESS", "tx_hash": result.get("tx_hash")}
+
+            except aiohttp.ClientError as e:
+                await trigger_alert(
+                    "ArbitrageNetworkError",
+                    str(e)[:400],
+                    severity="warning",
+                )
+                return {"status": "FAILED", "reason": "NETWORK_ERROR"}
+            except Exception as e:
+                await trigger_alert(
+                    "ArbitrageFatalError",
+                    str(e)[:400],
+                    severity="error",
+                )
+                return {"status": "FAILED", "reason": "UNKNOWN_ERROR"}
+
+
+ArbitrageEngine = DexArbitrageExecutor

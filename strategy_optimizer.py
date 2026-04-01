@@ -658,7 +658,7 @@ def _write_best_params_to_config(strategy: str, best_params: dict) -> None:
         if strategy == "ma_ribbon":
             cfg["ma_ribbon_best"] = best_params
             # Propagate overlapping signal engine keys
-            for key in ("ma_fast", "ma_slow"):
+            for key in ("ma_fast", "ema_slow"):
                 if key in best_params:
                     cfg[key] = best_params[key]
         elif strategy == "rsi":

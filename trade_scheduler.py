@@ -48,6 +48,11 @@ def _save_state(state: dict):
         logger.error(f"Scheduler state save failed: {e}")
 
 
+def read_scheduler_state() -> dict:
+    """Persisted scheduler counters for dashboards (safe if process restarted)."""
+    return _load_state()
+
+
 class TradeScheduler:
     """Orchestrates trading sessions with auto-resume capability."""
 
@@ -129,19 +134,29 @@ class TradeScheduler:
         await self._live_trader.start()
 
         if self._send:
-            balance = await secure_wallet.get_sol_balance()
-            pubkey = secure_wallet.get_public_key()
+            balance = await secure_wallet.get_sol_balance() or 0
+            pubkey = secure_wallet.get_public_key() or "unknown"
             await self._send(
                 f"\U0001f680 Live Trading Started\n"
                 f"\u94b1\u5305: {pubkey[:8]}...{pubkey[-6:]}\n"
                 f"\u4f59\u989d: {balance:.4f} SOL\n"
                 f"\u6a21\u5f0f: \u5b9e\u76d8\u4ea4\u6613"
             )
+            await self._send(
+                "\u26a0\ufe0f \u98ce\u9669\u63d0\u9192\uff1a\u4efb\u4f55\u5e02\u573a\u90fd\u65e0\u6cd5\u4fdd\u8bc1\u76c8\u5229\u3002"
+                "\u672c\u673a\u5236\u4e3a Jupiter \u5b9e\u76d8\u5151\u6362\uff0c\u975e MEV/\u8d85\u9ad8\u9891\u5957\u5229\u3002"
+                "\u8bf7\u4ec5\u7528\u53ef\u627f\u53d7\u635f\u5931\u7684\u8d44\u91d1\u3002"
+            )
+
+        # Prime UI counters so /chain 实盘面板立刻有「上次周期」时间
+        state = _load_state()
+        state["last_scan_time"] = time.time()
+        _save_state(state)
 
         # Monitor loop — periodic status updates
         scan_count = 0
         while self._running:
-            await asyncio.sleep(300)  # Status update every 5 minutes
+            await asyncio.sleep(120)  # 2 min heartbeat (面板/计数更新更及时)
             scan_count += 1
 
             state = _load_state()
@@ -149,10 +164,10 @@ class TradeScheduler:
             state["total_scans"] = state.get("total_scans", 0) + 1
             _save_state(state)
 
-            # Periodic status (every 30 min = 6 checks)
-            if scan_count % 6 == 0 and self._send:
+            # Periodic status (~30 min at 120s interval: 15 checks)
+            if scan_count % 15 == 0 and self._send:
                 stats = live_trader.get_live_stats()
-                balance = await secure_wallet.get_sol_balance()
+                balance = await secure_wallet.get_sol_balance() or 0
                 await self._send(
                     f"\U0001f4ca \u5b9a\u671f\u62a5\u544a\n"
                     f"\u4f59\u989d: {balance:.4f} SOL\n"

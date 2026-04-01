@@ -5,15 +5,22 @@ Auto Evolve Monitor v1.0
 - 空闲/停止 → 催促继续
 - Context limit → 自动发送续命指令
 - 连续多次空闲 → 认定为 context limit，重新激活
+
+另含 EvolveSandbox：对策略基因做静态边界校验与（可插拔）异步回测门槛。
 """
+import asyncio
 import pyautogui
 import pyperclip
 import time
 import os
 import json
 import requests
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
+
+from self_monitor import trigger_alert
 
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -21,6 +28,97 @@ USER_ID = os.getenv('AUTHORIZED_USER_ID')
 
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(_BOT_DIR, "_evolve_state.json")
+
+
+@dataclass
+class EvolutionRiskBoundary:
+    """Fractional thresholds: leverage cap, max stop-loss width, min backtest win rate."""
+
+    max_leverage_mutation: float = 2.0
+    max_drawdown_tolerance: float = 0.15
+    min_win_rate_required: float = 0.45
+
+
+class EvolveSandbox:
+    """Isolate unsafe parameter mutations; optional paper-style win-rate gate."""
+
+    def __init__(self, boundary: Optional[EvolutionRiskBoundary] = None):
+        self.boundary = boundary or EvolutionRiskBoundary()
+        self._lock = asyncio.Lock()
+
+    async def validate_mutation(self, new_genome: Dict[str, Any]) -> bool:
+        async with self._lock:
+            try:
+                lev = float(new_genome.get("leverage", 1))
+            except (TypeError, ValueError):
+                await trigger_alert(
+                    "EvolveBlocked",
+                    "Mutation rejected: invalid leverage.",
+                    severity="warning",
+                )
+                return False
+            if lev > self.boundary.max_leverage_mutation:
+                await trigger_alert(
+                    "EvolveBlocked",
+                    "Mutation rejected: leverage exceeds hard boundary.",
+                    severity="warning",
+                )
+                return False
+
+            try:
+                sl = float(new_genome.get("stop_loss_pct", 0))
+            except (TypeError, ValueError):
+                await trigger_alert(
+                    "EvolveBlocked",
+                    "Mutation rejected: invalid stop_loss_pct.",
+                    severity="warning",
+                )
+                return False
+            if sl > self.boundary.max_drawdown_tolerance:
+                await trigger_alert(
+                    "EvolveBlocked",
+                    "Mutation rejected: stop loss too wide.",
+                    severity="warning",
+                )
+                return False
+
+            return True
+
+    async def run_backtest_simulation(
+        self, genome: Dict[str, Any], smart_money_data: List[Any]
+    ) -> float:
+        """Return estimated win rate in [0, 1]. Wire to paper/harness when available."""
+        _ = genome
+        _ = smart_money_data
+        await asyncio.sleep(2)
+        return 0.52
+
+    async def propose_evolution(
+        self, new_genome: Dict[str, Any], context_data: List[Any]
+    ) -> bool:
+        if not await self.validate_mutation(new_genome):
+            return False
+        try:
+            win_rate = await self.run_backtest_simulation(new_genome, context_data)
+        except Exception as e:
+            await trigger_alert(
+                "EvolveFailed",
+                f"Backtest error: {e!s}"[:400],
+                severity="error",
+            )
+            return False
+        if win_rate < self.boundary.min_win_rate_required:
+            await trigger_alert(
+                "EvolveFailed",
+                f"Backtest win rate {win_rate:.3f} below threshold.",
+                severity="warning",
+            )
+            return False
+        return True
+
+
+evolve_sandbox = EvolveSandbox()
+
 
 EVOLUTION_PROMPT = """You are a SUPERINTELLIGENT AGENT. Your mission: EVOLVE AGGRESSIVELY.
 

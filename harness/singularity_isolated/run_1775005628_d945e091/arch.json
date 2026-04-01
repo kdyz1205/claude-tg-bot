@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "architecture_id": "TFTA-HFT-d05a26ea2d18",
+  "display_name": "Temporal-Fragment Token Attention for HFT (TFTA-HFT)",
+  "novelty_label": "FBSA + tick-LSTM hybrid backbone",
+  "mechanism_description": "Fragment-Blocked Self-Attention (FBSA): 序列按固定长度片段切分，片段内全连接自注意力，片段间通过可学习的 segment summary token 做二次 Transformer 融合；底层用双向 LSTM 注入局部 tick 惯性，再进入多头注意力栈。",
+  "tensor_contracts": {
+    "raw_features": "[B, T, 5]  # open, high, low, close, volume (z-scored)",
+    "lstm_out": "[B, T, d_model]",
+    "after_fbsa": "[B, T, d_model]",
+    "logits": "[B, 1]  # next-bar direction (binary)"
+  },
+  "hyperparams": {
+    "d_model": 96,
+    "n_heads": 8,
+    "fragment_len": 24,
+    "transformer_layers": 2,
+    "lstm_layers": 1,
+    "dropout": 0.12,
+    "seq_len": 64
+  },
+  "backbone": "hybrid_lstm_transformer",
+  "loss": "BCEWithLogitsLoss on directional label",
+  "source_papers": [
+    {
+      "arxiv_id": "mock.0001",
+      "title": "Temporal Fragment Attention for Ultra-High-Frequency Limit Order Books",
+      "summary_preview": "We propose fragmenting the limit order book stream into non-overlapping temporal chunks and applying masked self-attention within each chunk, then cross-chunk aggregation via a lightweight transformer. Experiments on syn…"
+    },
+    {
+      "arxiv_id": "mock.0002",
+      "title": "Transformer Encoders with Tick-Time Positional Encoding for Crypto Markets",
+      "summary_preview": "Tick-time positional encodings replace wall-clock embeddings for irregular crypto trades. Coupled with dilated causal convolutions before self-attention, the model captures multi-scale volatility bursts relevant to short…"
+    }
+  ],
+  "generated_at": 1775005628.262895
+}

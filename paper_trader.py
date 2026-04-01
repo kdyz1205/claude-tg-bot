@@ -25,6 +25,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADES_FILE = os.path.join(BASE_DIR, "_paper_trades.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "_paper_config.json")
 
+_sol_price_cache = {"price": 83.0, "ts": 0}
+
+
+def _get_sol_price() -> float:
+    """Get SOL/USD price with 60s cache."""
+    import time as _t
+    if _t.time() - _sol_price_cache["ts"] < 60:
+        return _sol_price_cache["price"]
+    try:
+        import httpx
+        r = httpx.get("https://www.okx.com/api/v5/market/ticker?instId=SOL-USDT", timeout=3)
+        p = float(r.json().get("data", [{}])[0].get("last", 0))
+        if p > 0:
+            _sol_price_cache["price"] = p
+            _sol_price_cache["ts"] = _t.time()
+    except Exception:
+        pass
+    return _sol_price_cache["price"]
+
 # ─── Default Configuration ───
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -207,7 +226,7 @@ def open_paper_trade(token: dict, cfg: dict = None) -> Optional[dict]:
     # Fractional Kelly: f* = edge/odds, but simplified as confidence * base
     position_sol = base_sol * regime_mult * (0.5 + 0.5 * confidence_scale)
     position_sol = min(position_sol, cfg.get("max_total_sol", 2.0) * 0.5)  # never >50% of total
-    sol_price_est = 150.0
+    sol_price_est = _get_sol_price()
     position_usd = position_sol * sol_price_est
     position_tokens = position_usd / price
 

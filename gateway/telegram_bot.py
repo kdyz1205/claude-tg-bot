@@ -11,6 +11,8 @@ Setup:
 Usage:
     Send to your bot:  "帮我写一个 React 登录页面"
     Bot auto-dispatches to the right AI based on task difficulty.
+
+Auto code (full bot): use /dev in bot.py — see pipeline/auto_dev_orchestrator.py.
 """
 
 from __future__ import annotations

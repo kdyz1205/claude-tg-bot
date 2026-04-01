@@ -1,0 +1,32 @@
+{
+  "id": "sk_paper_to_alpha",
+  "title": "论文→伪代码→Alpha 流水线（arXiv / 本地文本）",
+  "summary": "拉取或注入论文摘要，生成供 CLI/codex_charger 的结构化伪代码与张量特征说明",
+  "task_type": "research",
+  "function_signature": "run_skill(params: dict) -> dict",
+  "input_schema": "search_query | paper_text+title | max_results | extra_constraints",
+  "output_schema": "{ok, payloads|payload, papers?, error?}",
+  "trigger_pattern": "论文 arxiv 伪代码 alpha paper singularity",
+  "keywords": [
+    "arxiv",
+    "paper",
+    "pseudocode",
+    "alpha",
+    "RL",
+    "transformer",
+    "singularity"
+  ],
+  "generic_steps": [
+    "httpx 请求 arXiv Atom API 或接受本地 paper_text",
+    "build_codex_charger_payload 生成 CLI prompt",
+    "可选 extract_json_from_llm_response 解析 CODEX 块"
+  ],
+  "template_code": "from skills.sk_paper_to_alpha import run_skill\n# await run_skill({'search_query': 'all:market microstructure', 'max_results': 2})",
+  "files_modified": [],
+  "files_created": ["skills/sk_paper_to_alpha.py"],
+  "config_location": "无",
+  "created_at": "2026-03-31T00:00:00",
+  "source": "phase9_singularity",
+  "score": 70,
+  "usage_count": 0
+}

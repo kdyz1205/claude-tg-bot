@@ -1,0 +1,60 @@
+{
+  "last_training": {
+    "ts": 1775005403.9502726,
+    "episodes": [
+      {
+        "return": -0.6647426097082867,
+        "steps": 256,
+        "final_sharpe": 0.7065948833751309
+      },
+      {
+        "return": -0.7487588762827946,
+        "steps": 256,
+        "final_sharpe": -0.4262609512051281
+      }
+    ],
+    "torch": true
+  },
+  "runs": [
+    {
+      "run_id": "1775005628_d945e091",
+      "ts": 1775006275.4368985,
+      "duration_sec": 647.5580961704254,
+      "research_source": "mock_fallback",
+      "architecture_id": "TFTA-HFT-d05a26ea2d18",
+      "codegen_source": "bundled",
+      "metrics": {
+        "train_loss": 0.691770674002291,
+        "val_loss": 0.6922736167907715,
+        "val_win_rate": 0.5227864384651184,
+        "epochs": 12,
+        "architecture_id": "TFTA-HFT-d05a26ea2d18",
+        "device": "cpu",
+        "bundled": true
+      },
+      "promoted": false,
+      "promotion_reason": "val_loss=0.6923 (need <= 0.65) or win_rate=0.5228 (need >= 0.52)",
+      "run_dir": "C:\\Users\\alexl\\Desktop\\claude tg bot\\harness\\singularity_isolated\\run_1775005628_d945e091"
+    },
+    {
+      "run_id": "1775006242_77e1e3b4",
+      "ts": 1775006316.1227024,
+      "duration_sec": 75.0272707939148,
+      "research_source": "arxiv",
+      "architecture_id": "TFTA-HFT-bf4d61b8db05",
+      "codegen_source": "bundled",
+      "metrics": {
+        "train_loss": 0.698286110162735,
+        "val_loss": 0.6980710029602051,
+        "val_win_rate": 0.489130437374115,
+        "epochs": 5,
+        "architecture_id": "TFTA-HFT-bf4d61b8db05",
+        "device": "cpu",
+        "bundled": true
+      },
+      "promoted": false,
+      "promotion_reason": "val_loss=0.6981 (need <= 0.65) or win_rate=0.4891 (need >= 0.52)",
+      "run_dir": "C:\\Users\\alexl\\Desktop\\claude tg bot\\harness\\singularity_isolated\\run_1775006242_77e1e3b4"
+    }
+  ]
+}

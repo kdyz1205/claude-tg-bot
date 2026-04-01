@@ -21,6 +21,24 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE_DIR, "_dex_settings.json")
 POSITIONS_FILE = os.path.join(BASE_DIR, "_dex_positions.json")
 
+_sol_price_cache = {"price": 83.0, "ts": 0}
+
+
+def _get_sol_price_sync() -> float:
+    """Get SOL/USD price with 60s cache. Sync-safe for paper calculations."""
+    if time.time() - _sol_price_cache["ts"] < 60:
+        return _sol_price_cache["price"]
+    try:
+        import httpx
+        r = httpx.get("https://www.okx.com/api/v5/market/ticker?instId=SOL-USDT", timeout=3)
+        p = float(r.json().get("data", [{}])[0].get("last", 0))
+        if p > 0:
+            _sol_price_cache["price"] = p
+            _sol_price_cache["ts"] = time.time()
+    except Exception:
+        pass
+    return _sol_price_cache["price"]
+
 # ─── Default Settings ───
 DEFAULT_SETTINGS = {
     "buy_slippage_pct": 15,
@@ -408,7 +426,7 @@ def execute_buy(token_info: dict, amount_sol: float, mode: str = "paper") -> Opt
             existing = p
             break
 
-    sol_price_est = 150.0  # TODO: fetch live SOL price
+    sol_price_est = _get_sol_price_sync()
     tokens_bought = (amount_sol * sol_price_est) / price if price > 0 else 0
 
     if existing:

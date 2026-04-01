@@ -606,7 +606,11 @@ class SelfMonitor:
                 "value": error_rate,
             })
 
-        # 2. Memory leak detection (steadily increasing usage)
+        # 2. System memory trend (NOT per-process leak detection)
+        # Uses psutil.virtual_memory().percent = whole-machine RAM; browsers / OS cache /
+        # background backtests can move this ~5% without the bot leaking. Threshold kept
+        # conservative to reduce false positives.
+        _MEM_TREND_PCT = 10.0  # min half-to-half increase (percentage points) to warn
         if len(self._memory_samples) >= 10:
             samples = list(self._memory_samples)
             half = len(samples) // 2
@@ -616,11 +620,14 @@ class SelfMonitor:
             else:
                 first_half_avg = second_half_avg = 0
             increase = second_half_avg - first_half_avg
-            if increase > 5:  # >5% steady increase
+            if increase > _MEM_TREND_PCT:
                 anomalies.append({
                     "type": "memory_leak",
                     "severity": "warning",
-                    "message": f"Memory usage increasing: {first_half_avg:.1f}% -> {second_half_avg:.1f}% (+{increase:.1f}%)",
+                    "message": (
+                        f"系统整体内存占用上升: {first_half_avg:.1f}% -> {second_half_avg:.1f}% "
+                        f"(+{increase:.1f} pp)；非必然为 Bot 泄漏，可看 Self-Monitor 报告中的 process RSS"
+                    ),
                     "value": increase,
                 })
 
@@ -1222,3 +1229,16 @@ def _format_duration(seconds: float) -> str:
 action_memory = ActionMemory()
 self_monitor = SelfMonitor()
 code_repair = CodeSelfRepair()
+
+
+async def trigger_alert(alert_type: str, message: str, *, severity: str = "warning") -> None:
+    """Subsystem hook: record in error window and notify registered alert handlers.
+
+    Dedup uses anomaly ``type``; external alerts are namespaced to avoid clashing
+    with internal monitor keys (e.g. message_silence).
+    """
+    text = f"[{alert_type}] {message}"
+    self_monitor.record_error(text[:500])
+    await self_monitor._fire_alerts(
+        [{"type": f"ext:{alert_type}", "severity": severity, "message": message[:500]}]
+    )

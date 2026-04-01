@@ -1,0 +1,33 @@
+{
+  "id": "sk_smart_money_decoder",
+  "title": "聪明钱集中度解码",
+  "summary": "DexScreener 主池流动性 + Ethplorer 持币集中度启发式评分（公开 API）",
+  "task_type": "analysis",
+  "function_signature": "decode_smart_money_panel(token_address, chain_hint='ethereum') -> str",
+  "input_schema": "token_address: str; chain_hint: optional str",
+  "output_schema": "Markdown 文本报告",
+  "trigger_pattern": "smart money 聪明钱 集中度 巨鲸 持币",
+  "keywords": [
+    "smart money",
+    "聪明钱",
+    "集中度",
+    "巨鲸",
+    "ethplorer",
+    "dexscreener",
+    "holder"
+  ],
+  "generic_steps": [
+    "调用 DexScreener latest/dex/tokens/{address}",
+    "可选 EVM 地址调用 Ethplorer getTopTokenHolders",
+    "计算顶部持仓占比启发式评分",
+    "输出 Telegram Markdown 报告"
+  ],
+  "template_code": "from skills.sk_smart_money_decoder import decode_smart_money_panel\n# text = await decode_smart_money_panel(addr)",
+  "files_modified": [],
+  "files_created": ["skills/sk_smart_money_decoder.py"],
+  "config_location": "ETHPLORER_API_KEY optional",
+  "created_at": "2026-03-31T00:00:00",
+  "source": "phase5_skill_pack",
+  "score": 80,
+  "usage_count": 0
+}

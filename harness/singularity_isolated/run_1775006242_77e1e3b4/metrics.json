@@ -1,0 +1,9 @@
+{
+  "train_loss": 0.698286110162735,
+  "val_loss": 0.6980710029602051,
+  "val_win_rate": 0.489130437374115,
+  "epochs": 5,
+  "architecture_id": "TFTA-HFT-bf4d61b8db05",
+  "device": "cpu",
+  "bundled": true
+}

@@ -111,7 +111,80 @@
       "task_type": "code_create",
       "use_count": 2,
       "avg_score": 0.72
+    },
+    {
+      "id": "sk_smart_money_decoder",
+      "title": "聪明钱集中度解码",
+      "keywords": [
+        "smart money",
+        "聪明钱",
+        "dexscreener",
+        "ethplorer",
+        "holder",
+        "集中度"
+      ],
+      "task_type": "analysis",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_rug_pull_detector",
+      "title": "EVM bytecode 安全启发式扫描",
+      "keywords": [
+        "rug",
+        "honeypot",
+        "貔貅",
+        "bytecode",
+        "web3",
+        "audit"
+      ],
+      "task_type": "safety",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_paper_to_alpha",
+      "title": "论文→伪代码→Alpha 流水线",
+      "keywords": [
+        "arxiv",
+        "paper",
+        "pseudocode",
+        "RL",
+        "singularity",
+        "alpha"
+      ],
+      "task_type": "research",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_academic_researcher",
+      "title": "Transformer+HFT 学术检索与架构蒸馏",
+      "keywords": [
+        "arxiv",
+        "transformer",
+        "HFT",
+        "attention",
+        "singularity"
+      ],
+      "task_type": "research",
+      "use_count": 0,
+      "avg_score": null
+    },
+    {
+      "id": "sk_flashloan_arbitrage",
+      "title": "闪电贷与DEX价差监控（教育骨架）",
+      "keywords": [
+        "flash loan",
+        "MEV",
+        "Flashbots",
+        "Uniswap",
+        "Aave"
+      ],
+      "task_type": "defi_research",
+      "use_count": 0,
+      "avg_score": null
     }
   ],
-  "last_rebuilt": "2026-03-29T13:03:13.960835"
+  "last_rebuilt": "2026-03-31T12:00:00"
 }

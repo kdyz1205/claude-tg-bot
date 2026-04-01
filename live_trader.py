@@ -37,8 +37,8 @@ DEFAULT_LIVE_CONFIG = {
     "min_mcap_usd": 5_000_000,    # minimum market cap
     "max_slippage_bps": 100,      # max slippage in basis points (1%)
     "min_sol_reserve": 0.05,      # always keep this much SOL for gas
-    "check_interval": 30,         # position check interval (seconds)
-    "scan_interval": 900,         # strategy scan interval (seconds)
+    "check_interval": 30,         # TP/SL 监控周期（秒）— 与 scan_interval 独立
+    "scan_interval": 300,         # 新信号扫描周期（秒）；旧配置若仍为 900 则沿用文件值
     "starting_balance_sol": 0,    # set on first start
     "daily_pnl_sol": 0,
     "daily_reset_ts": 0,
@@ -154,7 +154,6 @@ async def _execute_jupiter_swap(quote: dict, user_pubkey: str) -> Optional[str]:
             return None
 
         # Submit signed transaction
-        import base64 as b64
         signed_b64 = b64.b64encode(signed_bytes).decode()
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -197,10 +196,19 @@ async def _get_token_price_usd(mint: str) -> Optional[float]:
     return None
 
 
+_cached_sol_price = 83.0
+_cached_sol_price_ts = 0
+
 async def _get_sol_price_usd() -> float:
-    """Get SOL price in USD."""
+    """Get SOL price in USD (cached 60s, fallback to last known)."""
+    global _cached_sol_price, _cached_sol_price_ts
+    if time.time() - _cached_sol_price_ts < 60:
+        return _cached_sol_price
     price = await _get_token_price_usd(SOL_MINT)
-    return price if price else 150.0  # fallback
+    if price and price > 0:
+        _cached_sol_price = price
+        _cached_sol_price_ts = time.time()
+    return _cached_sol_price
 
 
 async def _validate_token(mint: str, cfg: dict) -> tuple[bool, str]:
@@ -309,6 +317,22 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
         logger.warning(f"Trade blocked: {reason}")
         return None
 
+    if signal_data and signal_data.get("llm_trade_directive_json"):
+        try:
+            import json as _json
+
+            from dispatcher import sanitize_llm_trade_output
+
+            raw = signal_data["llm_trade_directive_json"]
+            st = raw if isinstance(raw, str) else _json.dumps(raw)
+            safe = await sanitize_llm_trade_output(st)
+            if safe is None:
+                logger.warning("Trade blocked: LLM directive failed hallucination filter")
+                return None
+        except Exception as e:
+            logger.warning("llm trade guard error: %s", e)
+            return None
+
     # Token safety check
     valid, val_reason = await _validate_token(mint, cfg)
     if not valid:
@@ -342,9 +366,12 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
     # Record position
     sol_price = await _get_sol_price_usd()
     token_price = await _get_token_price_usd(mint)
+    if not token_price or token_price <= 0:
+        # Estimate from quote: outAmount tokens for amount_sol SOL
+        token_price = (amount_sol * sol_price) / max(out_amount / 1e6, 1e-12) if out_amount > 0 else 0
 
     position = {
-        "id": f"live_{int(time.time())}_{symbol or mint[:8]}",
+        "id": f"live_{int(time.time())}_{int(time.time()*1000) % 1000}_{symbol or mint[:8]}",
         "status": "open",
         "mint": mint,
         "symbol": symbol or mint[:8],
@@ -461,8 +488,8 @@ async def check_positions(send_func=None) -> dict:
         if not current_price or current_price <= 0:
             continue
 
-        entry_price = pos.get("entry_price_usd", 0)
-        if entry_price <= 0:
+        entry_price = pos.get("entry_price_usd") or 0
+        if not entry_price or entry_price <= 0:
             continue
 
         pnl_pct = ((current_price - entry_price) / entry_price) * 100
@@ -540,6 +567,17 @@ def get_live_stats() -> dict:
     }
 
 
+def get_open_live_positions() -> list:
+    """Open Jupiter-engine positions (file read only, no RPC)."""
+    return [p for p in _load_positions() if p.get("status") == "open"]
+
+
+def get_recent_closed_trades(limit: int = 5) -> list:
+    closed = [p for p in _load_positions() if p.get("status") == "closed"]
+    closed.sort(key=lambda x: x.get("close_time") or 0, reverse=True)
+    return closed[: max(0, int(limit))]
+
+
 def format_live_status() -> str:
     """Format live trading status for Telegram."""
     s = get_live_stats()
@@ -576,6 +614,8 @@ class LiveTrader:
         self._send = send_func
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._last_pos_check = 0.0
+        self._last_sig_scan = 0.0
 
     async def start(self):
         if self._running:
@@ -594,6 +634,8 @@ class LiveTrader:
                 _save_config(cfg)
 
         self._running = True
+        self._last_pos_check = 0.0
+        self._last_sig_scan = 0.0
         self._task = asyncio.create_task(self._loop())
         logger.info("LiveTrader started")
 
@@ -607,10 +649,100 @@ class LiveTrader:
         _save_config(cfg)
         logger.info("LiveTrader stopped")
 
-    async def _loop(self):
-        """Main trading loop: scan for signals → execute → monitor positions."""
+    async def _signal_scan_and_execute(self):
+        """Scan pro + alpha + on-chain filter, then attempt Jupiter buys (real TX)."""
         import pro_strategy
 
+        cfg = _load_config()
+        signals = await pro_strategy.scan_all_pro(cfg)
+        if not isinstance(signals, list):
+            signals = list(signals) if signals else []
+
+        try:
+            from alpha_engine import scan_alpha, scan_onchain_filter
+
+            alpha_result = await scan_alpha()
+            if alpha_result:
+                for token in (alpha_result if isinstance(alpha_result, list) else []):
+                    addr = token.get("address", "")
+                    if addr and len(addr) >= 32 and not addr.startswith("0x"):
+                        signals.append({
+                            "symbol": token.get("symbol", "?"),
+                            "direction": "long",
+                            "combined_score": float(token.get("score", 0) or 0),
+                            "mint_address": addr,
+                            "source": "alpha_engine",
+                        })
+
+            oc_res = await scan_onchain_filter()
+            if oc_res:
+                seen = {s.get("mint_address") or s.get("address") for s in signals if s.get("mint_address") or s.get("address")}
+                for token in (oc_res if isinstance(oc_res, list) else []):
+                    addr = token.get("address", "")
+                    if not addr or len(addr) < 32 or addr.startswith("0x") or addr in seen:
+                        continue
+                    seen.add(addr)
+                    signals.append({
+                        "symbol": token.get("symbol", "?"),
+                        "direction": "long",
+                        "combined_score": float(token.get("score", 0) or 0),
+                        "mint_address": addr,
+                        "source": "onchain_filter",
+                    })
+        except Exception as e:
+            logger.debug("Alpha/onchain scan in live loop: %s", e)
+
+        for sig in signals:
+            if not self._running:
+                break
+
+            symbol = sig.get("symbol", "")
+            direction = sig.get("direction", "")
+            score = float(sig.get("combined_score", 0) or 0)
+
+            if direction != "long":
+                continue
+
+            if score < 40:
+                continue
+
+            mint = sig.get("mint_address") or _symbol_to_mint(symbol)
+            if not mint:
+                continue
+
+            import secure_wallet
+            balance = await secure_wallet.get_sol_balance()
+            if not balance:
+                continue
+
+            regime_mult = sig.get("regime_mult", 1.0)
+            confidence = min(score / 100, 1.0)
+            base_pct = cfg.get("max_trade_pct", 15.0) / 100
+            trade_sol = balance * base_pct * regime_mult * (0.5 + 0.5 * confidence)
+            trade_sol = min(trade_sol, balance - cfg.get("min_sol_reserve", 0.05))
+            trade_sol = max(trade_sol, 0.01)
+
+            result = await buy_token(
+                mint, trade_sol, symbol,
+                signal_data={"score": score, "direction": direction, "source": sig.get("source")},
+            )
+
+            if result and self._send:
+                msg = (
+                    f"\U0001f7e2 **LIVE BUY** {symbol}\n"
+                    f"\u91d1\u989d: {trade_sol:.4f} SOL\n"
+                    f"\u8bc4\u5206: {score:.0f}/100\n"
+                    f"TX: {result.get('tx_signature', '?')[:20]}..."
+                )
+                try:
+                    await self._send(msg)
+                except Exception:
+                    pass
+
+            await asyncio.sleep(2)
+
+    async def _loop(self):
+        """TP/SL 按 check_interval；新单扫描按 scan_interval（互不阻塞）。"""
         while self._running:
             try:
                 cfg = _load_config()
@@ -618,69 +750,25 @@ class LiveTrader:
                     await asyncio.sleep(10)
                     continue
 
-                # 1. Check existing positions (TP/SL/trailing)
-                await check_positions(self._send)
+                now = time.time()
+                ci = max(10.0, float(cfg.get("check_interval", 30)))
+                si = max(60.0, float(cfg.get("scan_interval", 300)))
 
-                # 2. Scan for new signals
-                signals = await pro_strategy.scan_all_pro(cfg)
+                if self._last_pos_check == 0 or (now - self._last_pos_check) >= ci:
+                    self._last_pos_check = time.time()
+                    await check_positions(self._send)
 
-                for sig in signals:
-                    if not self._running:
-                        break
+                now = time.time()
+                if self._last_sig_scan == 0 or (now - self._last_sig_scan) >= si:
+                    self._last_sig_scan = time.time()
+                    await self._signal_scan_and_execute()
 
-                    symbol = sig.get("symbol", "")
-                    direction = sig.get("direction", "")
-                    score = sig.get("combined_score", 0)
-
-                    # Only take long signals for spot trading (can't short on DEX)
-                    # For short signals: skip (or future: short via perps)
-                    if direction != "long":
-                        continue
-
-                    # Score threshold for live trading (higher than paper)
-                    if score < 40:
-                        continue
-
-                    # Need token mint address for Jupiter
-                    # Map common symbols to mints
-                    mint = _symbol_to_mint(symbol)
-                    if not mint:
-                        continue
-
-                    # Calculate position size
-                    import secure_wallet
-                    balance = await secure_wallet.get_sol_balance()
-                    if not balance:
-                        continue
-
-                    regime_mult = sig.get("regime_mult", 1.0)
-                    confidence = min(score / 100, 1.0)
-                    base_pct = cfg.get("max_trade_pct", 15.0) / 100
-                    trade_sol = balance * base_pct * regime_mult * (0.5 + 0.5 * confidence)
-                    trade_sol = min(trade_sol, balance - cfg.get("min_sol_reserve", 0.05))
-                    trade_sol = max(trade_sol, 0.01)  # minimum trade
-
-                    result = await buy_token(
-                        mint, trade_sol, symbol,
-                        signal_data={"score": score, "direction": direction}
-                    )
-
-                    if result and self._send:
-                        msg = (
-                            f"\U0001f7e2 **LIVE BUY** {symbol}\n"
-                            f"\u91d1\u989d: {trade_sol:.4f} SOL\n"
-                            f"\u8bc4\u5206: {score:.0f}/100\n"
-                            f"TX: {result.get('tx_signature', '?')[:20]}..."
-                        )
-                        try:
-                            await self._send(msg)
-                        except Exception:
-                            pass
-
-                    await asyncio.sleep(2)  # Don't spam
-
-                # Wait for next scan
-                await asyncio.sleep(cfg.get("scan_interval", 900))
+                now = time.time()
+                next_p = self._last_pos_check + ci
+                next_s = self._last_sig_scan + si
+                wait = min(next_p, next_s) - now
+                wait = max(1.0, min(wait, 120.0))
+                await asyncio.sleep(wait)
 
             except asyncio.CancelledError:
                 break

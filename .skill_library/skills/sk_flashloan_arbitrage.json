@@ -1,0 +1,18 @@
+{
+  "id": "sk_flashloan_arbitrage",
+  "title": "DEX价差监控 + Aave闪电贷 + Flashbots 骨架",
+  "summary": "QuoterV2 vs Sushi 报价、Gas启发式、executeFlashArb calldata、Flashbots eth_sendBundle 提交骨架；Solidity 模板未审计",
+  "task_type": "defi_research",
+  "function_signature": "run_skill(params: dict | None) -> dict",
+  "input_schema": "rpc_url | ETH_RPC_URL | amount_in_wei | eth_price_usd | gas_price_gwei | min_spread_bps | executor_address",
+  "output_schema": "{ok, snapshot, actionable, execute_flash_arb_calldata?, gas_estimate}",
+  "trigger_pattern": "flash loan MEV uniswap sushiswap flashbots aave",
+  "keywords": ["flash loan", "MEV", "Flashbots", "Uniswap", "Sushi", "Aave", "arbitrage"],
+  "template_code": "from skills.sk_flashloan_arbitrage import run_skill\n# await run_skill({'rpc_url': os.environ['ETH_RPC_URL']})",
+  "files_created": ["skills/sk_flashloan_arbitrage.py"],
+  "config_location": "ETH_RPC_URL, FLASHBOTS_SIGNER_KEY, FLASHBOTS_RELAY_URL",
+  "source": "dark_forest_educational",
+  "created_at": "2026-03-31T00:00:00",
+  "score": 55,
+  "usage_count": 0
+}

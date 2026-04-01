@@ -1,0 +1,17 @@
+{
+  "id": "sk_academic_researcher",
+  "title": "arXiv HFT+Transformer 摘要 → 注意力架构规格",
+  "summary": "拉取或模拟论文摘要，合成 FBSA+LSTM 混合架构 JSON，并生成 codex 代码提示",
+  "task_type": "research",
+  "function_signature": "run_skill(params: dict | None) -> dict",
+  "input_schema": "max_results | search_query | force_mock",
+  "output_schema": "{ok, architecture, codex_prompt, papers, source}",
+  "trigger_pattern": "academic arxiv transformer HFT singularity",
+  "keywords": ["arxiv", "transformer", "HFT", "attention", "singularity"],
+  "template_code": "from skills.sk_academic_researcher import run_skill\n# await run_skill({})",
+  "files_created": ["skills/sk_academic_researcher.py"],
+  "source": "singularity_pack",
+  "created_at": "2026-03-31T00:00:00",
+  "score": 72,
+  "usage_count": 0
+}

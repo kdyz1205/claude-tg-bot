@@ -320,6 +320,35 @@ claude --resume SESSION_ID -p "你的消息" --output-format text --dangerously-
 ### Never-Die充能链（按顺序尝试）：
 CLI订阅 → Codex浏览器 → 免费Web AI（ChatGPT/Grok）→ 缓存/模板回复
 
+## TRADING CAPABILITIES (用户直接说中文即可)
+你是一个具有完整交易能力的智能体。用户可能用自然语言给你交易指令：
+
+### 快捷指令（已内置，秒级响应）：
+- "价格 BTC" / "BTC多少钱" → 自动查 OKX 实时行情
+- "大盘" / "行情" / "市场" → BTC/ETH/SOL 概览
+- "扫描" / "alpha" → 执行 alpha_engine 信号扫描
+- "持仓" / "仓位" → 显示当前持仓
+- "开始交易" → 启动实盘交易引擎
+- "停止" → 停止交易
+- "交易" / "面板" → 打开 Trading Dashboard
+
+### 高级交易操作（需要你执行命令）：
+- 查看 OKX 行情详细: `python -c "import httpx; r=httpx.get('https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT-SWAP'); print(r.json())"`
+- 查看实盘状态: `python -c "import live_trader; print(live_trader.format_live_status())"`
+- 管理钱包: `python -c "import secure_wallet; print(secure_wallet.get_public_key())"`
+- Alpha 扫描: `python -c "import asyncio; from alpha_engine import scan_alpha; print(asyncio.run(scan_alpha()))"`
+- 技能库查看: `python -c "import skill_library; print(skill_library.search_skills('策略'))"`
+
+### 自主开发流水线（/dev 命令）：
+用户说"写一个xxx策略"或"开发一个xxx功能"时，自动调用:
+`python -c "import asyncio; from pipeline.auto_dev_orchestrator import AutoDevOrchestrator; r=asyncio.run(AutoDevOrchestrator().run(task_goal='任务', target_rel_path='skills/xxx.py')); print(r)"`
+
+### 后台运行中的自动化系统：
+- InfiniteEvolver: 每30分钟自动生成→回测→晋升策略
+- ProactiveAgent: 健康巡逻
+- MarketMonitor: 行情异动推送
+- MetaLearner: 每日模式分析
+
 ## SELF-HEALING
 Click miss → ui_click_element → som_click → smartclick
 Type fail → ui_type_element → smarttype (clipboard fallback)
@@ -1850,10 +1879,20 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
 
 
 async def _fallback_to_api_providers(user_message: str, chat_id: int, context) -> bool:
-    """Fallback: DISABLED — API providers cost money, user explicitly opted out.
-    Always returns False so the chain moves to free web AI."""
-    logger.info(f"Chat {chat_id}: API fallback DISABLED (user preference: no paid API)")
-    return False
+    """Fallback: Route through Codex CLI (local OpenAI subscription, no API cost)."""
+    try:
+        from providers_router import model_router
+        if "codex_cli" in model_router.available_providers() and model_router._stats["codex_cli"].is_healthy:
+            logger.info(f"Chat {chat_id}: trying Codex CLI fallback (local subscription)")
+            success = await model_router._call_provider("codex_cli", user_message, chat_id, context)
+            if success:
+                model_router.record_success("codex_cli", 0)
+                return True
+            model_router.record_failure("codex_cli")
+        return False
+    except ImportError:
+        logger.info(f"Chat {chat_id}: Codex CLI fallback unavailable")
+        return False
 
 
 async def _fallback_to_web_ai(user_message: str, chat_id: int, context) -> bool:
@@ -2298,8 +2337,10 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs) ->
 
             logger.warning(f"Chat {chat_id}: CLI failed, entering never-die fallback chain")
 
-            # Step 2: API providers (DISABLED — user opted out, too expensive)
-            # _fallback_to_api_providers always returns False now
+            # Step 2: API providers (Gemini free, OpenAI if key set)
+            api_ok = await _fallback_to_api_providers(user_message, chat_id, context)
+            if api_ok:
+                return True
 
             # Step 3: Try free web AI (ChatGPT/Claude.ai/Gemini web)
             web_ok = await _fallback_to_web_ai(user_message, chat_id, context)

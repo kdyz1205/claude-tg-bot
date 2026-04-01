@@ -251,3 +251,12 @@ class Dispatcher:
             lines.append("")
             lines.append(self.quota.status_report())
         return "\n".join(lines)
+
+
+# ── LLM trade directive guard (call from codex / live paths before execution) ─
+from .llm_filter import LLMHallucinationFilter  # noqa: E402
+
+
+async def sanitize_llm_trade_output(raw_llm_output: str):
+    """Validate embedded trade JSON; returns dict or None if blocked."""
+    return await LLMHallucinationFilter.sanitize_trade_directive(raw_llm_output)

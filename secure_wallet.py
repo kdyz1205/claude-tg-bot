@@ -3,13 +3,16 @@ Secure Wallet Module — Encrypted key storage + swap-only transaction signing.
 
 Security model:
 - Private key encrypted at rest with Fernet (AES-128-CBC + HMAC-SHA256)
+- PBKDF2 with 480 000 iterations + random salt (brute-force resistant)
 - Password from WALLET_PASSWORD environment variable (never on disk)
+- Wallet file restricted to owner-only permissions (0600)
 - Transaction whitelist: ONLY Jupiter swap program IDs allowed
 - Transfer instructions are REJECTED — code cannot send SOL/tokens to other wallets
 - Key never logged, printed, or sent over network
+- Decrypted material zeroed from memory after use
 """
 
-import os, json, logging, base64, hashlib, time
+import os, json, logging, base64, hashlib, time, ctypes, sys
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +23,34 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
 WALLET_FILE = BASE_DIR / "_wallet_encrypted.dat"
+
+
+def _secure_zero(data: bytearray | bytes):
+    """Best-effort in-place zeroing of sensitive bytes from memory."""
+    if isinstance(data, bytearray):
+        for i in range(len(data)):
+            data[i] = 0
+    elif isinstance(data, bytes) and data:
+        try:
+            ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer_copy(data)), 0, len(data))
+        except Exception:
+            pass
+
+
+def _restrict_file_permissions(path: Path):
+    """Set file to owner-read/write only. Best-effort on Windows."""
+    try:
+        if sys.platform != "win32":
+            path.chmod(0o600)
+        else:
+            import subprocess
+            subprocess.run(
+                ["icacls", str(path), "/inheritance:r",
+                 "/grant:r", f"{os.getenv('USERNAME', 'CURRENT_USER')}:(R,W)"],
+                capture_output=True, timeout=5,
+            )
+    except Exception:
+        pass
 
 # ── Whitelisted program IDs (ONLY these can appear in signed transactions) ──
 ALLOWED_PROGRAMS = {
@@ -35,13 +66,26 @@ ALLOWED_PROGRAMS = {
 # ── BLOCKED instruction types (reject if these discriminators appear) ──
 # SystemProgram::Transfer discriminator = 2 (u32 LE)
 # TokenProgram::Transfer discriminator = 3 (u8)
+# TokenProgram::TransferChecked discriminator = 12 (u8)
 BLOCKED_SYSTEM_TRANSFER_DISC = b'\x02\x00\x00\x00'
 BLOCKED_TOKEN_TRANSFER_DISC = bytes([3])
+BLOCKED_TOKEN_TRANSFER_CHECKED_DISC = bytes([12])
 
+
+SALT_FILE = BASE_DIR / "_wallet_salt.dat"
+
+def _get_or_create_salt() -> bytes:
+    """Get or create a unique random salt for this installation."""
+    if SALT_FILE.exists():
+        return SALT_FILE.read_bytes()
+    salt = os.urandom(32)
+    SALT_FILE.write_bytes(salt)
+    _restrict_file_permissions(SALT_FILE)
+    return salt
 
 def _derive_key(password: str) -> bytes:
-    """Derive Fernet key from password using PBKDF2."""
-    salt = b"solana_wallet_encryption_salt_v1"
+    """Derive Fernet key from password using PBKDF2 with unique random salt."""
+    salt = _get_or_create_salt()
     dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations=480000, dklen=32)
     return base64.urlsafe_b64encode(dk)
 
@@ -93,7 +137,9 @@ def store_wallet(key_input: str) -> bool:
 
     encrypted = f.encrypt(payload)
     WALLET_FILE.write_bytes(encrypted)
-    logger.info("Wallet stored (encrypted)")
+    _restrict_file_permissions(WALLET_FILE)
+    _secure_zero(payload)
+    logger.info("Wallet stored (AES-encrypted, permissions restricted)")
     return True
 
 
@@ -110,9 +156,10 @@ def load_keypair():
     if not f:
         return None
 
+    decrypted = None
     try:
         encrypted = WALLET_FILE.read_bytes()
-        decrypted = f.decrypt(encrypted)
+        decrypted = bytearray(f.decrypt(encrypted))
         data = json.loads(decrypted)
     except InvalidToken:
         logger.error("Failed to decrypt wallet — wrong password?")
@@ -120,6 +167,9 @@ def load_keypair():
     except Exception as e:
         logger.error(f"Wallet load error: {e}")
         return None
+    finally:
+        if decrypted is not None:
+            _secure_zero(decrypted)
 
     try:
         from solders.keypair import Keypair
@@ -131,13 +181,22 @@ def load_keypair():
             elif len(key_bytes) == 32:
                 return Keypair.from_seed(key_bytes)
         elif data["type"] == "seed":
-            # BIP39 seed phrase → derive keypair
-            # Solana uses derivation path m/44'/501'/0'/0'
+            # BIP39 seed phrase → derive keypair via proper BIP44 path m/44'/501'/0'/0'
             try:
                 from mnemonic import Mnemonic
+                import hmac as _hmac
                 mnemo = Mnemonic("english")
-                seed_bytes = mnemo.to_seed(data["data"])[:32]
-                return Keypair.from_seed(seed_bytes)
+                seed = mnemo.to_seed(data["data"])  # 64-byte BIP39 seed
+                # Derive using SLIP-10/ed25519: HMAC-SHA512 chain
+                # Master key
+                I = _hmac.new(b"ed25519 seed", seed, hashlib.sha512).digest()
+                key, chain = I[:32], I[32:]
+                # Derive each level: 44', 501', 0', 0'
+                for idx in (44, 501, 0, 0):
+                    idx_bytes = (0x80000000 | idx).to_bytes(4, "big")
+                    I = _hmac.new(chain, b"\x00" + key + idx_bytes, hashlib.sha512).digest()
+                    key, chain = I[:32], I[32:]
+                return Keypair.from_seed(key)
             except ImportError:
                 logger.error("Install 'mnemonic' package for seed phrase support: pip install mnemonic")
                 return None
@@ -163,13 +222,14 @@ def wallet_exists() -> bool:
 
 
 def delete_wallet() -> bool:
-    """Securely delete wallet file."""
+    """Securely delete wallet file with multi-pass overwrite."""
     if WALLET_FILE.exists():
-        # Overwrite with random data before deletion
         size = WALLET_FILE.stat().st_size
-        WALLET_FILE.write_bytes(os.urandom(size))
+        for _ in range(3):
+            WALLET_FILE.write_bytes(os.urandom(size))
+        WALLET_FILE.write_bytes(b'\x00' * size)
         WALLET_FILE.unlink()
-        logger.info("Wallet deleted securely")
+        logger.info("Wallet deleted securely (3-pass random + zero)")
         return True
     return False
 
@@ -202,9 +262,9 @@ def _validate_transaction(tx_bytes: bytes) -> tuple[bool, str]:
                 if len(ix.data) >= 4 and bytes(ix.data[:4]) == BLOCKED_SYSTEM_TRANSFER_DISC:
                     return False, "BLOCKED: SystemProgram.Transfer detected — refusing to sign"
 
-            # Extra check: if Token Program, block Transfer instruction
+            # Extra check: if Token Program, block Transfer AND TransferChecked
             if program_id == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":
-                if len(ix.data) >= 1 and bytes(ix.data[:1]) == BLOCKED_TOKEN_TRANSFER_DISC:
+                if len(ix.data) >= 1 and bytes(ix.data[:1]) in (BLOCKED_TOKEN_TRANSFER_DISC, BLOCKED_TOKEN_TRANSFER_CHECKED_DISC):
                     return False, "BLOCKED: TokenProgram.Transfer detected — refusing to sign"
 
         return True, "OK"

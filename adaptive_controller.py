@@ -8,14 +8,119 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import time
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import aiofiles
+
+from self_monitor import trigger_alert
 
 logger = logging.getLogger(__name__)
 
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 PATTERNS_FILE = os.path.join(BOT_DIR, "adaptive_patterns.json")
+CONSCIOUSNESS_STATE_FILE = Path(BOT_DIR) / ".consciousness_state.json"
+
+
+class ConsciousnessStateManager:
+    """Singleton: asyncio lock + atomic writes for `.consciousness_state.json`."""
+
+    _instance: Optional["ConsciousnessStateManager"] = None
+
+    def __new__(cls) -> "ConsciousnessStateManager":
+        if cls._instance is None:
+            ins = super().__new__(cls)
+            ins.memory_cache = {}
+            ins.current_version = 0
+            ins._file_lock = asyncio.Lock()
+            ins._state_file = CONSCIOUSNESS_STATE_FILE
+            cls._instance = ins
+        return cls._instance
+
+    async def load_state(self) -> Dict[str, Any]:
+        async with self._file_lock:
+            if not self._state_file.exists():
+                return {}
+            try:
+                async with aiofiles.open(
+                    self._state_file, mode="r", encoding="utf-8"
+                ) as f:
+                    content = await f.read()
+                data = json.loads(content)
+                if not isinstance(data, dict):
+                    raise ValueError("state root must be a JSON object")
+                self.memory_cache = dict(data)
+                self.current_version = int(data.get("_version", 0))
+                return dict(data)
+            except json.JSONDecodeError as e:
+                await trigger_alert(
+                    "ConsciousnessStateCorruption",
+                    f"JSON decode error: {e}",
+                    severity="error",
+                )
+                try:
+                    bak = self._state_file.with_suffix(
+                        f".corrupt.{int(time.time())}.bak.json"
+                    )
+                    await asyncio.to_thread(shutil.copy2, self._state_file, bak)
+                except OSError:
+                    pass
+                return dict(self.memory_cache)
+            except (OSError, ValueError, TypeError) as e:
+                await trigger_alert(
+                    "ConsciousnessStateLoadError",
+                    str(e)[:400],
+                    severity="warning",
+                )
+                return dict(self.memory_cache)
+
+    async def commit_state_patch(
+        self, patch: Dict[str, Any], caller_id: str
+    ) -> bool:
+        async with self._file_lock:
+            temp_file = self._state_file.with_suffix(".tmp")
+            try:
+                current_state = dict(self.memory_cache)
+                current_state.update(patch)
+                current_state.pop("_version", None)
+                self.current_version += 1
+                current_state["_version"] = self.current_version
+                current_state["_last_modifier"] = caller_id
+
+                async with aiofiles.open(
+                    temp_file, mode="w", encoding="utf-8"
+                ) as f:
+                    await f.write(
+                        json.dumps(
+                            current_state, indent=2, ensure_ascii=False
+                        )
+                    )
+                def _atomic_replace() -> None:
+                    temp_file.replace(self._state_file)
+
+                await asyncio.to_thread(_atomic_replace)
+                self.memory_cache = current_state
+                return True
+            except Exception as e:
+                await trigger_alert(
+                    "StateCommitFailure",
+                    f"{caller_id}: {e}",
+                    severity="error",
+                )
+                try:
+                    if temp_file.exists():
+                        temp_file.unlink()
+                except OSError:
+                    pass
+                return False
+
+
+def get_consciousness_state_manager() -> ConsciousnessStateManager:
+    return ConsciousnessStateManager()
+
 
 # ---------------------------------------------------------------------------
 # Lazy imports — only pulled in when needed to keep module load fast

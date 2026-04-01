@@ -1,0 +1,32 @@
+{
+  "id": "sk_rug_pull_detector",
+  "title": "EVM bytecode 貔貅/增发启发式扫描",
+  "summary": "eth_getCode + 选择子启发式；非链上模拟卖出，仅作前置过滤",
+  "task_type": "safety",
+  "function_signature": "scan_contract_bytecode(token_address, rpc_url=None) -> dict",
+  "input_schema": "token_address: 0x…; rpc_url: optional",
+  "output_schema": "{ok, risk_level, reasons, bytecode_len}",
+  "trigger_pattern": "rug honeypot 貔貅 字节码 审计 bytecode",
+  "keywords": [
+    "rug",
+    "honeypot",
+    "貔貅",
+    "bytecode",
+    "audit",
+    "mint",
+    "evm"
+  ],
+  "generic_steps": [
+    "Web3 HTTPProvider 拉取合约 bytecode",
+    "检查 transfer / transferFrom / 疑似 mint 选择子",
+    "生成风险等级与 Markdown 报告"
+  ],
+  "template_code": "from skills.sk_rug_pull_detector import run_skill\n# await run_skill({'token_address': addr})",
+  "files_modified": [],
+  "files_created": ["skills/sk_rug_pull_detector.py"],
+  "config_location": "ETH_RPC_URL env",
+  "created_at": "2026-03-31T00:00:00",
+  "source": "phase5_skill_pack",
+  "score": 75,
+  "usage_count": 0
+}

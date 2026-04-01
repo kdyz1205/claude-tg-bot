@@ -23,9 +23,41 @@ import time
 from datetime import datetime
 from typing import Optional
 
-import httpx
+import aiohttp
+
+from pipeline.net_gate import alpha_http_limiter, trade_memory_gate
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_UA = "Mozilla/5.0 (compatible; claude-tg-bot-alpha/1.0)"
+
+
+async def _aio_get_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    params: dict | None = None,
+    extra_headers: dict | None = None,
+    total_timeout: float = 15.0,
+) -> dict | list | None:
+    await alpha_http_limiter.acquire()
+    headers = {"User-Agent": _DEFAULT_UA}
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        async with session.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=total_timeout),
+        ) as resp:
+            if resp.status != 200:
+                logger.debug("alpha_engine: HTTP %s %s", resp.status, url[:80])
+                return None
+            return await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        logger.debug("alpha_engine: fetch error %s: %s", url[:60], e)
+        return None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "_alpha_config.json")
@@ -178,17 +210,17 @@ def _composite(liq: float, hold: float, mom: float, heat: float, weights: dict) 
 
 # ── Data fetchers ─────────────────────────────────────────────────────────────
 
-async def _fetch_coingecko_trending(client: httpx.AsyncClient) -> list[dict]:
+async def _fetch_coingecko_trending(session: aiohttp.ClientSession) -> list[dict]:
     """CoinGecko /search/trending — free, no API key needed."""
     try:
-        resp = await client.get(
+        data = await _aio_get_json(
+            session,
             "https://api.coingecko.com/api/v3/search/trending",
-            timeout=12.0,
+            total_timeout=12.0,
         )
-        if resp.status_code != 200:
-            logger.debug("alpha_engine: CoinGecko HTTP %s", resp.status_code)
+        if not isinstance(data, dict):
             return []
-        coins = resp.json().get("coins", [])
+        coins = data.get("coins", [])
         results = []
         for rank, item in enumerate(coins[:10]):
             coin = item.get("item", {})
@@ -200,9 +232,11 @@ async def _fetch_coingecko_trending(client: httpx.AsyncClient) -> list[dict]:
             # price_change_percentage_24h can be a dict {"usd": x} or a float
             pct = data.get("price_change_percentage_24h", 0)
             change_24h = pct.get("usd", 0) if isinstance(pct, dict) else float(pct or 0)
-            # market_cap_btc as rough liquidity proxy: 1 BTC ≈ $60k
+            # market_cap_btc as rough liquidity proxy
             mc_btc = float(coin.get("market_cap_btc", 0) or 0)
-            liquidity_proxy = mc_btc * 60_000 * 0.05  # 5% of mcap as liquidity proxy
+            btc_price_est = float(coin.get("price_btc", 0) or 0)
+            btc_usd = (1.0 / btc_price_est) if btc_price_est > 0 else 95_000  # derive from data or fallback
+            liquidity_proxy = mc_btc * btc_usd * 0.05  # 5% of mcap as liquidity proxy
             results.append({
                 "name": name,
                 "symbol": symbol,
@@ -221,17 +255,16 @@ async def _fetch_coingecko_trending(client: httpx.AsyncClient) -> list[dict]:
         return []
 
 
-async def _fetch_dexscreener_trending(client: httpx.AsyncClient) -> list[dict]:
+async def _fetch_dexscreener_trending(session: aiohttp.ClientSession) -> list[dict]:
     """DEXScreener top-boosted tokens. Enriches each with pair data."""
     try:
-        resp = await client.get(
+        data = await _aio_get_json(
+            session,
             "https://api.dexscreener.com/token-boosts/top/v1",
-            timeout=12.0,
+            total_timeout=12.0,
         )
-        if resp.status_code != 200:
-            logger.debug("alpha_engine: DEXScreener HTTP %s", resp.status_code)
+        if data is None:
             return []
-        data = resp.json()
         items = data if isinstance(data, list) else []
     except Exception as e:
         logger.debug("alpha_engine: DEXScreener boost list error: %s", e)
@@ -251,18 +284,13 @@ async def _fetch_dexscreener_trending(client: httpx.AsyncClient) -> list[dict]:
             boost_amount = float(item.get("amount", 0) or 0)
             heat = min(100.0, math.log10(max(1.0, boost_amount)) / 4.0 * 100.0)
 
-            # Rate limit between API calls
-            if _idx > 0:
-                await asyncio.sleep(0.2)
             # Fetch pair data for liquidity / price change
-            try:
-                pr = await client.get(
-                    f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-                    timeout=8.0,
-                )
-                pairs = pr.json().get("pairs") or []
-            except Exception:
-                pairs = []
+            pr_data = await _aio_get_json(
+                session,
+                f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+                total_timeout=8.0,
+            )
+            pairs = pr_data.get("pairs") or [] if isinstance(pr_data, dict) else []
 
             if not pairs:
                 continue
@@ -301,10 +329,11 @@ async def _fetch_dexscreener_trending(client: httpx.AsyncClient) -> list[dict]:
     return results
 
 
-async def _fetch_pumpfun_trending(client: httpx.AsyncClient) -> list[dict]:
+async def _fetch_pumpfun_trending(session: aiohttp.ClientSession) -> list[dict]:
     """Pump.fun hot list — tokens with most recent social activity."""
     try:
-        resp = await client.get(
+        data = await _aio_get_json(
+            session,
             "https://frontend-api.pump.fun/coins",
             params={
                 "limit": 20,
@@ -312,13 +341,11 @@ async def _fetch_pumpfun_trending(client: httpx.AsyncClient) -> list[dict]:
                 "order": "DESC",
                 "includeNsfw": "false",
             },
-            timeout=12.0,
-            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+            extra_headers={"Accept": "application/json"},
+            total_timeout=12.0,
         )
-        if resp.status_code != 200:
-            logger.debug("alpha_engine: Pump.fun HTTP %s", resp.status_code)
+        if data is None:
             return []
-        data = resp.json()
         items = data if isinstance(data, list) else []
     except Exception as e:
         logger.debug("alpha_engine: Pump.fun error: %s", e)
@@ -351,6 +378,67 @@ async def _fetch_pumpfun_trending(client: httpx.AsyncClient) -> list[dict]:
         except (ValueError, TypeError, KeyError):
             continue
     return results
+
+
+# ── OKX spot market source ───────────────────────────────────────────────────
+
+_OKX_SPOT_TICKERS = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+_OKX_TOP_N = 50       # how many OKX USDT pairs to consider
+_OKX_MIN_VOL_24H = 5_000_000   # $5M minimum 24h USDT volume
+
+async def _fetch_okx_trending(session: aiohttp.ClientSession) -> list[dict]:
+    """Top-N OKX USDT spot pairs by 24h volume with basic momentum filter."""
+    try:
+        data = await _aio_get_json(session, _OKX_SPOT_TICKERS, total_timeout=12.0)
+        if not data or not isinstance(data.get("data"), list):
+            return []
+    except Exception as e:
+        logger.debug("alpha_engine: OKX fetch error: %s", e)
+        return []
+
+    results = []
+    for item in data["data"]:
+        inst_id = item.get("instId", "")
+        if not inst_id.endswith("-USDT"):
+            continue
+        try:
+            price = float(item.get("last") or 0)
+            vol_ccy = float(item.get("volCcy24h") or 0)   # in quote (USDT)
+            open_24h = float(item.get("open24h") or 0)
+            high_24h = float(item.get("high24h") or 0)
+            low_24h = float(item.get("low24h") or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if vol_ccy < _OKX_MIN_VOL_24H or price <= 0 or open_24h <= 0:
+            continue
+
+        change_24h = (price - open_24h) / open_24h * 100
+        symbol = inst_id.replace("-USDT", "")
+
+        if _is_risky(symbol, symbol):
+            continue
+
+        # Use ATR proxy as liquidity estimate (not depth, but correlates)
+        atr_proxy = (high_24h - low_24h) if high_24h > low_24h else 0
+
+        results.append({
+            "name": symbol,
+            "symbol": symbol,
+            "source": "okx",
+            "chain": "cex",
+            "address": inst_id,
+            "pair_url": f"https://www.okx.com/trade-spot/{inst_id.lower()}",
+            "liquidity_usd": vol_ccy * 0.02,   # 2% of 24h volume as depth proxy
+            "volume_24h_usd": vol_ccy,
+            "holder_count": 0,
+            "price_change_24h": round(change_24h, 2),
+            "community_heat_raw": min(100.0, vol_ccy / 1_000_000),
+            "price_usd": price,
+        })
+
+    results.sort(key=lambda x: x["volume_24h_usd"], reverse=True)
+    return results[:_OKX_TOP_N]
 
 
 # ── Onchain Filter (DexScreener advanced scan) ──────────────────────────────
@@ -407,37 +495,39 @@ def onchain_filter_new_only(tokens: list[dict]) -> list[dict]:
     return new_tokens
 
 
-async def scan_onchain_filter(filter_set: dict = None, client: httpx.AsyncClient = None) -> list[dict]:
+async def scan_onchain_filter(
+    filter_set: dict = None, session: aiohttp.ClientSession | None = None
+) -> list[dict]:
     """
     Onchain filter: scan DexScreener for tokens matching strict criteria.
     Uses token-profiles for discovery + pair data for filtering.
     """
     if filter_set is None:
         filter_set = ONCHAIN_FILTER_SET_1
-    own_client = client is None
-    if own_client:
-        client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(20.0))
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=25),
+            headers={"User-Agent": _DEFAULT_UA},
+        )
 
     results = []
     try:
         # 1. Fetch latest token profiles (recently boosted / active)
-        resp = await client.get(
+        _boosts_data = await _aio_get_json(
+            session,
             "https://api.dexscreener.com/token-boosts/top/v1",
-            timeout=12.0,
+            total_timeout=12.0,
         )
-        _boosts_data = resp.json()
         boosts = _boosts_data if isinstance(_boosts_data, list) else []
 
         # Also search for new pairs across chains
-        try:
-            resp2 = await client.get(
-                "https://api.dexscreener.com/token-profiles/latest/v1",
-                timeout=12.0,
-            )
-            _profiles_data = resp2.json()
-            profiles = _profiles_data if isinstance(_profiles_data, list) else []
-        except Exception:
-            profiles = []
+        _profiles_data = await _aio_get_json(
+            session,
+            "https://api.dexscreener.com/token-profiles/latest/v1",
+            total_timeout=12.0,
+        )
+        profiles = _profiles_data if isinstance(_profiles_data, list) else []
 
         candidates = []
         seen_addr: set[str] = set()
@@ -451,14 +541,13 @@ async def scan_onchain_filter(filter_set: dict = None, client: httpx.AsyncClient
 
         # 2. Fetch pair data and apply filters
         for _ci, cand in enumerate(candidates[:30]):  # limit API calls
-            if _ci > 0:
-                await asyncio.sleep(0.2)  # rate-limit: max 5 req/s for DexScreener
             try:
-                pr = await client.get(
+                pr_data = await _aio_get_json(
+                    session,
                     f"https://api.dexscreener.com/latest/dex/tokens/{cand['address']}",
-                    timeout=8.0,
+                    total_timeout=8.0,
                 )
-                pairs = pr.json().get("pairs") or []
+                pairs = pr_data.get("pairs") or [] if isinstance(pr_data, dict) else []
             except Exception:
                 continue
             if not pairs:
@@ -543,8 +632,8 @@ async def scan_onchain_filter(filter_set: dict = None, client: httpx.AsyncClient
     except Exception as e:
         logger.error("onchain_filter scan error: %s", e)
     finally:
-        if own_client:
-            await client.aclose()
+        if own_session:
+            await session.close()
 
     # Sort by 5-minute volume (hottest first)
     results.sort(key=lambda x: x.get("vol_5m", 0), reverse=True)
@@ -605,16 +694,20 @@ async def scan_alpha(cfg: dict = None) -> list[dict]:
     threshold = cfg.get("score_threshold", 70)
     top_n = cfg.get("top_n", 5)
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        cg, dex, pump = await asyncio.gather(
-            _fetch_coingecko_trending(client),
-            _fetch_dexscreener_trending(client),
-            _fetch_pumpfun_trending(client),
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30),
+        headers={"User-Agent": _DEFAULT_UA},
+    ) as session:
+        cg, dex, pump, okx = await asyncio.gather(
+            _fetch_coingecko_trending(session),
+            _fetch_dexscreener_trending(session),
+            _fetch_pumpfun_trending(session),
+            _fetch_okx_trending(session),
             return_exceptions=True,
         )
 
     all_tokens: list[dict] = []
-    for batch in (cg, dex, pump):
+    for batch in (cg, dex, pump, okx):
         if isinstance(batch, list):
             all_tokens.extend(batch)
 
@@ -664,8 +757,26 @@ async def scan_alpha(cfg: dict = None) -> list[dict]:
                 "scanned_at": time.time(),
             })
 
-    scored.sort(key=lambda x: x.get("score", 0), reverse=True)
-    return scored[:top_n]
+    # ── Pre-Trade RAG memory gate ─────────────────────────────────────────
+    passed: list[dict] = []
+    for t in scored:
+        blocked, block_reason = await trade_memory_gate.check({
+            "symbol": t.get("symbol", ""),
+            "score": t.get("score", 0),
+            "liquidity_usd": t.get("liquidity_usd", 0),
+            "volume_24h_usd": t.get("volume_24h_usd", t.get("volume_24h", 0)),
+            "price_change_24h": t.get("price_change_24h", 0),
+            "top10_concentration_pct": t.get("top10_concentration_pct", 0),
+        })
+        if blocked:
+            logger.info("alpha_engine: memory gate blocked %s — %s",
+                        t.get("symbol", "?"), block_reason[:120])
+            continue
+        passed.append(t)
+    # ─────────────────────────────────────────────────────────────────────
+
+    passed.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return passed[:top_n]
 
 
 # ── Performance tracking ──────────────────────────────────────────────────────
@@ -712,7 +823,10 @@ async def check_short_term_performance() -> dict:
     updated = 0
     results = {"checked": 0, "wins_1h": 0, "losses_1h": 0, "wins_24h": 0, "losses_24h": 0}
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30),
+        headers={"User-Agent": _DEFAULT_UA},
+    ) as session:
         for r in records:
             if r.get("resolved"):
                 continue
@@ -736,11 +850,12 @@ async def check_short_term_performance() -> dict:
 
             # Fetch current price
             try:
-                resp = await client.get(
+                pr_data = await _aio_get_json(
+                    session,
                     f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-                    timeout=8.0,
+                    total_timeout=8.0,
                 )
-                pairs = resp.json().get("pairs") or []
+                pairs = pr_data.get("pairs") or [] if isinstance(pr_data, dict) else []
                 if not pairs:
                     continue
                 best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
@@ -842,17 +957,21 @@ async def resolve_old_records(cfg: dict = None) -> dict:
     }
     newly_resolved = 0
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30),
+        headers={"User-Agent": _DEFAULT_UA},
+    ) as session:
         for r in pending:
             address = r.get("address", "")
             outcome = "unknown"
             if address and r["source"] in ("dexscreener", "pumpfun"):
                 try:
-                    resp = await client.get(
+                    pr_data = await _aio_get_json(
+                        session,
                         f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-                        timeout=8.0,
+                        total_timeout=8.0,
                     )
-                    pairs = resp.json().get("pairs") or []
+                    pairs = pr_data.get("pairs") or [] if isinstance(pr_data, dict) else []
                     if pairs:
                         best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
                         new_liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
@@ -918,14 +1037,92 @@ def _auto_adjust_weights(cfg: dict, wins_by_factor: dict) -> None:
     logger.info("alpha_engine: weights adjusted → %s", new_w)
 
 
+def evolve_onchain_filter() -> dict:
+    """
+    Evolve the on-chain filter parameters based on paper trade outcomes.
+    Tightens thresholds when losing, loosens when consistently winning.
+    Returns the updated filter set.
+    """
+    global ONCHAIN_FILTER_SET_1
+    filter_evo_file = os.path.join(BASE_DIR, "_onchain_filter_evo.json")
+
+    try:
+        with open(filter_evo_file, "r", encoding="utf-8") as f:
+            evo_state = json.load(f)
+    except Exception:
+        evo_state = {
+            "generation": 0,
+            "best_wr": 0,
+            "best_params": dict(ONCHAIN_FILTER_SET_1),
+            "current_params": dict(ONCHAIN_FILTER_SET_1),
+        }
+
+    try:
+        from paper_trader import compute_stats
+        stats = compute_stats()
+    except Exception:
+        return ONCHAIN_FILTER_SET_1
+
+    total = stats.get("total_trades", 0)
+    wr = stats.get("win_rate", 0)
+    if total < 10:
+        return ONCHAIN_FILTER_SET_1
+
+    evo_state["generation"] += 1
+    gen = evo_state["generation"]
+
+    if wr > evo_state["best_wr"]:
+        evo_state["best_wr"] = wr
+        evo_state["best_params"] = dict(ONCHAIN_FILTER_SET_1)
+
+    import random
+    params = dict(ONCHAIN_FILTER_SET_1)
+
+    if wr < 45:
+        # Losing — tighten filters (more selective)
+        params["min_liquidity"] = int(params["min_liquidity"] * random.uniform(1.05, 1.20))
+        params["min_mcap"] = int(params["min_mcap"] * random.uniform(1.05, 1.15))
+        params["max_mcap"] = int(params["max_mcap"] * random.uniform(0.85, 0.95))
+        params["min_vol_3m"] = int(params["min_vol_3m"] * random.uniform(1.05, 1.15))
+        params["min_vol_5m"] = int(params["min_vol_5m"] * random.uniform(1.05, 1.15))
+    elif wr > 60:
+        # Winning — cautiously loosen (more opportunities)
+        params["min_liquidity"] = int(params["min_liquidity"] * random.uniform(0.90, 0.98))
+        params["max_mcap"] = int(params["max_mcap"] * random.uniform(1.02, 1.10))
+        params["min_vol_3m"] = int(params["min_vol_3m"] * random.uniform(0.92, 0.98))
+    else:
+        # Stable — small random mutations
+        for k in ["min_liquidity", "min_mcap", "min_vol_3m", "min_vol_5m"]:
+            params[k] = int(params[k] * random.uniform(0.95, 1.05))
+
+    # Clamp to reasonable bounds
+    params["min_liquidity"] = max(5000, min(100000, params["min_liquidity"]))
+    params["min_mcap"] = max(5000, min(200000, params["min_mcap"]))
+    params["max_mcap"] = max(1000000, min(50000000, params["max_mcap"]))
+    params["min_vol_3m"] = max(2000, min(50000, params["min_vol_3m"]))
+    params["min_vol_5m"] = max(5000, min(100000, params["min_vol_5m"]))
+
+    ONCHAIN_FILTER_SET_1.update(params)
+    evo_state["current_params"] = params
+
+    try:
+        with open(filter_evo_file, "w", encoding="utf-8") as f:
+            json.dump(evo_state, f, indent=2)
+    except Exception:
+        pass
+
+    logger.info("alpha_engine: filter evolved gen=%d wr=%.0f%% → %s", gen, wr, params)
+    return params
+
+
 # ── Formatting ────────────────────────────────────────────────────────────────
 
-_SOURCE_EMOJI = {"coingecko": "🦎", "dexscreener": "📊", "pumpfun": "💊"}
+_SOURCE_EMOJI = {"coingecko": "🦎", "dexscreener": "📊", "pumpfun": "💊", "okx": "🔵"}
 
 
 def format_alpha_report(tokens: list[dict], header: str = "🚀 **Alpha 信号扫描 Top5**") -> str:
     if not tokens:
-        return "🔍 当前无高评分 Alpha 信号（评分未达70分）\n\n数据来源: CoinGecko / DEXScreener / Pump.fun"
+        return "🔍 当前无高评分 Alpha 信号（评分未达70分）\n\n数据来源: CoinGecko / DEXScreener / Pump.fun / OKX"
 
     lines = [header, ""]
     for i, t in enumerate(tokens, 1):
@@ -1040,12 +1237,41 @@ class AlphaEngine:
                     await self._send(report)
                     record_push(tokens)
 
+                # ── LLM / agent directive gate before any paper trade ────────
+                # If alpha signals arrive via an LLM agent (not direct scan),
+                # sanitize each token directive through LLMHallucinationFilter.
+                safe_tokens: list[dict] = []
+                for t in tokens:
+                    if t.get("source") == "agent_directive":
+                        try:
+                            from dispatcher.llm_filter import LLMHallucinationFilter
+                            directive = {
+                                "action": "BUY",
+                                "pair": f"{t.get('symbol','?')}/USDT",
+                                "amount": float(t.get("buy_amount_usd", 10.0)),
+                                "price": float(t.get("price_usd", 0) or 1.0),
+                            }
+                            cleared = await LLMHallucinationFilter.sanitize_trade_directive(
+                                directive
+                            )
+                            if cleared is None:
+                                logger.warning(
+                                    "AlphaEngine: LLMFilter blocked agent directive for %s",
+                                    t.get("symbol", "?"),
+                                )
+                                continue
+                        except Exception as fe:
+                            logger.warning("AlphaEngine: LLMFilter error: %s", fe)
+                            continue
+                    safe_tokens.append(t)
+                # ─────────────────────────────────────────────────────────────
+
                 # Auto-open paper trades for alpha tokens
-                if tokens:
+                if safe_tokens:
                     try:
                         import paper_trader as _pt
                         if hasattr(_pt, 'on_signal_detected'):
-                            await _pt.on_signal_detected(tokens)
+                            await _pt.on_signal_detected(safe_tokens)
                     except Exception:
                         pass
 
@@ -1081,7 +1307,6 @@ class AlphaEngine:
                     stats = await resolve_old_records(cfg)
                     if stats["newly_resolved"] > 0 and self._send:
                         wa_note = " ⚖️ 权重已自动调整" if stats.get("weight_adjusted") else ""
-                        # Include real P&L in the report
                         perf_text = get_performance_summary()
                         await self._send(
                             f"📊 7天Alpha绩效: 共{stats['total']}个 胜率{stats['win_rate']:.1%}"
@@ -1089,6 +1314,14 @@ class AlphaEngine:
                         )
                 except Exception as e:
                     logger.debug("AlphaEngine: resolve error: %s", e)
+
+                # Evolve on-chain filter parameters based on paper performance
+                try:
+                    new_params = evolve_onchain_filter()
+                    if new_params and self._send:
+                        logger.info("AlphaEngine: on-chain filter evolved → %s", new_params)
+                except Exception as e:
+                    logger.debug("AlphaEngine: filter evolution error: %s", e)
 
             except asyncio.CancelledError:
                 raise

@@ -25,6 +25,7 @@ Thumbs.db
 
 # Wallet & live trading (NEVER commit)
 _wallet_encrypted.dat
+_wallet_salt.dat
 _live_positions.json
 _live_config.json
 _scheduler_state.json
