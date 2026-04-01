@@ -895,6 +895,10 @@ class InfiniteEvolver:
     Asyncio daemon: hypothesis → AutoDev codegen → subprocess backtest
     → Sharpe gate → .skill_library promotion.
 
+    Generated ``skills/*.py`` are checked with ``evolver_firewall`` (AST denylist)
+    plus ``pipeline.security_ast`` before execution. V6 ``quick_backtest`` runs
+    NumPy work in a ``ProcessPoolExecutor`` so the bot event loop stays responsive.
+
     Run as a background task:
         evolver = InfiniteEvolver(send_func=my_tg_send)
         evolver.start()

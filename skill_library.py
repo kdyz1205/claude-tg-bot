@@ -9,6 +9,9 @@ Flow:
   User msg → find_matching_skills() → inject into prompt
   Response → score → maybe_extract_skill() → save new skill
   Reuse + high score → update_skill_from_reuse() → skill evolves
+
+Executable Python skills (``skills/sk_*.py``) use ``skills.base_skill.BaseSkill`` and
+``skills.skill_runtime`` for timeouts, hot-reload, and unload. See ``invoke_python_skill_async``.
 """
 import json
 import logging
@@ -16,6 +19,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -918,6 +922,29 @@ def seed_evolution_skills() -> int:
         logger.info(f"Seeded {added} evolution skills into library")
 
     return added
+
+
+# ─── Executable Python skills (BaseSkill / hot-reload) ─────────────────────
+
+async def invoke_python_skill_async(
+    module: str | Path,
+    payload: dict | None = None,
+    *,
+    timeout_sec: float = 120.0,
+    reload_module: bool = False,
+) -> Any:
+    """
+    Run a ``skills.sk_*`` module or a ``.py`` path via ``skill_runtime``
+    (unified timeout; optional ``importlib.reload`` for package modules).
+    """
+    from skills.skill_runtime import run_skill_module_async
+
+    return await run_skill_module_async(
+        module,
+        payload,
+        timeout_sec=timeout_sec,
+        reload_first=reload_module,
+    )
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────

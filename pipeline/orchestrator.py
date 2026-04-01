@@ -4,6 +4,9 @@ Orchestrator — the complete pipeline that ties everything together.
 Flow:
     User (Telegram) → Dispatcher (classify + split) → Browser Agents (execute) → Git (merge) → Result
 
+HTTP LLM agent stages (RAG → reflection → trader) use ``agents.pipeline_bus`` and ``agents.runner``;
+this module is the browser-harness orchestrator, not that queue.
+
 This is the "brain" of the harness. It:
 1. Receives a task from the gateway (Telegram)
 2. Dispatches to the right AI platform(s)

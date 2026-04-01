@@ -1,6 +1,8 @@
 """
 Claude Web Browser Agent — automates claude.ai
 
+Playwright Page/Browser are always released via ``BrowserAgent.execute`` → ``close()``.
+
 This is for standard Claude conversations on the web.
 Good for moderate-to-heavy code tasks.
 

@@ -23,6 +23,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SIGNAL_HISTORY_FILE = os.path.join(BASE_DIR, "_signal_history.json")
 PERFORMANCE_STATS_FILE = os.path.join(BASE_DIR, "_performance_stats.json")
 CHART_FILE = os.path.join(BASE_DIR, "_performance_chart.png")
+RISK_EVENTS_FILE = os.path.join(BASE_DIR, "_risk_events.jsonl")
 
 # Hours after signal at which we sample price
 CHECK_INTERVALS_H = [1, 4, 24]
@@ -81,6 +82,16 @@ def record_arb_signal(pair: str, buy_exchange: str, sell_exchange: str,
             break
     _save_signals(signals[-MAX_SIGNALS:])
     return sig_id
+
+
+def record_risk_kill_event(kind: str, payload: dict) -> None:
+    """Append a risk / hard-kill event for audit (independent of signal PnL tracking)."""
+    row = {"ts": time.time(), "kind": kind, **payload}
+    try:
+        with open(RISK_EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        logger.warning("profit_tracker: risk event log failed: %s", e)
 
 
 def compute_arb_stats() -> dict:

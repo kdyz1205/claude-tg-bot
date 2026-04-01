@@ -24,6 +24,7 @@ import numpy as np
 
 from .indicators import sma, ema, atr, bb_upper, bb_lower, slope
 from .okx_executor import OKXExecutor, Position, TradeRecord
+from trading_skills.drawdown_guardian import DrawdownGuardian, status_triggers_hard_kill
 
 log = logging.getLogger(__name__)
 
@@ -469,6 +470,16 @@ class StrategyBrain:
         self._singularity_lock = asyncio.Lock()
         self._singularity_reload_interval = 300.0
         self._last_singularity_reload: float = 0.0
+        self._drawdown_guardian = DrawdownGuardian(
+            base_max_dd=self.executor.risk.max_drawdown_pct,
+            adaptive_lookback=30,
+            vol_scale=True,
+        )
+        self._drawdown_guardian.configure_risk(
+            base_max_dd=self.executor.risk.max_drawdown_pct,
+            max_daily_loss_pct=self.executor.risk.max_daily_loss_pct,
+        )
+        self._guardian_daily_anchor_ts: float = 0.0
 
     async def _notify(self, text: str):
         if self._send_callback:
@@ -702,7 +713,27 @@ class StrategyBrain:
         self.lessons.cycle += 1
         self._cycle_phase = "observe"
         self.executor.check_daily_reset()
+        if self._guardian_daily_anchor_ts != self.executor.state.last_daily_reset:
+            if self.executor.state.last_daily_reset > 0:
+                self._drawdown_guardian.reset_daily()
+            self._guardian_daily_anchor_ts = self.executor.state.last_daily_reset
+        self._drawdown_guardian.configure_risk(
+            base_max_dd=self.executor.risk.max_drawdown_pct,
+            max_daily_loss_pct=self.executor.risk.max_daily_loss_pct,
+        )
         await self.executor.update_positions()
+
+        g_status = self._drawdown_guardian.update(self.executor.state.equity)
+        if status_triggers_hard_kill(g_status):
+            from trading.hard_risk_kill import hard_kill
+
+            reason = g_status.get("message") or "drawdown_guardian_shutdown"
+            await hard_kill(self.executor, f"drawdown_guardian:{reason}"[:400])
+            self.executor.state.is_alive = False
+            self.executor.state.shutdown_reason = reason[:500]
+            self.executor.save_state()
+            await self._notify(f"🛑 Hard kill (drawdown guardian): {reason[:300]}")
+            return
 
         self._cycle_phase = "manage"
         await self.manage_positions()

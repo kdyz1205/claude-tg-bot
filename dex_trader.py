@@ -25,13 +25,13 @@ _sol_price_cache = {"price": 83.0, "ts": 0}
 
 
 def _get_sol_price_sync() -> float:
-    """Get SOL/USD price with 60s cache. Sync-safe for paper calculations."""
+    """SOL/USD from OKX ticker WSS hub if running; 60s cache; no REST poll."""
     if time.time() - _sol_price_cache["ts"] < 60:
         return _sol_price_cache["price"]
     try:
-        import httpx
-        r = httpx.get("https://www.okx.com/api/v5/market/ticker?instId=SOL-USDT", timeout=3)
-        p = float(r.json().get("data", [{}])[0].get("last", 0))
+        from trading.okx_ws_hub import get_last_price_usdt
+
+        p = float(get_last_price_usdt("SOL-USDT"))
         if p > 0:
             _sol_price_cache["price"] = p
             _sol_price_cache["ts"] = time.time()

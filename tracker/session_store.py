@@ -11,18 +11,25 @@ When the platform comes back online, the orchestrator can:
 1. Reopen that browser tab
 2. Navigate to the saved conversation URL
 3. Continue the task from where it left off
+
+Disk writes use ``threading.Lock`` for snapshot consistency and, when an asyncio
+loop is running, ``asyncio.Lock`` + aiofiles for non-blocking atomic saves.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-import os
-import time
 import logging
+import os
+import threading
+import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
-from enum import Enum
+
+import aiofiles
 
 logger = logging.getLogger(__name__)
 
@@ -143,12 +150,18 @@ class SessionStore:
     def __init__(self, state_file: str = ".harness_state/sessions.json"):
         self.state_file = Path(state_file)
         self.sessions: dict[str, SessionState] = {}
-        self._save_lock = __import__("threading").Lock()
+        self._persist_lock = threading.Lock()
+        self._disk_aio_lock: asyncio.Lock | None = None
         self.telegram_prefs_file = self.state_file.parent / "telegram_panel_mode.json"
         self._telegram_prefs: dict[str, str] = {}
-        self._telegram_prefs_lock = __import__("threading").Lock()
+        self._telegram_prefs_lock = threading.Lock()
         self._load()
         self._load_telegram_prefs()
+
+    def _get_disk_aio_lock(self) -> asyncio.Lock:
+        if self._disk_aio_lock is None:
+            self._disk_aio_lock = asyncio.Lock()
+        return self._disk_aio_lock
 
     MAX_SESSIONS = 200  # Prevent unbounded memory growth
 
@@ -304,18 +317,48 @@ class SessionStore:
             logger.warning(f"Failed to load sessions: {e}")
 
     def _save_telegram_prefs(self):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._save_telegram_prefs_sync()
+        else:
+            asyncio.create_task(self._save_telegram_prefs_async())
+
+    def _save_telegram_prefs_sync(self) -> None:
         with self._telegram_prefs_lock:
             blob = dict(self._telegram_prefs)
         try:
             self.telegram_prefs_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.telegram_prefs_file.with_suffix(".tmp")
             with open(str(tmp), "w", encoding="utf-8") as f:
-                json.dump(blob, f, indent=2)
+                json.dump(blob, f, indent=2, ensure_ascii=False, default=str)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(str(tmp), str(self.telegram_prefs_file))
         except OSError as e:
             logger.error("Failed to save telegram panel prefs: %s", e)
+
+    async def _save_telegram_prefs_async(self) -> None:
+        async with self._get_disk_aio_lock():
+            with self._telegram_prefs_lock:
+                blob = dict(self._telegram_prefs)
+            self.telegram_prefs_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.telegram_prefs_file.with_suffix(".tmp")
+            text = json.dumps(blob, indent=2, ensure_ascii=False, default=str)
+            try:
+                async with aiofiles.open(tmp, mode="w", encoding="utf-8") as f:
+                    await f.write(text)
+                await asyncio.to_thread(os.replace, str(tmp), str(self.telegram_prefs_file))
+            except OSError as e:
+                logger.error("Failed to save telegram prefs (async): %s", e)
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+
+    async def save_telegram_prefs_async(self) -> None:
+        await self._save_telegram_prefs_async()
 
     def _load_telegram_prefs(self):
         if not self.telegram_prefs_file.exists():

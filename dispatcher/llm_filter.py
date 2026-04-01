@@ -6,6 +6,8 @@ LLMHallucinationFilter.sanitize_trade_directive() before reaching the
 execution layer. Trade JSON repair rounds use ``reask_trade_json_via_http``
 (aiohttp to Ollama / Anthropic / OpenAI per ``config``), not subprocess CLI.
 
+Upstream ``llm_http_client`` enforces daily token budget (``LLM_DAILY_TOKEN_BUDGET``) and model fallback.
+
 Rejects:
   - Non-whitelisted trading pairs
   - Notional value > MAX_NOTIONAL_USD

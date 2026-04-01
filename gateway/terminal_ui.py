@@ -15,6 +15,7 @@ Callback routing (prefix ``term:`` to avoid clashes with bot.py):
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import os
@@ -427,6 +428,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return TerminalState.MAIN_MENU
 
 
+async def _terminal_rug_followup_evm(
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    chat_id: int,
+    evm: str,
+) -> None:
+    """Heavy rug scan off the MessageHandler hot path (instant placeholder first)."""
+    try:
+        body = await _rug_report_evm(evm)
+        panel = f"{body}"
+        kb = build_token_analysis_keyboard(evm, None)
+        await _edit_or_send_panel(context, uid, chat_id, panel, kb)
+    except Exception as e:
+        logger.warning("terminal rug follow-up failed: %s", e)
+
+
 async def global_address_interceptor(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
@@ -443,14 +460,15 @@ async def global_address_interceptor(
     chat_id = update.effective_chat.id
 
     if evm:
-        body = await _rug_report_evm(evm)
-        panel = f"{body}"
+        panel = f"📍 `{evm}`\n\n⏳ 链上静态扫描进行中…"
         kb = build_token_analysis_keyboard(evm, None)
+        await _edit_or_send_panel(context, uid, chat_id, panel, kb)
+        asyncio.create_task(_terminal_rug_followup_evm(context, uid, chat_id, evm))
     else:
         panel = _solana_stub_report(sol or "")
         kb = build_token_analysis_keyboard(None, sol)
+        await _edit_or_send_panel(context, uid, chat_id, panel, kb)
 
-    await _edit_or_send_panel(context, uid, chat_id, panel, kb)
     s = get_session(uid)
     s.active_screen = "token"
     persist_session(s)

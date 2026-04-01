@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from skills.base_skill import BaseSkill
+
 logger = logging.getLogger(__name__)
 
 ARXIV_API = "https://export.arxiv.org/api/query"
@@ -178,6 +180,52 @@ Output: ONLY the raw Python source inside a single ```python fenced block, no ex
 """
 
 
+class AcademicResearcherSkill(BaseSkill):
+    """学术检索 + 架构提炼（超时由 BaseSkill.run 控制）。"""
+
+    skill_id = "sk_academic_researcher"
+    default_timeout_sec = 180.0
+
+    async def _execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        force_mock = bool(params.get("force_mock"))
+        max_results = int(params.get("max_results") or 5)
+        search_query = params.get("search_query")
+
+        papers: List[ArxivEntry] = []
+        source = "arxiv"
+
+        if not force_mock:
+            try:
+                papers = await fetch_arxiv_hft_transformer(search_query, max_results=max_results)
+            except Exception as e:
+                logger.warning("arXiv fetch failed, using mock: %s", e)
+                papers = _mock_arxiv_entries()
+                source = "mock_fallback"
+        else:
+            papers = _mock_arxiv_entries()
+            source = "mock"
+
+        if not papers:
+            papers = _mock_arxiv_entries()
+            source = "mock_empty"
+
+        architecture = synthesize_attention_architecture(papers)
+        codex_prompt = build_codex_prompt(architecture)
+
+        return {
+            "ok": True,
+            "source": source,
+            "paper_count": len(papers),
+            "papers": [p.__dict__ for p in papers],
+            "architecture": architecture,
+            "codex_prompt": codex_prompt,
+            "skill": "sk_academic_researcher",
+        }
+
+
+SKILL_CLASS = AcademicResearcherSkill
+
+
 async def run_skill(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Skill 标准入口（异步），供 singularity_engine / 调度器 await。
@@ -187,46 +235,12 @@ async def run_skill(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
       max_results: 拉取条数
       force_mock: True 则跳过网络，仅用内置模拟论文
     """
-    params = params or {}
-    force_mock = bool(params.get("force_mock"))
-    max_results = int(params.get("max_results") or 5)
-    search_query = params.get("search_query")
-
-    papers: List[ArxivEntry] = []
-    source = "arxiv"
-
-    if not force_mock:
-        try:
-            papers = await fetch_arxiv_hft_transformer(search_query, max_results=max_results)
-        except Exception as e:
-            logger.warning("arXiv fetch failed, using mock: %s", e)
-            papers = _mock_arxiv_entries()
-            source = "mock_fallback"
-    else:
-        papers = _mock_arxiv_entries()
-        source = "mock"
-
-    if not papers:
-        papers = _mock_arxiv_entries()
-        source = "mock_empty"
-
-    architecture = synthesize_attention_architecture(papers)
-    codex_prompt = build_codex_prompt(architecture)
-
-    return {
-        "ok": True,
-        "source": source,
-        "paper_count": len(papers),
-        "papers": [p.__dict__ for p in papers],
-        "architecture": architecture,
-        "codex_prompt": codex_prompt,
-        "skill": "sk_academic_researcher",
-    }
+    return await AcademicResearcherSkill().run(params or {})
 
 
 def run_skill_sync(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(run_skill(params))
+        return asyncio.run(AcademicResearcherSkill().run(params or {}))
     raise RuntimeError("在 async 上下文中请使用 await run_skill(...)")

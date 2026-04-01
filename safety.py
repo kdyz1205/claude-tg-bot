@@ -3,6 +3,9 @@ safety.py — Permission system for dangerous commands.
 
 In CLI mode (Bridge), Claude Code handles its own permissions.
 This module is only used for API fallback mode where tools are called directly.
+
+Trading hard kill (daily loss / drawdown) is handled by trading.hard_risk_kill and
+DrawdownGuardian — it does not pass through this permission flow.
 """
 import re
 import asyncio

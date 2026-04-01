@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from typing import Any
 
 import aiohttp
@@ -125,6 +124,74 @@ def _ollama_extract_text(data: dict[str, Any]) -> str:
     return str(m.get("content") or "").strip()
 
 
+def _usage_tokens(data: dict[str, Any] | None, backend: str) -> int:
+    if not data or not isinstance(data, dict):
+        return 0
+    if backend == "anthropic":
+        u = data.get("usage") or {}
+        if not isinstance(u, dict):
+            return 0
+        return int(u.get("input_tokens", 0) or 0) + int(u.get("output_tokens", 0) or 0)
+    if backend == "openai":
+        u = data.get("usage") or {}
+        if not isinstance(u, dict):
+            return 0
+        t = int(u.get("total_tokens", 0) or 0)
+        if t:
+            return t
+        return int(u.get("prompt_tokens", 0) or 0) + int(u.get("completion_tokens", 0) or 0)
+    return 0
+
+
+def _estimate_prompt_tokens(system_prompt: str, messages_for_api: list[dict[str, str]]) -> int:
+    n = len(system_prompt or "")
+    for m in messages_for_api:
+        n += len(str(m.get("content") or ""))
+    return max(512, n // 4 + 1024)
+
+
+def _overload_retryable(err: str) -> bool:
+    el = (err or "").lower()
+    return any(
+        x in el
+        for x in (
+            "529",
+            "503",
+            "502",
+            "overloaded",
+            "capacity",
+            "temporarily unavailable",
+            "try again",
+        )
+    )
+
+
+def _model_fallback_chain(backend: str, primary: str) -> list[str]:
+    primary = (primary or "").strip()
+    chain: list[str] = []
+    if primary:
+        chain.append(primary)
+    if backend == "anthropic":
+        for m in getattr(config, "LLM_HTTP_FALLBACK_MODELS", []) or []:
+            ms = (m or "").strip()
+            if ms and ms not in chain:
+                chain.append(ms)
+    elif backend == "openai":
+        for m in (
+            getattr(config, "TASK_TIER_FAST_OPENAI", None),
+            "gpt-4o-mini",
+            "gpt-3.5-turbo",
+        ):
+            ms = (m or "").strip()
+            if ms and ms not in chain:
+                chain.append(ms)
+    else:
+        om = (getattr(config, "OLLAMA_MODEL", "") or "").strip()
+        if om and om not in chain:
+            chain.append(om)
+    return chain[:6]
+
+
 async def complete_turn(
     *,
     chat_id: int,
@@ -140,7 +207,7 @@ async def complete_turn(
         (assistant_text, session_id_or_none, stderr_equivalent_for_legacy_checks)
     """
     backend = resolve_backend()
-    model = effective_model(backend, model_hint)
+    model_primary = effective_model(backend, model_hint)
     user_text = (user_text or "").strip()
     if not user_text:
         return "", None, "empty user message"
@@ -156,62 +223,111 @@ async def complete_turn(
 
     messages_for_api: list[dict[str, str]] = prior + [{"role": "user", "content": user_text}]
 
+    try:
+        from tracker.quota import http_llm_preflight, http_llm_record_usage
+    except ImportError:
+        def http_llm_preflight(_n: int) -> tuple[bool, str]:
+            return True, ""
+
+        def http_llm_record_usage(_n: int) -> None:
+            return
+
+    ok_budget, budget_msg = http_llm_preflight(
+        _estimate_prompt_tokens(system_prompt, messages_for_api)
+    )
+    if not ok_budget:
+        return "", None, budget_msg
+
+    models = _model_fallback_chain(backend, model_primary)
+    err = ""
+    data: dict[str, Any] | None = None
+    text = ""
+
     async with _sem():
         connector = aiohttp.TCPConnector(limit=32, limit_per_host=16)
         async with aiohttp.ClientSession(connector=connector) as session:
-            err = ""
-            data: dict[str, Any] | None = None
+            for attempt, model in enumerate(models):
+                err = ""
+                data = None
 
-            if backend == "anthropic":
-                key = getattr(config, "ANTHROPIC_API_KEY", "") or ""
-                if not key:
-                    return "", None, "ANTHROPIC_API_KEY not set"
-                base = getattr(config, "ANTHROPIC_API_BASE", "https://api.anthropic.com").rstrip("/")
-                url = f"{base}/v1/messages"
-                hdrs = {
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                }
-                payload = {
-                    "model": model,
-                    "max_tokens": min(8192, int(getattr(config, "ANTHROPIC_MAX_TOKENS", 8192))),
-                    "system": system_prompt[:240_000],
-                    "messages": [{"role": m["role"], "content": m["content"]} for m in messages_for_api],
-                }
-                data, err = await _post_json(session, url, headers=hdrs, payload=payload, timeout=timeout)
-                text = _anthropic_extract_text(data) if data else ""
+                if backend == "anthropic":
+                    key = getattr(config, "ANTHROPIC_API_KEY", "") or ""
+                    if not key:
+                        return "", None, "ANTHROPIC_API_KEY not set"
+                    base = getattr(config, "ANTHROPIC_API_BASE", "https://api.anthropic.com").rstrip("/")
+                    url = f"{base}/v1/messages"
+                    hdrs = {
+                        "x-api-key": key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    }
+                    payload = {
+                        "model": model,
+                        "max_tokens": min(8192, int(getattr(config, "ANTHROPIC_MAX_TOKENS", 8192))),
+                        "system": system_prompt[:240_000],
+                        "messages": [{"role": m["role"], "content": m["content"]} for m in messages_for_api],
+                    }
+                    data, err = await _post_json(session, url, headers=hdrs, payload=payload, timeout=timeout)
+                    text = _anthropic_extract_text(data) if data else ""
 
-            elif backend == "openai":
-                key = getattr(config, "OPENAI_API_KEY", "") or ""
-                if not key:
-                    return "", None, "OPENAI_API_KEY not set"
-                base = getattr(config, "OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
-                url = f"{base}/chat/completions"
-                hdrs = {"authorization": f"Bearer {key}", "content-type": "application/json"}
-                oa_msgs: list[dict[str, str]] = [
-                    {"role": "system", "content": system_prompt[:240_000]},
-                ]
-                oa_msgs.extend(messages_for_api)
-                payload = {
-                    "model": model,
-                    "messages": oa_msgs,
-                    "temperature": 0.2,
-                }
-                data, err = await _post_json(session, url, headers=hdrs, payload=payload, timeout=timeout)
-                text = _openai_extract_text(data) if data else ""
+                elif backend == "openai":
+                    key = getattr(config, "OPENAI_API_KEY", "") or ""
+                    if not key:
+                        return "", None, "OPENAI_API_KEY not set"
+                    base = getattr(config, "OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+                    url = f"{base}/chat/completions"
+                    hdrs = {"authorization": f"Bearer {key}", "content-type": "application/json"}
+                    oa_msgs: list[dict[str, str]] = [
+                        {"role": "system", "content": system_prompt[:240_000]},
+                    ]
+                    oa_msgs.extend(messages_for_api)
+                    payload = {
+                        "model": model,
+                        "messages": oa_msgs,
+                        "temperature": 0.2,
+                    }
+                    data, err = await _post_json(session, url, headers=hdrs, payload=payload, timeout=timeout)
+                    text = _openai_extract_text(data) if data else ""
 
-            else:
-                base = getattr(config, "OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-                url = f"{base}/api/chat"
-                hdrs = {"content-type": "application/json"}
-                ol_msgs: list[dict[str, str]] = [
-                    {"role": "system", "content": system_prompt[:120_000]},
-                ]
-                ol_msgs.extend(messages_for_api)
-                payload = {"model": model, "messages": ol_msgs, "stream": False}
-                data, err = await _post_json(session, url, headers=hdrs, payload=payload, timeout=timeout)
-                text = _ollama_extract_text(data) if data else ""
+                else:
+                    base = getattr(config, "OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+                    url = f"{base}/api/chat"
+                    hdrs = {"content-type": "application/json"}
+                    ol_msgs: list[dict[str, str]] = [
+                        {"role": "system", "content": system_prompt[:120_000]},
+                    ]
+                    ol_msgs.extend(messages_for_api)
+                    payload = {"model": model, "messages": ol_msgs, "stream": False}
+                    data, err = await _post_json(session, url, headers=hdrs, payload=payload, timeout=timeout)
+                    text = _ollama_extract_text(data) if data else ""
+
+                if not err:
+                    ut = _usage_tokens(data, backend)
+                    if ut > 0:
+                        http_llm_record_usage(ut)
+                    if attempt > 0:
+                        logger.info(
+                            "llm_http_client: recovered on fallback model %s (backend=%s)",
+                            model,
+                            backend,
+                        )
+                    break
+
+                if attempt + 1 < len(models) and _overload_retryable(err):
+                    logger.warning(
+                        "llm_http_client overload (%s), retry model %s → next",
+                        err[:120],
+                        model,
+                    )
+                    continue
+
+                logger.warning("llm_http_client %s error: %s", backend, err[:300])
+                el = err.lower()
+                if "401" in err or "403" in err or "invalid" in el and "key" in el:
+                    return "", None, f"auth failed: {err}"
+                if "429" in err or "rate" in el:
+                    return "", None, f"rate limit: {err}"
+                return "", None, err
 
     if err:
         logger.warning("llm_http_client %s error: %s", backend, err[:300])
@@ -230,6 +346,7 @@ async def complete_turn(
 
     sid = f"http:{chat_id}" if chat_id >= 0 else None
     return text, sid, ""
+
 
 
 async def complete_stateless(

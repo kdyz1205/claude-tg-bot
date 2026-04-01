@@ -232,10 +232,21 @@ _cached_sol_price = 83.0
 _cached_sol_price_ts = 0
 
 async def _get_sol_price_usd() -> float:
-    """Get SOL price in USD (cached 60s, fallback to last known)."""
+    """SOL/USD from OKX ticker WSS hub (60s cache); Jupiter HTTP only if hub empty."""
     global _cached_sol_price, _cached_sol_price_ts
     if time.time() - _cached_sol_price_ts < 60:
         return _cached_sol_price
+    try:
+        from trading import okx_ws_hub
+
+        await okx_ws_hub.ensure_started()
+        p = okx_ws_hub.get_last_price_usdt("SOL-USDT")
+        if p > 0:
+            _cached_sol_price = p
+            _cached_sol_price_ts = time.time()
+            return _cached_sol_price
+    except Exception:
+        pass
     price = await _get_token_price_usd(SOL_MINT)
     if price and price > 0:
         _cached_sol_price = price
@@ -722,12 +733,17 @@ async def _run_delta_neutral_with_recovery(
     async def _hedge_leg() -> Any:
         return await execu.open_position_with_retry(hedge_symbol, "short", usd)
 
-    # OKX live open releases executor lock during REST so this overlaps real wall time with DEX.
-    dex_r, hed_r = await asyncio.gather(
-        _dex_leg(),
-        _hedge_leg(),
-        return_exceptions=True,
-    )
+    # Same-tick start: tasks are scheduled together, then awaited in one gather.
+    dex_t = asyncio.create_task(_dex_leg(), name="delta_neutral_dex")
+    hed_t = asyncio.create_task(_hedge_leg(), name="delta_neutral_hedge")
+    try:
+        from trading.hard_risk_kill import register_trading_task
+
+        register_trading_task(dex_t)
+        register_trading_task(hed_t)
+    except Exception:
+        pass
+    dex_r, hed_r = await asyncio.gather(dex_t, hed_t, return_exceptions=True)
     if isinstance(dex_r, BaseException):
         logger.error("DEX leg raised: %s", dex_r, exc_info=True)
         dex_r = None

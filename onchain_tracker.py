@@ -6,7 +6,8 @@ Chain activity uses **WebSocket subscriptions** (see ``onchain_ws_listen``):
   ``newHeads`` for native transfers; automatic reconnect (``while True`` + try/except).
 - Solana: ``logs_subscribe`` (mentions) over WSS + per-event ``get_transaction`` for amounts.
 
-Spot prices still come from CoinGecko over HTTP on a slow refresh (not used as a chain poll).
+Spot reference prices (ETH/BNB/SOL) come from the OKX public ticker WebSocket hub
+(``trading.okx_ws_hub``), not HTTP polling.
 
 Configure RPC endpoints via ``ONCHAIN_ETH_WSS``, ``ONCHAIN_BSC_WSS``, ``ONCHAIN_SOL_WSS``,
 and ``SOLANA_RPC_HTTP`` in ``config`` / environment.
@@ -108,27 +109,25 @@ _MAX_PRICE_CACHE_ENTRIES = 200
 
 
 async def _get_prices(client: httpx.AsyncClient) -> dict:
-    """Fetch ETH/BNB/SOL spot prices from CoinGecko (free, no key)."""
-    now = time.time()
-    if _PRICE_CACHE.get("_ts", 0) + _PRICE_CACHE_TTL > now:
-        return _PRICE_CACHE
+    """ETH/BNB/SOL spot from OKX public ticker WSS hub (``client`` unused; kept for call sites)."""
+    global _PRICE_CACHE
+    _ = client
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {"ids": "ethereum,binancecoin,solana", "vs_currencies": "usd"}
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = _safe_httpx_json(resp)
-        if not isinstance(data, dict):
-            raise ValueError("coingecko: invalid JSON")
-        # Cap price cache size
+        from trading import okx_ws_hub
+
+        await okx_ws_hub.ensure_started()
+        d = okx_ws_hub.get_spot_usd_map()
+        now = time.time()
         if len(_PRICE_CACHE) > _MAX_PRICE_CACHE_ENTRIES:
             _PRICE_CACHE.clear()
-        _PRICE_CACHE.update({
-            "ETH": float(data.get("ethereum", {}).get("usd", 3000) or 3000),
-            "BNB": float(data.get("binancecoin", {}).get("usd", 400) or 400),
-            "SOL": float(data.get("solana", {}).get("usd", 150) or 150),
-            "_ts": now,
-        })
+        _PRICE_CACHE.update(
+            {
+                "ETH": float(d.get("ETH", 3000) or 3000),
+                "BNB": float(d.get("BNB", 400) or 400),
+                "SOL": float(d.get("SOL", 150) or 150),
+                "_ts": float(d.get("_ts") or now),
+            }
+        )
     except Exception as e:
         logger.debug("_get_prices failed: %s", e)
         if "ETH" not in _PRICE_CACHE:

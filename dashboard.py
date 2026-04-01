@@ -1,6 +1,9 @@
 """
 Compatibility facade: web metrics live in ``web_dashboard``; Telegram inline panel
 templates live in ``gateway.tg_panel``. Importing ``dashboard`` stays stable for ``bot.py``.
+
+TG 面板数据面：持仓等数值由 ``trading.portfolio_snapshot`` 进程内缓存（可选 Redis 镜像，
+见 ``get_snapshot_for_gateway``）；不要在 ``dashboard`` 里做链上/交易所计算。
 """
 
 from __future__ import annotations

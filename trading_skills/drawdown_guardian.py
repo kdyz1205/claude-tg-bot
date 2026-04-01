@@ -141,6 +141,13 @@ class DrawdownGuardian:
             self.vol_scale,
         )
 
+    def configure_risk(self, base_max_dd: float | None = None, max_daily_loss_pct: float | None = None) -> None:
+        """Align limits with OKXExecutor.risk (fractions, e.g. 0.02 = 2%)."""
+        if base_max_dd is not None and base_max_dd > 0:
+            self.base_max_dd = float(base_max_dd)
+        if max_daily_loss_pct is not None and max_daily_loss_pct > 0:
+            self._daily_loss_limit = float(max_daily_loss_pct)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -155,6 +162,7 @@ class DrawdownGuardian:
         if equity <= 0:
             return self._build_status(
                 message="Invalid equity <= 0; skipping update.",
+                daily_loss_breached=False,
             )
 
         ts = timestamp if timestamp is not None else time.time()
@@ -204,6 +212,7 @@ class DrawdownGuardian:
             message=msg,
             threshold=threshold,
             daily_loss_pct=daily_loss_pct,
+            daily_loss_breached=daily_breached,
         )
 
     def check_position(self, position: Position, current_price: float) -> Dict[str, Any]:
@@ -469,6 +478,7 @@ class DrawdownGuardian:
         message: str = "",
         threshold: Optional[float] = None,
         daily_loss_pct: float = 0.0,
+        daily_loss_breached: bool = False,
     ) -> Dict[str, Any]:
         thr = threshold if threshold is not None else self.get_dynamic_threshold()
         return {
@@ -477,6 +487,7 @@ class DrawdownGuardian:
             "threshold_pct": round(thr * 100, 4),
             "position_size_mult": self.get_position_size_multiplier(),
             "daily_loss_pct": round(daily_loss_pct * 100, 4),
+            "daily_loss_breached": daily_loss_breached,
             "in_recovery": self.in_recovery,
             "in_cooldown": self._in_cooldown(),
             "should_close_all": self.alert_level == AlertLevel.SHUTDOWN,
@@ -508,3 +519,10 @@ class DrawdownGuardian:
             f"alert={self.alert_level.value} "
             f"threshold={self.get_dynamic_threshold()*100:.2f}%)"
         )
+
+
+def status_triggers_hard_kill(status: Dict[str, Any]) -> bool:
+    """True when equity path says flatten everything (independent of LLM)."""
+    if not status:
+        return False
+    return bool(status.get("should_close_all")) or bool(status.get("daily_loss_breached"))

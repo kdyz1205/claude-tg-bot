@@ -8,8 +8,13 @@ Categories:
   - summaries: Periodic conversation summaries
 
 Auto-cleanup: when total entries > 500, lowest-scored entries are pruned.
+
+Persistence: ``threading.Lock`` protects the in-memory dict; async handlers should
+use ``await save_async()`` (``asyncio.Lock`` + aiofiles + atomic replace). Sync
+``save()`` remains for non-async callers (e.g. CLI).
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -17,6 +22,8 @@ import threading
 import time
 from datetime import datetime
 from typing import Any
+
+import aiofiles
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +34,15 @@ TG_MSG_LIMIT = 4096
 
 _lock = threading.Lock()
 _memory: dict | None = None
+
+_io_async_lock: asyncio.Lock | None = None
+
+
+def _get_io_async_lock() -> asyncio.Lock:
+    global _io_async_lock
+    if _io_async_lock is None:
+        _io_async_lock = asyncio.Lock()
+    return _io_async_lock
 
 
 # ── Internal helpers ────────────────────────────────────────────────────────
@@ -97,6 +113,51 @@ def _save(mem: dict) -> None:
         logger.warning("memory_engine: failed to save: %s", e)
 
 
+def _snapshot_for_persist() -> str:
+    """Under ``_lock``: refresh timestamps, prune, return JSON text."""
+    global _memory
+    if _memory is None:
+        _memory = _load()
+    _memory["last_updated"] = datetime.now().isoformat()
+    _cleanup(_memory)
+    return json.dumps(_memory, ensure_ascii=False, indent=2, default=str)
+
+
+async def _write_atomic_aio(path: str, text: str) -> None:
+    tmp = path + ".tmp"
+    async with aiofiles.open(tmp, mode="w", encoding="utf-8") as f:
+        await f.write(text)
+    await asyncio.to_thread(os.replace, tmp, path)
+
+
+def _snapshot_under_lock() -> str:
+    with _lock:
+        return _snapshot_for_persist()
+
+
+async def save_async() -> None:
+    """Atomic aiofiles persist; serializes concurrent async saves."""
+    async with _get_io_async_lock():
+        payload = await asyncio.to_thread(_snapshot_under_lock)
+        await _write_atomic_aio(MEMORY_FILE, payload)
+
+
+def _persist_after_mutation() -> None:
+    """After in-memory mutation: aiofiles save on running loop, else sync ``save()``."""
+    try:
+        asyncio.get_running_loop()
+
+        async def _flush() -> None:
+            try:
+                await save_async()
+            except Exception as e:
+                logger.warning("memory_engine: save_async failed: %s", e)
+
+        asyncio.create_task(_flush())
+    except RuntimeError:
+        save()
+
+
 def _total_entries(mem: dict) -> int:
     return len(mem.get("shortcuts", [])) + len(mem.get("patterns", [])) + len(mem.get("summaries", []))
 
@@ -136,7 +197,7 @@ def get_memory() -> dict:
 
 
 def save() -> None:
-    """Persist current memory to disk."""
+    """Persist current memory to disk (sync; use :func:`save_async` from coroutines)."""
     with _lock:
         if _memory is not None:
             _memory["last_updated"] = datetime.now().isoformat()
@@ -215,27 +276,33 @@ def _maybe_promote_shortcut(mem: dict, pattern: dict) -> None:
     logger.info("memory_engine: promoted shortcut: %.60s", key)
 
 
-def add_summary(text: str, source: str = "auto") -> None:
+def add_summary(text: str, source: str = "auto", *, persist: bool = True) -> None:
     """Add a conversation summary entry."""
     if not text or len(text) < 10:
         return
-    mem = get_memory()
     with _lock:
-        mem["summaries"].append({
+        global _memory
+        if _memory is None:
+            _memory = _load()
+        _memory["summaries"].append({
             "date": datetime.now().isoformat(),
             "text": text[:1000],
             "source": source,
             "score": 0.7,
         })
-    save()
+    if persist:
+        _persist_after_mutation()
 
 
-def update_profile(key: str, value: Any) -> None:
+def update_profile(key: str, value: Any, *, persist: bool = True) -> None:
     """Update a user profile field."""
-    mem = get_memory()
     with _lock:
-        mem["user_profile"][key] = value
-    save()
+        global _memory
+        if _memory is None:
+            _memory = _load()
+        _memory["user_profile"][key] = value
+    if persist:
+        _persist_after_mutation()
 
 
 def get_shortcuts() -> list[dict]:

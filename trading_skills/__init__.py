@@ -16,7 +16,7 @@ Skills:
 """
 
 from .regime_detector import MarketRegimeDetector, MarketRegime
-from .drawdown_guardian import DrawdownGuardian
+from .drawdown_guardian import DrawdownGuardian, status_triggers_hard_kill
 from .confidence_scorer import SignalConfidenceScorer
 from .mtf_confluence import MultiTimeframeConfluence
 from .correlation_monitor import CorrelationHedgeMonitor
@@ -27,6 +27,7 @@ from .funding_scanner import FundingRateScanner
 __all__ = [
     "MarketRegimeDetector", "MarketRegime",
     "DrawdownGuardian",
+    "status_triggers_hard_kill",
     "SignalConfidenceScorer",
     "MultiTimeframeConfluence",
     "CorrelationHedgeMonitor",

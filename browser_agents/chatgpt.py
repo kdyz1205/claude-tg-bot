@@ -6,6 +6,8 @@ Handles:
 - GPT-4o, GPT-4, o1 models
 - Code block extraction
 
+Playwright resources are closed after each ``execute()`` (see ``browser_agents.base``).
+
 IMPORTANT: You must be logged in to chatgpt.com in the browser profile.
 Set user_data_dir in BrowserConfig to your Chrome profile path.
 

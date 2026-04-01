@@ -923,6 +923,13 @@ class CodeSelfRepair:
 
     async def _process_error(self, error_text: str) -> None:
         """Parse traceback, locate file/line, generate and apply fix."""
+        from self_repair import (
+            circuit_is_open,
+            circuit_note_failure,
+            circuit_note_success,
+            get_max_repair_attempts,
+        )
+
         matches = self._FILE_LINE_RE.findall(error_text)
         if not matches:
             return
@@ -937,6 +944,10 @@ class CodeSelfRepair:
             if not filepath.startswith(os.path.normpath(BOT_DIR)):
                 return
         except Exception:
+            return
+
+        if circuit_is_open(filepath):
+            logger.info("CodeSelfRepair: circuit breaker open, skip %s", filepath)
             return
 
         # Cooldown check
@@ -968,43 +979,63 @@ class CodeSelfRepair:
             error_type, os.path.basename(filepath), lineno,
         )
 
-        # Generate fix
-        fixed_code, confidence = await self._generate_fix(
-            filepath, lineno, error_type, error_msg, context_lines, start_line, base_confidence
-        )
-        if not fixed_code:
+        max_attempts = get_max_repair_attempts()
+        applied_try = False
+        last_diff = ""
+        last_backed = False
+        last_conf = 0.0
+
+        for _attempt in range(max_attempts):
+            fixed_code, confidence = await self._generate_fix(
+                filepath, lineno, error_type, error_msg, context_lines, start_line, base_confidence
+            )
+            if not fixed_code:
+                continue
+            applied_try = True
+            last_conf = confidence
+            success, diff, backed_up = await self._apply_fix(
+                filepath, context_lines, start_line, fixed_code, confidence
+            )
+            last_diff, last_backed = diff, backed_up
+            self._record_repair(
+                filepath=filepath, lineno=lineno, error_type=error_type,
+                error_msg=error_msg, confidence=confidence, diff=diff,
+                success=success, backed_up=backed_up,
+            )
+            if success:
+                circuit_note_success(filepath)
+                self._recently_repaired[filepath] = now
+                if len(self._recently_repaired) > self._MAX_RECENTLY_REPAIRED:
+                    oldest = sorted(self._recently_repaired, key=self._recently_repaired.get)
+                    for k in oldest[: len(self._recently_repaired) - self._MAX_RECENTLY_REPAIRED]:
+                        del self._recently_repaired[k]
+                logger.info(
+                    "CodeSelfRepair: repaired %s:%d (%s, confidence=%.2f)",
+                    os.path.basename(filepath), lineno, error_type, confidence,
+                )
+                return
+
+        if not applied_try:
             self._record_repair(
                 filepath=filepath, lineno=lineno, error_type=error_type,
                 error_msg=error_msg, confidence=0.0, diff="", success=False, backed_up=False,
             )
-            return
-
-        # Apply fix
-        success, diff, backed_up = await self._apply_fix(
-            filepath, context_lines, start_line, fixed_code, confidence
-        )
-
-        self._record_repair(
-            filepath=filepath, lineno=lineno, error_type=error_type,
-            error_msg=error_msg, confidence=confidence, diff=diff,
-            success=success, backed_up=backed_up,
-        )
-
-        if success:
-            self._recently_repaired[filepath] = now
-            # Cap recently_repaired to prevent unbounded growth
-            if len(self._recently_repaired) > self._MAX_RECENTLY_REPAIRED:
-                oldest = sorted(self._recently_repaired, key=self._recently_repaired.get)
-                for k in oldest[:len(self._recently_repaired) - self._MAX_RECENTLY_REPAIRED]:
-                    del self._recently_repaired[k]
-            logger.info(
-                "CodeSelfRepair: repaired %s:%d (%s, confidence=%.2f)",
-                os.path.basename(filepath), lineno, error_type, confidence,
+            logger.warning(
+                "CodeSelfRepair: no patch generated for %s:%d (%s)",
+                os.path.basename(filepath), lineno, error_type,
             )
         else:
             logger.warning(
                 "CodeSelfRepair: repair FAILED for %s:%d (%s)",
                 os.path.basename(filepath), lineno, error_type,
+            )
+        n = circuit_note_failure(filepath)
+        if n >= max_attempts:
+            await trigger_alert(
+                "SelfRepairExhausted",
+                f"`{os.path.basename(filepath)}` 自愈已失败 {n} 次（含无法生成补丁或快照验证未通过），"
+                f"已熔断该路径以免无限消耗 Token；请人工修复。",
+                severity="critical",
             )
 
     # ── helpers ───────────────────────────────────────────────────────────
@@ -1092,57 +1123,89 @@ class CodeSelfRepair:
         fixed_code: str,
         confidence: float,
     ) -> tuple[bool, str, bool]:
-        """Write the fix to disk. Returns (success, diff, backed_up)."""
-        import difflib as _difflib
+        """Write the fix with repair_snapshot + verify + rollback on failure."""
         import ast as _ast
+        import difflib as _difflib
+        from pathlib import Path as P
+
+        from repair_snapshot import (
+            create_snapshot_for_path,
+            record_rollback_cooldown,
+            restore_snapshot_to_target,
+            verify_after_repair,
+        )
+
         backed_up = False
         diff = ""
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 original_lines = f.readlines()
+            original_text = "".join(original_lines)
 
-            # Backup on low confidence
-            if confidence < 0.7:
-                backup_path = filepath + f".bak.{int(time.time())}"
-                with open(backup_path, "w", encoding="utf-8") as f:
-                    f.writelines(original_lines)
-                backed_up = True
-                logger.info("CodeSelfRepair: backed up %s -> %s",
-                            os.path.basename(filepath), os.path.basename(backup_path))
-
-            # Build diff
             fixed_lines = [
                 (ln if ln.endswith("\n") else ln + "\n")
                 for ln in fixed_code.splitlines()
             ]
-            diff_lines = list(_difflib.unified_diff(
-                context_lines,
-                fixed_lines,
-                fromfile=f"{os.path.basename(filepath)} (original)",
-                tofile=f"{os.path.basename(filepath)} (fixed)",
-                lineterm="",
-            ))
+            diff_lines = list(
+                _difflib.unified_diff(
+                    context_lines,
+                    fixed_lines,
+                    fromfile=f"{os.path.basename(filepath)} (original)",
+                    tofile=f"{os.path.basename(filepath)} (fixed)",
+                    lineterm="",
+                )
+            )
             diff = "\n".join(diff_lines[:80])
 
-            # Splice into full file
             end_idx = start_line - 1 + len(context_lines)
-            new_lines = original_lines[:start_line - 1] + fixed_lines + original_lines[end_idx:]
+            new_lines = original_lines[: start_line - 1] + fixed_lines + original_lines[end_idx:]
+            new_text = "".join(new_lines)
 
-            # Validate entire file before writing
             try:
-                _ast.parse("".join(new_lines))
+                _ast.parse(new_text)
             except SyntaxError as se:
                 logger.warning(
                     "CodeSelfRepair: repaired file still has SyntaxError at line %d: %s",
-                    se.lineno, se.msg,
+                    se.lineno,
+                    se.msg,
                 )
                 return False, diff, backed_up
 
-            # Atomic write
+            snap = create_snapshot_for_path(P(filepath), original_text)
+            if snap is None:
+                logger.error("CodeSelfRepair: snapshot failed, refusing write %s", filepath)
+                return False, diff, backed_up
+            backed_up = True
+
+            if confidence < 0.7:
+                backup_path = filepath + f".bak.{int(time.time())}"
+                try:
+                    with open(backup_path, "w", encoding="utf-8") as f:
+                        f.write(original_text)
+                except OSError:
+                    pass
+
             tmp = filepath + ".repair.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
+                f.write(new_text)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, filepath)
+
+            ok_v, vreason = verify_after_repair(P(filepath), P(BOT_DIR))
+            if not ok_v:
+                ok_rb, rb_err = restore_snapshot_to_target(snap, P(filepath))
+                if not ok_rb:
+                    logger.critical("CodeSelfRepair: rollback failed %s: %s", filepath, rb_err)
+                record_rollback_cooldown(filepath)
+                await trigger_alert(
+                    "CodeSelfRepairRollback",
+                    f"`{os.path.basename(filepath)}` 验证失败已回滚: {vreason[:400]}",
+                    severity="warning",
+                )
+                return False, diff, backed_up
+
+            logger.info("CodeSelfRepair: applied fix with snapshot to %s", filepath)
             return True, diff, backed_up
 
         except Exception as exc:

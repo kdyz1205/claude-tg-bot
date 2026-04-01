@@ -315,6 +315,7 @@ class OKXExecutor:
         if dd > self.risk.max_drawdown_pct:
             self.state.is_alive = False
             self.state.shutdown_reason = f"Max drawdown hit: {dd * 100:.1f}%"
+            self._schedule_hard_kill(self.state.shutdown_reason)
             return False, self.state.shutdown_reason
         if len(self.state.positions) >= self.risk.max_positions and symbol not in self.state.positions:
             return False, f"Max positions ({self.risk.max_positions}) reached"
@@ -580,6 +581,40 @@ class OKXExecutor:
                 "exit_price": price,
             }
 
+    async def close_all_positions(self, reason: str = "KILL_SWITCH") -> list[dict[str, Any]]:
+        """Close every open position (paper or live). Used by hard risk kill."""
+        results: list[dict[str, Any]] = []
+        async with self._lock:
+            symbols = list(self.state.positions.keys())
+        for sym in symbols:
+            try:
+                r = await self.close_position(sym, reason=reason)
+                results.append({"symbol": sym, **r})
+            except Exception as e:
+                log.exception("close_all_positions %s: %s", sym, e)
+                results.append({"symbol": sym, "ok": False, "reason": str(e)})
+        return results
+
+    def _schedule_hard_kill(self, reason: str) -> None:
+        """Fire-and-forget flatten + task cancel; does not block sync risk checks."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            log.warning("hard_kill skipped (no running event loop): %s", reason[:120])
+            return
+
+        ex = self
+
+        async def _run() -> None:
+            try:
+                from trading.hard_risk_kill import hard_kill
+
+                await hard_kill(ex, reason)
+            except Exception as e:
+                log.exception("scheduled hard_kill failed: %s", e)
+
+        loop.create_task(_run())
+
     async def update_positions(self):
         for symbol, pos in list(self.state.positions.items()):
             price = await self.get_price(symbol)
@@ -720,6 +755,110 @@ class OKXExecutor:
         if data.get("code") == "0" and data.get("data"):
             return data["data"]
         return []
+
+    def _symbol_from_inst_id(self, inst_id: str) -> str:
+        """BTC-USDT-SWAP → BTCUSDT (matches keys in state.positions)."""
+        p = inst_id.upper().split("-")
+        if len(p) >= 3 and p[1] == "USDT" and p[2] == "SWAP":
+            return f"{p[0]}USDT"
+        if len(p) >= 2 and p[1] == "USDT":
+            return f"{p[0]}USDT"
+        return inst_id.replace("-", "").upper()
+
+    async def reconcile_state_with_exchange(self) -> dict[str, Any]:
+        """
+        Live only: align ``state.positions`` with GET /api/v5/account/positions.
+
+        - Exchange has size, local missing → insert Position (recover ghost / post-crash).
+        - Local has size, exchange flat → remove (external close or drift).
+        - Both exist → refresh side / notional / avgPx when materially different.
+
+        Then refresh ``equity`` from account balance when available.
+        """
+        result: dict[str, Any] = {
+            "ok": True,
+            "skipped": False,
+            "added": [],
+            "removed": [],
+            "adjusted": [],
+        }
+        if self.state.mode != "live" or not self.has_api_keys():
+            result["skipped"] = True
+            result["reason"] = "not_live_or_no_keys"
+            return result
+
+        raw = await self.get_exchange_positions()
+        ex_by_symbol: dict[str, dict[str, Any]] = {}
+        for row in raw or []:
+            inst = str(row.get("instId") or "")
+            try:
+                pos_sz = float(row.get("pos", 0) or 0)
+            except (TypeError, ValueError):
+                pos_sz = 0.0
+            if abs(pos_sz) < 1e-12:
+                continue
+            sym = self._symbol_from_inst_id(inst)
+            ps = (row.get("posSide") or "net").lower()
+            if ps == "long":
+                side = "long"
+            elif ps == "short":
+                side = "short"
+            else:
+                side = "long" if pos_sz > 0 else "short"
+            avg_px = float(row.get("avgPx", 0) or 0)
+            notional = float(row.get("notionalUsd", 0) or 0)
+            if notional < 1.0 and avg_px > 0:
+                notional = abs(pos_sz) * avg_px
+            notional = max(notional, 1.0)
+            ex_by_symbol[sym] = {
+                "side": side,
+                "avgPx": max(avg_px, 1e-8),
+                "notionalUsd": notional,
+                "instId": inst,
+            }
+
+        async with self._lock:
+            local = self.state.positions
+            for sym, ex in ex_by_symbol.items():
+                if sym not in local:
+                    local[sym] = Position(
+                        symbol=sym,
+                        side=ex["side"],
+                        size=float(ex["notionalUsd"]),
+                        entry_price=float(ex["avgPx"]),
+                        entry_time=time.time(),
+                    )
+                    result["added"].append(sym)
+                else:
+                    lp = local[sym]
+                    changed: list[str] = []
+                    if lp.side != ex["side"]:
+                        lp.side = ex["side"]
+                        changed.append("side")
+                    if abs(lp.size - ex["notionalUsd"]) > max(5.0, 0.05 * ex["notionalUsd"]):
+                        lp.size = float(ex["notionalUsd"])
+                        changed.append("size")
+                    if ex["avgPx"] > 0 and abs(lp.entry_price - ex["avgPx"]) / ex["avgPx"] > 0.02:
+                        lp.entry_price = float(ex["avgPx"])
+                        changed.append("px")
+                    if changed:
+                        result["adjusted"].append(f"{sym}:{','.join(changed)}")
+            for sym in list(local.keys()):
+                if sym not in ex_by_symbol:
+                    del local[sym]
+                    result["removed"].append(sym)
+            self.state.equity = self.state.cash + sum(p.size for p in local.values())
+            self.save_state()
+
+        bal = await self.get_account_balance()
+        async with self._lock:
+            if bal.get("ok"):
+                teq = float(bal.get("total_equity") or 0)
+                if teq > 0:
+                    self.state.equity = teq
+                    self.state.peak_equity = max(self.state.peak_equity, self.state.equity)
+            self.save_state()
+        return result
 
     async def _get_contract_size(self, inst_id: str) -> float:
         try:

@@ -1,6 +1,10 @@
 """
 setup_and_start.py — One-click setup: fix auth + deploy + start bot
 
+Starts ``run.py`` (supervisor + subprocess bot + Telegram crash alerts). Bot itself adds a
+Phoenix loop around ``run_polling`` (traceback → TG → 5s retry). For maximum isolation,
+keep using ``python run.py`` rather than ``python bot.py`` directly.
+
 Run on Windows PowerShell:
   cd "C:\\Users\\alexl\\Desktop\\claude tg bot"
   python setup_and_start.py

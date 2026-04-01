@@ -396,3 +396,91 @@ class QuotaTracker:
 
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning(f"Failed to load quota state: {e}")
+
+
+# ─── HTTP LLM token budget (daily, persisted) ───────────────────────────────
+
+
+def _utc_day_key() -> str:
+    return time.strftime("%Y%m%d", time.gmtime())
+
+
+class HttpLlmTokenBudget:
+    """
+    Soft daily cap on *reported* API usage tokens (Anthropic/OpenAI usage blocks).
+    ``LLM_DAILY_TOKEN_BUDGET=0`` disables enforcement.
+    """
+
+    _instance: HttpLlmTokenBudget | None = None
+
+    def __init__(self, state_path: str | Path | None = None):
+        import config as _cfg
+
+        self.budget = int(getattr(_cfg, "LLM_DAILY_TOKEN_BUDGET", 0) or 0)
+        self.state_file = Path(
+            state_path or Path(__file__).resolve().parent.parent / ".harness_state" / "http_llm_tokens.json"
+        )
+        self._day = _utc_day_key()
+        self._used = 0
+        self._load()
+
+    @classmethod
+    def instance(cls) -> HttpLlmTokenBudget:
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def _load(self) -> None:
+        if not self.state_file.exists():
+            return
+        try:
+            raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+            d = raw.get("day")
+            if d == _utc_day_key():
+                self._used = int(raw.get("used", 0))
+            else:
+                self._used = 0
+            self._day = _utc_day_key()
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.debug("HttpLlmTokenBudget load: %s", e)
+            self._used = 0
+
+    def _save(self) -> None:
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_file.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"day": _utc_day_key(), "used": self._used}, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.state_file)
+        except OSError as e:
+            logger.warning("HttpLlmTokenBudget save failed: %s", e)
+
+    def preflight(self, estimated_extra: int) -> tuple[bool, str]:
+        if self.budget <= 0:
+            return True, ""
+        self._day = _utc_day_key()
+        if self._used + max(0, estimated_extra) > self.budget:
+            return (
+                False,
+                f"daily LLM token budget exceeded (~{self._used}/{self.budget} used)",
+            )
+        return True, ""
+
+    def record_from_usage(self, total_tokens: int) -> None:
+        if self.budget <= 0 or total_tokens <= 0:
+            return
+        if _utc_day_key() != self._day:
+            self._used = 0
+            self._day = _utc_day_key()
+        self._used += total_tokens
+        self._save()
+
+
+def http_llm_preflight(estimated_tokens: int) -> tuple[bool, str]:
+    return HttpLlmTokenBudget.instance().preflight(estimated_tokens)
+
+
+def http_llm_record_usage(total_tokens: int) -> None:
+    HttpLlmTokenBudget.instance().record_from_usage(total_tokens)

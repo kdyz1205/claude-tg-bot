@@ -193,11 +193,18 @@ class ModelRouter:
         self._stats: dict[str, ProviderStats] = {p: ProviderStats() for p in PROVIDERS}
         self._robin_idx: int = 0
         self._lock = asyncio.Lock()
-        self._codex_available: bool = _check_codex_available()
-        if self._codex_available:
+        cli_codex = _check_codex_available()
+        api_mini = bool(
+            (getattr(config, "OPENAI_API_KEY", "") or "").strip()
+            or (getattr(config, "ANTHROPIC_API_KEY", "") or "").strip()
+        )
+        self._codex_available: bool = cli_codex or api_mini
+        if cli_codex:
             log.info("Codex CLI detected — available as secondary provider")
+        elif api_mini:
+            log.info("HTTP mini-model fallback enabled (no Codex CLI subprocess)")
         else:
-            log.info("Codex CLI not found — Claude CLI only")
+            log.info("Codex CLI not found — Claude primary only")
 
     @property
     def mode(self) -> str:
@@ -311,29 +318,33 @@ class ModelRouter:
     async def _call_codex_cli(
         self, message: str, chat_id: int, context: Any
     ) -> bool:
-        """Call Codex CLI (OpenAI subscription, local, no API cost)."""
-        if not _CODEX_CMD:
-            return False
+        """HTTP coding fallback (aiohttp via ``llm_http_client``) — no Codex subprocess."""
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    subprocess.run,
-                    [_CODEX_CMD, "--quiet", "--full-auto", "-m", "o4-mini", message],
-                    capture_output=True, text=True, timeout=120,
-                    cwd=os.path.dirname(os.path.abspath(__file__)),
-                ),
-                timeout=130,
+            import llm_http_client
+
+            model = getattr(config, "TASK_TIER_FAST_OPENAI", None) or getattr(
+                config, "OPENAI_MODEL", None
             )
-            response = (result.stdout or "").strip()
-            if not response and result.stderr:
-                response = result.stderr.strip()
+            text, err = await llm_http_client.complete_stateless(
+                system_prompt=(
+                    "You are a coding assistant. Answer concisely; user is on Telegram."
+                ),
+                user_text=(message or "")[:120_000],
+                model_hint=model,
+                timeout_sec=120.0,
+                state_key=-7700 - (abs(chat_id) % 10_000),
+            )
+            response = (text or "").strip()
+            if not response and err:
+                response = err.strip()
             if response:
                 from claude_agent import _send_response
-                await _send_response(chat_id, f"[Codex] {response}", context)
+
+                await _send_response(chat_id, f"[API] {response}", context)
                 return True
             return False
         except Exception as e:
-            log.warning("Codex CLI error: %s", str(e)[:200])
+            log.warning("HTTP codex fallback error: %s", str(e)[:200])
             return False
 
     def get_status(self) -> dict:

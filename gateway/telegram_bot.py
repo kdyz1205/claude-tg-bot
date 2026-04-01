@@ -13,7 +13,8 @@ Env:   TELEGRAM_BOT_TOKEN (required)
        GATEWAY_UI=panel|terminal   (default: panel)
        GATEWAY_TELEGRAM_USER_IDS="123,456" optional allow-list (empty = any user)
        TERMINAL_REDIS_URL or REDIS_URL optional session mirror for terminal mode
-       TG_DEV_TIMEOUT_SEC optional seconds for `/dev` Claude CLI (default: 600)
+       TG_DEV_TIMEOUT_SEC optional seconds for `/dev` HTTP dev bridge (default: 600)
+       GATEWAY_PANEL_READ_REDIS=1 optional: read portfolio JSON from Redis (see portfolio_snapshot)
 """
 
 from __future__ import annotations
@@ -223,10 +224,21 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
 
     async def _run_bridge() -> None:
-        from pipeline.tg_dev_bridge import format_telegram_report, run_dev_prompt
+        from pipeline.tg_dev_bridge import (
+            format_telegram_report,
+            run_dev_prompt_with_stream,
+        )
+
+        async def _stream_chunk(t: str) -> None:
+            try:
+                await bot.send_message(chat_id=chat_id, text=t[:4090])
+            except Exception as ex:
+                logger.debug("cmd_dev stream chunk: %s", ex)
 
         try:
-            result = await run_dev_prompt(prompt)
+            result = await run_dev_prompt_with_stream(
+                prompt, _stream_chunk, timeout_sec=600, min_interval_sec=3.0
+            )
             if result.ok and result.modified_files:
                 text = "✅ 自动编程完成。您的代码库已被修改。"
             else:
@@ -271,7 +283,7 @@ async def _followup_positions_refresh(
         logger.exception("gateway positions background refresh")
     m = store.get_trade_mode(uid)
     try:
-        snap = portfolio_snapshot.get_snapshot()
+        snap = portfolio_snapshot.get_snapshot_for_gateway()
         await _bot_edit_markdown_v2(
             bot,
             chat_id,
@@ -360,7 +372,7 @@ async def handle_gateway_callback(
                     m = store.get_trade_mode(uid)
                     from trading import portfolio_snapshot
 
-                    snap = await asyncio.to_thread(portfolio_snapshot.get_snapshot)
+                    snap = portfolio_snapshot.get_snapshot_for_gateway()
                     await _bot_edit_markdown_v2(
                         bot,
                         chat_id,

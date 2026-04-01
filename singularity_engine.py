@@ -131,11 +131,26 @@ def main() -> None:
     X_val, Y_val = X[split:], Y[split:]
 
     def windows(Xa, Ya):
-        sx, sy = [], []
-        for i in range(len(Xa) - seq_len):
-            sx.append(Xa[i : i + seq_len])
-            sy.append(Ya[i + seq_len])
-        return np.stack(sx), np.array(sy, dtype=np.float32)
+        """Sliding windows along time without Python loops over bars (stride trick)."""
+        from numpy.lib.stride_tricks import as_strided
+
+        n, f = int(Xa.shape[0]), int(Xa.shape[1])
+        n_win = n - seq_len
+        if n_win <= 0:
+            return (
+                np.zeros((0, seq_len, f), dtype=Xa.dtype),
+                np.array([], dtype=np.float32),
+            )
+        s0, s1 = int(Xa.strides[0]), int(Xa.strides[1])
+        sx = as_strided(
+            Xa,
+            shape=(n_win, seq_len, f),
+            strides=(s0, s0, s1),
+            writeable=False,
+        )
+        sx = np.ascontiguousarray(sx)
+        sy = np.ascontiguousarray(Ya[seq_len : seq_len + n_win].astype(np.float32, copy=False))
+        return sx, sy
 
     tx, ty = windows(X_train, Y_train)
     vx, vy = windows(X_val, Y_val)

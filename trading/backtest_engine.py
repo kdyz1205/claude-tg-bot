@@ -14,9 +14,12 @@ backtesting framework that:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -417,34 +420,17 @@ def _compute_metrics(trades: list[dict], initial_equity: float) -> dict:
     }
 
 
-async def run_backtest(
+def _run_backtest_cpu_inner(
     strategy_params: dict[str, Any],
-    config: BacktestConfig | None = None,
-    signal_fn: Callable | None = None,
+    bundles: list[tuple[str, np.ndarray]],
+    config: BacktestConfig,
+    signal_fn: Callable | None,
 ) -> BacktestResult:
-    """Run a full walk-forward backtest with real OKX data.
-
-    Args:
-        strategy_params: V6 strategy parameters dict
-        config: backtest configuration (defaults to BacktestConfig())
-        signal_fn: optional custom signal function (close, high, low, vol, params) -> signals
-    """
-    if config is None:
-        config = BacktestConfig()
-
+    """CPU-only walk-forward simulation (used from ProcessPoolExecutor or threads)."""
     all_trades_train: list[dict] = []
     all_trades_test: list[dict] = []
 
-    for symbol in config.symbols:
-        try:
-            data = await fetch_ohlcv(symbol, config.bar, config.lookback_bars)
-        except Exception as e:
-            log.warning("Failed to fetch data for %s: %s", symbol, e)
-            continue
-
-        if len(data) < 100:
-            continue
-
+    for _symbol, data in bundles:
         close = data[:, 4]
         high = data[:, 2]
         low = data[:, 3]
@@ -456,40 +442,53 @@ async def run_backtest(
             signals = _compute_v6_signals(close, high, low, vol, strategy_params)
 
         ma55_arr = sma(close, strategy_params.get("ma55_len", 55))
-        bb_up_arr = bb_upper(close, strategy_params.get("bb_length", 21), strategy_params.get("bb_std_dev", 2.5))
-        bb_lo_arr = bb_lower(close, strategy_params.get("bb_length", 21), strategy_params.get("bb_std_dev", 2.5))
+        bb_up_arr = bb_upper(
+            close,
+            strategy_params.get("bb_length", 21),
+            strategy_params.get("bb_std_dev", 2.5),
+        )
+        bb_lo_arr = bb_lower(
+            close,
+            strategy_params.get("bb_length", 21),
+            strategy_params.get("bb_std_dev", 2.5),
+        )
 
-        # Walk-forward split
         split_idx = int(len(close) * config.train_pct)
 
-        # Train set
         train_signals = signals[:split_idx].copy()
         train_close = close[:split_idx]
         train_ma55 = ma55_arr[:split_idx] if ma55_arr is not None else None
         train_bb_up = bb_up_arr[:split_idx] if bb_up_arr is not None else None
         train_bb_lo = bb_lo_arr[:split_idx] if bb_lo_arr is not None else None
         train_trades = _simulate_trades(
-            train_close, train_signals, config,
-            ma55=train_ma55, bb_up=train_bb_up, bb_lo=train_bb_lo,
+            train_close,
+            train_signals,
+            config,
+            ma55=train_ma55,
+            bb_up=train_bb_up,
+            bb_lo=train_bb_lo,
         )
         all_trades_train.extend(train_trades)
 
-        # Test set (out-of-sample)
         test_signals = signals[split_idx:].copy()
         test_close = close[split_idx:]
         test_ma55 = ma55_arr[split_idx:] if ma55_arr is not None else None
         test_bb_up = bb_up_arr[split_idx:] if bb_up_arr is not None else None
         test_bb_lo = bb_lo_arr[split_idx:] if bb_lo_arr is not None else None
         test_trades = _simulate_trades(
-            test_close, test_signals, config,
-            ma55=test_ma55, bb_up=test_bb_up, bb_lo=test_bb_lo,
+            test_close,
+            test_signals,
+            config,
+            ma55=test_ma55,
+            bb_up=test_bb_up,
+            bb_lo=test_bb_lo,
         )
         all_trades_test.extend(test_trades)
 
     train_metrics = _compute_metrics(all_trades_train, config.initial_equity)
     test_metrics = _compute_metrics(all_trades_test, config.initial_equity)
 
-    result = BacktestResult(
+    return BacktestResult(
         sharpe_train=train_metrics["sharpe"],
         sharpe_test=test_metrics["sharpe"],
         total_return_pct=test_metrics["total_return_pct"],
@@ -500,7 +499,95 @@ async def run_backtest(
         profit_factor=test_metrics["profit_factor"],
         calmar_ratio=test_metrics["calmar_ratio"],
     )
-    return result
+
+
+_BACKTEST_POOL: ProcessPoolExecutor | None = None
+
+
+def _get_backtest_pool() -> ProcessPoolExecutor:
+    global _BACKTEST_POOL
+    if _BACKTEST_POOL is None:
+        n = os.cpu_count() or 2
+        workers = max(1, min(4, n - 1))
+        _BACKTEST_POOL = ProcessPoolExecutor(max_workers=workers)
+    return _BACKTEST_POOL
+
+
+def _backtest_pool_worker(payload: tuple) -> dict:
+    """Top-level for multiprocessing pickle."""
+    strategy_params, bundles, config_dict = payload
+    config = BacktestConfig(**config_dict)
+    r = _run_backtest_cpu_inner(strategy_params, bundles, config, None)
+    d = r.to_dict()
+    d["sharpe"] = d["sharpe_test"]
+    d["viable"] = r.is_viable
+    return d
+
+
+def _backtest_result_from_worker_dict(d: dict) -> BacktestResult:
+    return BacktestResult(
+        sharpe_train=float(d["sharpe_train"]),
+        sharpe_test=float(d["sharpe_test"]),
+        total_return_pct=float(d["total_return_pct"]),
+        max_drawdown_pct=float(d["max_drawdown_pct"]),
+        win_rate=float(d["win_rate"]),
+        total_trades=int(d["total_trades"]),
+        avg_trade_pnl=float(d["avg_trade_pnl"]),
+        profit_factor=float(d["profit_factor"]),
+        calmar_ratio=float(d["calmar_ratio"]),
+    )
+
+
+async def run_backtest(
+    strategy_params: dict[str, Any],
+    config: BacktestConfig | None = None,
+    signal_fn: Callable | None = None,
+) -> BacktestResult:
+    """Run a full walk-forward backtest with real OKX data.
+
+    OHLCV is fetched on the asyncio event loop; heavy NumPy simulation runs in a
+    ``ProcessPoolExecutor`` so the trading bot process is not CPU-starved.
+
+    Args:
+        strategy_params: V6 strategy parameters dict
+        config: backtest configuration (defaults to BacktestConfig())
+        signal_fn: optional custom signal function (not picklable — runs in a thread)
+    """
+    if config is None:
+        config = BacktestConfig()
+
+    bundles: list[tuple[str, np.ndarray]] = []
+    for symbol in config.symbols:
+        try:
+            data = await fetch_ohlcv(symbol, config.bar, config.lookback_bars)
+        except Exception as e:
+            log.warning("Failed to fetch data for %s: %s", symbol, e)
+            continue
+
+        if len(data) < 100:
+            continue
+        bundles.append((symbol, data))
+
+    if not bundles:
+        return BacktestResult()
+
+    if signal_fn is not None:
+        return await asyncio.to_thread(
+            _run_backtest_cpu_inner,
+            strategy_params,
+            bundles,
+            config,
+            signal_fn,
+        )
+
+    payload = (strategy_params, bundles, dataclasses.asdict(config))
+    loop = asyncio.get_running_loop()
+    d = await loop.run_in_executor(
+        _get_backtest_pool(),
+        _backtest_pool_worker,
+        payload,
+    )
+    return _backtest_result_from_worker_dict(d)
 
 
 async def quick_backtest(strategy_params: dict[str, Any]) -> dict:

@@ -1,6 +1,12 @@
 """
-Async subprocess bridge: run local `claude -p "<prompt>"` from repo root,
-stream combined stdout/stderr, auto-reply to y/n prompts, timeout, git change list.
+Telegram /dev bridge: run a long-form coding task on the repo.
+
+Default: local Claude CLI via ``asyncio.create_subprocess_exec`` with a hard wall-clock
+timeout (``TG_DEV_TIMEOUT_SEC``, default 600s), line-buffered stdout/stderr (capped) so
+a hung TTY prompt cannot grow memory without bound; optional ``y`` stdin injection for
+common confirmation prompts.
+
+Set ``TG_DEV_USE_HTTP=1`` to use ``llm_http_client`` instead (no subprocess).
 """
 
 from __future__ import annotations
@@ -12,9 +18,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -152,14 +159,36 @@ def _line_suggests_confirm(line: str) -> bool:
     return any(h.lower() in low for h in _CONFIRM_LINE_HINTS)
 
 
-async def _pump_stdout(
-    stdout: asyncio.StreamReader,
-    stdin: asyncio.StreamWriter | None,
-    sink: list[str],
+class _BoundedLineSink:
+    """FIFO lines with total char cap (avoids unbounded memory on chatty CLI)."""
+
+    __slots__ = ("lines", "max_chars", "_total")
+
+    def __init__(self, max_chars: int = _MAX_CAPTURE_CHARS) -> None:
+        self.lines: list[str] = []
+        self.max_chars = max_chars
+        self._total = 0
+
+    def push(self, line: str) -> None:
+        self.lines.append(line)
+        self._total += len(line) + 1
+        while self._total > self.max_chars and self.lines:
+            old = self.lines.pop(0)
+            self._total -= len(old) + 1
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+async def _pump_stream_bounded(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter | None,
+    sink: _BoundedLineSink,
+    on_line: Optional[Callable[[str], Awaitable[None] | None]] = None,
 ) -> None:
     buf = ""
     while True:
-        chunk = await stdout.read(4096)
+        chunk = await reader.read(8192)
         if not chunk:
             break
         buf += chunk.decode("utf-8", errors="replace")
@@ -168,21 +197,209 @@ async def _pump_stdout(
             if nl < 0:
                 break
             line, buf = buf[:nl], buf[nl + 1 :]
-            sink.append(line)
-            if stdin is not None and _line_suggests_confirm(line):
+            sink.push(line)
+            if on_line is not None:
                 try:
-                    stdin.write(b"y\n")
-                    await stdin.drain()
+                    r = on_line(line)
+                    if asyncio.iscoroutine(r):
+                        await r
+                except Exception as e:
+                    logger.debug("cli_bridge on_line: %s", e)
+            if writer is not None and _line_suggests_confirm(line):
+                try:
+                    writer.write(b"y\n")
+                    await writer.drain()
                 except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    logger.debug("cli_bridge stdin inject skipped: %s", e)
+                    logger.debug("cli_bridge stdin inject: %s", e)
     if buf.strip():
-        sink.append(buf.rstrip("\n"))
-        if stdin is not None and _line_suggests_confirm(buf):
+        tail = buf.rstrip("\n")
+        sink.push(tail)
+        if on_line is not None:
             try:
-                stdin.write(b"y\n")
-                await stdin.drain()
+                r = on_line(tail)
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception as e:
+                logger.debug("cli_bridge on_line tail: %s", e)
+        if writer is not None and _line_suggests_confirm(buf):
+            try:
+                writer.write(b"y\n")
+                await writer.drain()
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                logger.debug("cli_bridge stdin inject (tail) skipped: %s", e)
+                logger.debug("cli_bridge stdin tail inject: %s", e)
+
+
+def _use_http_dev() -> bool:
+    v = os.environ.get("TG_DEV_USE_HTTP", "0").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+async def _run_claude_dev_http(
+    cli_prompt: str,
+    temp_paths: list[Path],
+    *,
+    workdir: Path,
+    timeout_sec: int,
+) -> CliDevRunResult:
+    import config as _cfg
+    import llm_http_client
+
+    system = (
+        "You are a senior engineer. The repository root is:\n"
+        f"{workdir.resolve()}\n\n"
+        "Produce concrete, file-scoped edit instructions or unified diffs. "
+        "You cannot execute shell commands from here; output only text. "
+        "Be concise; user reads on mobile."
+    )
+    timed_out = False
+    full_text = ""
+    err_msg = ""
+    try:
+        text, e = await asyncio.wait_for(
+            llm_http_client.complete_stateless(
+                system_prompt=system,
+                user_text=cli_prompt[:200_000],
+                model_hint=getattr(_cfg, "CLAUDE_MODEL", None),
+                timeout_sec=min(float(timeout_sec), 600.0),
+                state_key=-8801,
+            ),
+            timeout=float(timeout_sec),
+        )
+        full_text = (text or "").strip()
+        if e:
+            err_msg = e[:2000]
+    except asyncio.TimeoutError:
+        timed_out = True
+        err_msg = f"Timed out after {timeout_sec}s."
+        logger.warning("cli_bridge: HTTP dev timeout after %ss", timeout_sec)
+    except Exception as e:
+        logger.exception("cli_bridge: HTTP run failed")
+        err_msg = str(e)[:2000]
+    finally:
+        for p in temp_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if len(full_text) > _MAX_CAPTURE_CHARS:
+        full_text = full_text[-_MAX_CAPTURE_CHARS:]
+
+    modified = git_changed_files(workdir)
+    ok = bool(full_text) and not timed_out and not err_msg
+    tail = full_text[-_TAIL_FOR_REPORT:] if full_text else ""
+
+    return CliDevRunResult(
+        ok=ok,
+        returncode=0 if ok else 1,
+        timed_out=timed_out,
+        modified_files=modified,
+        combined_output_tail=tail.strip(),
+        error_message=err_msg,
+    )
+
+
+async def _run_claude_dev_subprocess(
+    cli_prompt: str,
+    temp_paths: list[Path],
+    *,
+    workdir: Path,
+    timeout_sec: int,
+    extra_args: Iterable[str] | None,
+    on_stdout_line: Optional[Callable[[str], Awaitable[None] | None]],
+) -> CliDevRunResult:
+    exe = find_claude_executable()
+    if not Path(exe).is_file():
+        logger.warning("cli_bridge: Claude executable not found at %s, using HTTP fallback", exe)
+        return await _run_claude_dev_http(cli_prompt, temp_paths, workdir=workdir, timeout_sec=timeout_sec)
+
+    args: list[str] = [
+        exe,
+        "-p",
+        cli_prompt,
+        "--output-format",
+        "json",
+        "--dangerously-skip-permissions",
+    ]
+    if extra_args:
+        args.extend(list(extra_args))
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(workdir),
+            limit=2**20,
+        )
+    except (OSError, NotImplementedError) as e:
+        for p in temp_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return CliDevRunResult(
+            ok=False,
+            returncode=None,
+            timed_out=False,
+            error_message=f"subprocess spawn failed: {e}"[:2000],
+        )
+
+    out_sink = _BoundedLineSink()
+    err_sink = _BoundedLineSink()
+    timed_out = False
+    rc: int | None = None
+    err_msg = ""
+
+    assert proc.stdout is not None and proc.stderr is not None and proc.stdin is not None
+    t_out = asyncio.create_task(
+        _pump_stream_bounded(proc.stdout, proc.stdin, out_sink, on_stdout_line)
+    )
+    t_err = asyncio.create_task(
+        _pump_stream_bounded(proc.stderr, None, err_sink, None),
+    )
+    try:
+        rc = await asyncio.wait_for(proc.wait(), timeout=float(timeout_sec))
+    except asyncio.TimeoutError:
+        timed_out = True
+        err_msg = f"CLI timed out after {timeout_sec}s (process killed)."
+        logger.warning("cli_bridge: subprocess dev timeout after %ss", timeout_sec)
+        await _kill_process_tree(proc)
+    finally:
+        await asyncio.gather(t_out, t_err, return_exceptions=True)
+        try:
+            proc.stdin.close()
+            await proc.stdin.wait_closed()
+        except Exception:
+            pass
+        for p in temp_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    combined = ""
+    if out_sink.text():
+        combined += out_sink.text()
+    if err_sink.text():
+        combined += "\n--- stderr ---\n" + err_sink.text()
+
+    stdout_text = out_sink.text()
+    modified = git_changed_files(workdir)
+    ok = rc == 0 and not timed_out and bool(stdout_text.strip())
+    tail = combined[-_TAIL_FOR_REPORT:] if combined else ""
+    if rc not in (0, None) and not err_msg:
+        err_msg = f"CLI exit code {rc}. stderr tail: {err_sink.text()[-800:]}"
+
+    return CliDevRunResult(
+        ok=ok,
+        returncode=rc,
+        timed_out=timed_out,
+        modified_files=modified,
+        combined_output_tail=tail.strip(),
+        error_message=err_msg,
+    )
 
 
 async def run_claude_dev_prompt(
@@ -191,14 +408,16 @@ async def run_claude_dev_prompt(
     cwd: Path | None = None,
     timeout_sec: int | None = None,
     extra_args: Iterable[str] | None = None,
+    on_stdout_line: Optional[Callable[[str], Awaitable[None] | None]] = None,
 ) -> CliDevRunResult:
     """
-    Run ``claude -p "<prompt>"`` under ``cwd`` (default: repo root), merge stderr into
-    stdout stream, answer likely ``[y/N]`` prompts via stdin, enforce timeout, then
-    list paths from ``git status --porcelain``.
+    Run a dev task: by default **local Claude CLI** via ``create_subprocess_exec`` with
+    ``timeout_sec`` (default 600). Optional ``on_stdout_line`` receives each stdout line
+    for Telegram streaming. Set ``TG_DEV_USE_HTTP=1`` to use HTTP LLM instead.
     """
     workdir = cwd or REPO_ROOT
-    timeout_sec = timeout_sec if timeout_sec is not None else _DEFAULT_TIMEOUT_SEC
+    timeout_sec = int(timeout_sec if timeout_sec is not None else _DEFAULT_TIMEOUT_SEC)
+    timeout_sec = max(30, min(timeout_sec, 3600))
     cli_prompt, temp_paths = _prepare_cli_prompt(prompt)
     if not cli_prompt.strip():
         return CliDevRunResult(
@@ -208,114 +427,15 @@ async def run_claude_dev_prompt(
             error_message="Empty prompt.",
         )
 
-    exe = find_claude_executable()
-    args: list[str] = [
-        exe,
-        "-p",
+    if _use_http_dev():
+        return await _run_claude_dev_http(
+            cli_prompt, temp_paths, workdir=workdir, timeout_sec=timeout_sec
+        )
+    return await _run_claude_dev_subprocess(
         cli_prompt,
-        "--output-format",
-        "text",
-        "--dangerously-skip-permissions",
-    ]
-    if extra_args:
-        args.extend(extra_args)
-    env = os.environ.copy()
-
-    proc: asyncio.subprocess.Process | None = None
-    pump: asyncio.Task[None] | None = None
-    out_lines: list[str] = []
-    timed_out = False
-    returncode: int | None = None
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(workdir),
-            env=env,
-        )
-        assert proc.stdout is not None
-        pump = asyncio.create_task(_pump_stdout(proc.stdout, proc.stdin, out_lines))
-
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            timed_out = True
-            logger.warning("cli_bridge: timeout after %ss, killing tree", timeout_sec)
-            await _kill_process_tree(proc)
-        finally:
-            try:
-                if proc.stdin and not proc.stdin.is_closing():
-                    proc.stdin.close()
-                    await proc.stdin.wait_closed()
-            except Exception:
-                pass
-            if pump is not None:
-                try:
-                    await asyncio.wait_for(pump, timeout=30)
-                except asyncio.TimeoutError:
-                    pump.cancel()
-                    try:
-                        await pump
-                    except asyncio.CancelledError:
-                        pass
-
-        returncode = proc.returncode
-    except FileNotFoundError:
-        return CliDevRunResult(
-            ok=False,
-            returncode=None,
-            timed_out=False,
-            error_message=f"Claude CLI not found (tried {exe!r}). Install @anthropic-ai/claude-code.",
-        )
-    except Exception as e:
-        logger.exception("cli_bridge: run failed")
-        await _kill_process_tree(proc)
-        if pump is not None:
-            try:
-                await asyncio.wait_for(pump, timeout=20)
-            except asyncio.TimeoutError:
-                pump.cancel()
-                try:
-                    await pump
-                except asyncio.CancelledError:
-                    pass
-            except Exception:
-                pass
-        return CliDevRunResult(
-            ok=False,
-            returncode=returncode,
-            timed_out=timed_out,
-            error_message=str(e)[:2000],
-        )
-    finally:
-        for p in temp_paths:
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    full_text = "\n".join(out_lines)
-    if len(full_text) > _MAX_CAPTURE_CHARS:
-        full_text = full_text[-_MAX_CAPTURE_CHARS:]
-
-    modified = git_changed_files(workdir)
-    ok = not timed_out and returncode == 0
-    tail = full_text[-_TAIL_FOR_REPORT:] if full_text else ""
-
-    err = ""
-    if timed_out:
-        err = f"Timed out after {timeout_sec}s."
-    elif returncode not in (0, None):
-        err = f"CLI exited with code {returncode}."
-
-    return CliDevRunResult(
-        ok=ok,
-        returncode=returncode,
-        timed_out=timed_out,
-        modified_files=modified,
-        combined_output_tail=tail.strip(),
-        error_message=err,
+        temp_paths,
+        workdir=workdir,
+        timeout_sec=timeout_sec,
+        extra_args=extra_args,
+        on_stdout_line=on_stdout_line,
     )

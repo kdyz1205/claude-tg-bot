@@ -153,6 +153,17 @@ def main():
         report.append(f"Post-repair pytest: {pytest_enabled()}")
         report.append(f"Rollback cooldown (min): {get_rollback_cooldown_sec() // 60}")
         report.append("")
+        from self_repair import circuit_status, get_max_repair_attempts
+
+        report.append("=== Repair circuit breaker ===")
+        report.append(f"Max consecutive failures before abandon: {get_max_repair_attempts()}")
+        cs = circuit_status()
+        if cs:
+            for k, v in list(cs.items())[:20]:
+                report.append(f"  fails={v}  {k}")
+        else:
+            report.append("  (no paths in breaker state)")
+        report.append("")
     except Exception as exc:
         report.append(f"Self-repair snapshots: (unavailable) {exc}")
         report.append("")

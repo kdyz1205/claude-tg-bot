@@ -1,8 +1,7 @@
 """
 agents/sessions.py — Multi-session coordinator.
 
-Manages multiple Claude CLI sessions, each working on a different project.
-The bot routes user messages to the right session based on context.
+Named sessions use HTTP LLM turns (``llm_http_client``) with stable virtual chat_ids — no Claude CLI subprocess.
 
 Usage:
     mgr = SessionManager()
@@ -16,17 +15,15 @@ Usage:
     result = await mgr.auto_route("继续修 crypto 的 bug")
 """
 import asyncio
-import json
 import logging
 import os
 import time
 from dataclasses import dataclass, field
 
+import llm_http_client
+
 logger = logging.getLogger(__name__)
 
-CLAUDE_CMD = os.path.join(
-    os.path.expanduser("~"), "AppData", "Roaming", "npm", "claude.cmd"
-)
 BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SYSTEM_PROMPT_FILE = os.path.join(BOT_DIR, ".system_prompt.txt")
@@ -43,64 +40,55 @@ class Session:
     last_used: float = 0
     history: list = field(default_factory=list)  # last N interactions
 
+    def _virtual_chat_id(self) -> int:
+        h = abs(hash(self.name)) % 90_000_000
+        return 8_000_000 + h
+
     async def send(self, message: str, timeout: int = 300) -> str:
-        """Send a message to this session. Returns response."""
+        """Send a message via HTTP LLM with per-session history."""
         self.busy = True
         self.last_used = time.time()
-
-        args = [
-            CLAUDE_CMD,
-            "-p", message,
-            "--output-format", "json",
-            "--dangerously-skip-permissions",
-            "--model", self.model,
-            "--append-system-prompt-file", SYSTEM_PROMPT_FILE,
-        ]
-        if self.session_id:
-            args.extend(["--resume", self.session_id])
-
-        proc = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.project_dir,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            if proc:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
-            return f"Session '{self.name}' timed out ({timeout}s)"
-        except Exception as e:
-            return f"Session '{self.name}' error: {e}"
-        finally:
-            self.busy = False
+            system = ""
+            try:
+                if os.path.isfile(SYSTEM_PROMPT_FILE):
 
-        raw = stdout.decode("utf-8", errors="replace").strip()
-        if not raw:
-            return "No output"
+                    def _read_sys() -> str:
+                        with open(SYSTEM_PROMPT_FILE, encoding="utf-8") as f:
+                            return f.read()
 
-        try:
-            data = json.loads(raw)
-            result = data.get("result", "").strip() or "Done."
-            self.session_id = data.get("session_id", self.session_id)
+                    system = await asyncio.to_thread(_read_sys)
+            except OSError:
+                pass
+            system = (
+                (system or "")
+                + f"\n\n## Session\nProject directory: {self.project_dir}\n"
+                + (f"Session label: {self.session_id}\n" if self.session_id else "")
+            )
+            text, sid, err = await llm_http_client.complete_turn(
+                chat_id=self._virtual_chat_id(),
+                system_prompt=system[:240_000],
+                user_text=message[:200_000],
+                model_hint=self.model,
+                timeout_sec=float(timeout),
+            )
+            if err:
+                return f"Session '{self.name}' HTTP error: {err}"
+            result = (text or "").strip() or "Done."
+            self.session_id = sid or self.session_id
             self.history.append({
                 "time": time.time(),
                 "message": message[:100],
                 "response": result[:200],
             })
-            # Keep last 20 interactions
             self.history = self.history[-20:]
             return result
-        except json.JSONDecodeError:
-            return raw[:1000]
+        except asyncio.TimeoutError:
+            return f"Session '{self.name}' timed out ({timeout}s)"
+        except Exception as e:
+            return f"Session '{self.name}' error: {e}"
+        finally:
+            self.busy = False
 
 
 class SessionManager:

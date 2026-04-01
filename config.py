@@ -83,6 +83,24 @@ try:
 except ValueError:
     ANTHROPIC_MAX_TOKENS = 8192
 
+# HTTP LLM token budget (0 = unlimited). Tracked in tracker/quota.HttpLlmTokenBudget.
+try:
+    LLM_DAILY_TOKEN_BUDGET = max(0, int(os.getenv("LLM_DAILY_TOKEN_BUDGET", "0")))
+except ValueError:
+    LLM_DAILY_TOKEN_BUDGET = 0
+
+# Comma-separated model ids to try after primary on overload (same backend only).
+_raw_fb = os.getenv("LLM_HTTP_FALLBACK_MODELS", "").strip()
+LLM_HTTP_FALLBACK_MODELS: list[str] = [m.strip() for m in _raw_fb.split(",") if m.strip()]
+if not LLM_HTTP_FALLBACK_MODELS:
+    LLM_HTTP_FALLBACK_MODELS = [
+        m for m in (
+            TASK_TIER_FAST_CLAUDE,
+            "claude-3-5-haiku-20241022",
+            OLLAMA_MODEL,
+        ) if m
+    ]
+
 # ─── Conversation & Processing ────────────────────────────────────────────────
 MAX_CONVERSATION_HISTORY = 80
 MAX_TOOL_ITERATIONS = 25

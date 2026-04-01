@@ -1,6 +1,10 @@
 """
 Alpha Evolver — LLM-driven alpha feature discovery cycle.
 
+Before evaluation, generated code is scanned with ``pipeline.security_ast``; feature
+evaluation runs in a ``ProcessPoolExecutor`` so ``exec()`` of LLM output cannot block
+the trading process.
+
 Inspired by AlphaQuant (2026) and FinAgent patterns:
 1. LLM receives market context (price action, volume, funding rates)
 2. LLM proposes a NumPy feature function (momentum, mean-reversion, volatility)
@@ -22,6 +26,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -212,6 +217,28 @@ def _evaluate_feature(
     }
 
 
+def _evaluate_feature_worker(args: tuple) -> dict:
+    """ProcessPool entry: exec LLM alpha code off the main trading process."""
+    code, close_a, high_a, low_a, vol_a = args
+    c = np.asarray(close_a)
+    h = np.asarray(high_a)
+    l = np.asarray(low_a)
+    v = np.asarray(vol_a)
+    return _evaluate_feature(code, c, h, l, v)
+
+
+_ALPHA_POOL: ProcessPoolExecutor | None = None
+
+
+def _get_alpha_pool() -> ProcessPoolExecutor:
+    global _ALPHA_POOL
+    if _ALPHA_POOL is None:
+        n = os.cpu_count() or 2
+        workers = max(1, min(3, n - 1))
+        _ALPHA_POOL = ProcessPoolExecutor(max_workers=workers)
+    return _ALPHA_POOL
+
+
 def _find_claude() -> str:
     """Find claude CLI executable."""
     import shutil
@@ -346,7 +373,32 @@ class AlphaEvolver:
                 await asyncio.sleep(5)
                 continue
 
-            metrics = _evaluate_feature(code, close, high, low, vol)
+            full_src = _FEATURE_TEMPLATE.replace("{FEATURE_CODE}", code)
+            try:
+                from pipeline.security_ast import scan_source
+
+                viol = scan_source(full_src, rel_path="alpha_candidate.py")
+            except Exception as e:
+                log.warning("alpha_evolver: security_ast failed: %s", e)
+                viol = []
+            if viol:
+                v0 = viol[0]
+                feedback = (
+                    f"security_ast blocked ({v0.rule} line {v0.line}): {v0.detail[:200]}. "
+                    "Use only NumPy math on close/high/low/volume — no I/O, imports beyond numpy, or env access."
+                )
+                log.info("Iteration %d: security_ast rejected: %s", iteration, v0.rule)
+                continue
+
+            loop = asyncio.get_running_loop()
+            try:
+                metrics = await loop.run_in_executor(
+                    _get_alpha_pool(),
+                    _evaluate_feature_worker,
+                    (code, close, high, low, vol),
+                )
+            except Exception as e:
+                metrics = {"error": f"pool execution failed: {e}"}
 
             if "error" in metrics:
                 feedback = f"Previous attempt failed: {metrics['error']}. Try a different approach."

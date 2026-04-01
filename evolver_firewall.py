@@ -208,4 +208,17 @@ def validate_strategy_file(path: Path) -> tuple[bool, str]:
         src = path.read_text(encoding="utf-8")
     except OSError as e:
         return False, f"read error: {e}"
-    return validate_strategy_python_source(src, label=str(path))
+    ok, msg = validate_strategy_python_source(src, label=str(path))
+    if not ok:
+        return False, msg
+    try:
+        from pipeline.security_ast import scan_source
+
+        viol = scan_source(src, rel_path=str(path))
+    except Exception as e:
+        log.warning("security_ast scan failed (allowing file): %s", e)
+        return True, "ok"
+    if viol:
+        v0 = viol[0]
+        return False, f"security_ast:{v0.rule} line {v0.line}: {v0.detail[:120]}"
+    return True, "ok"

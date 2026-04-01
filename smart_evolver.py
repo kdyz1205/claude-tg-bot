@@ -1,5 +1,10 @@
 """
 Smart Evolver v3.0 - 智能进化agent (带技能系统)
+
+Runnable strategy codegen is vetted in ``infinite_evolver`` via
+``evolver_firewall.validate_strategy_file`` (includes ``pipeline.security_ast``);
+CPU-heavy backtests use ``ProcessPoolExecutor`` in ``trading.backtest_engine``.
+
 在v2基础上增加：
 1. 任务完成后自动生成skill文件
 2. 技能组合：检测可合并skill自动生成composite skill

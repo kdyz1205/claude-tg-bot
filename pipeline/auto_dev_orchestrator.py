@@ -9,7 +9,6 @@ import asyncio
 import logging
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,7 +84,53 @@ async def _call_claude(system: str, user: str) -> str:
     return "\n".join(parts).strip()
 
 
-def _harness_validate(py_src: str) -> tuple[bool, str]:
+async def _py_compile_subproc(probe: Path, cwd: Path) -> tuple[bool, str]:
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "py_compile",
+        probe.name,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=90.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False, "py_compile timeout (90s)"
+    if proc.returncode != 0:
+        raw = (err or b"") + (out or b"")
+        return False, raw.decode("utf-8", errors="replace")[:4000]
+    return True, ""
+
+
+async def _pytest_subproc(tests_dir: Path, bot_dir: Path) -> tuple[bool, str]:
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "pytest",
+        str(tests_dir),
+        "-q",
+        "--tb=line",
+        "-x",
+        cwd=str(bot_dir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=180.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False, "pytest timeout (180s)"
+    if proc.returncode != 0:
+        return False, (out or b"").decode("utf-8", errors="replace")[-4000:]
+    return True, ""
+
+
+async def _harness_validate_async(py_src: str) -> tuple[bool, str]:
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
     probe = HARNESS_DIR / "_auto_dev_probe.py"
     try:
@@ -93,34 +138,14 @@ def _harness_validate(py_src: str) -> tuple[bool, str]:
     except OSError as e:
         return False, f"write probe failed: {e}"
     try:
-        r = subprocess.run(
-            [sys.executable, "-m", "py_compile", str(probe)],
-            cwd=str(HARNESS_DIR),
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        if r.returncode != 0:
-            return False, (r.stderr or r.stdout or "py_compile failed")[:4000]
+        ok, msg = await _py_compile_subproc(probe, HARNESS_DIR)
+        if not ok:
+            return False, msg
         tests_dir = HARNESS_DIR / "tests"
         if tests_dir.is_dir():
-            r2 = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    str(tests_dir),
-                    "-q",
-                    "--tb=line",
-                    "-x",
-                ],
-                cwd=str(BOT_DIR),
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            if r2.returncode != 0:
-                return False, (r2.stdout + r2.stderr)[:4000]
+            ok2, msg2 = await _pytest_subproc(tests_dir, BOT_DIR)
+            if not ok2:
+                return False, msg2
         return True, ""
     finally:
         try:
@@ -183,7 +208,7 @@ class AutoDevOrchestrator:
                 feedback = ast_err
                 messages.append(f"attempt {attempt}: ast {ast_err}")
                 continue
-            ok_h, h_err = await asyncio.to_thread(_harness_validate, code)
+            ok_h, h_err = await _harness_validate_async(code)
             if not ok_h:
                 feedback = h_err
                 messages.append(f"attempt {attempt}: harness {h_err[:500]}")

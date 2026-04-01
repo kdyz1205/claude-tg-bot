@@ -1,19 +1,9 @@
 """
-claude_agent.py — Harness Agent: Claude CLI + 多窗口编排 + 项目管理
+claude_agent.py — Harness Agent: HTTP LLM（aiohttp）+ 多窗口编排 + 项目管理
 
-DROP-IN REPLACEMENT — 直接替换你的 claude-tg-bot/claude_agent.py
-
-改了什么:
-1. _SYSTEM_PROMPT 增加了 Harness 技能（多窗口、项目管理、截图、session管理、多AI协作、权限确认）
-2. 删除了 API fallback（不花钱，只走 CLI）
-3. 没有其他任何改动。路由、session、队列全部保持原样。
-
-Architecture:
-  User (Telegram) → bot.py → claude_agent.py → claude -p --resume <session>
-                                                  ↓
-                                              Full computer access + Harness Skills
-                                              Uses Plan tokens (free)
-                                              Persistent conversations
+主对话路径走 ``llm_http_client.complete_turn``（Anthropic / OpenAI / Ollama），
+日 Token 预算与模型降级见 ``tracker.quota`` / ``config.LLM_DAILY_TOKEN_BUDGET``。
+不再启动本地 ``claude`` CLI 子进程。
 """
 import asyncio
 import json

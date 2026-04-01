@@ -7,6 +7,8 @@ polling loop. Handlers read only get_snapshot() — O(1) memory copy.
 OKX, wallet, and DEX legs refresh concurrently via asyncio.gather.
 
 Optional: set REDIS_URL to mirror JSON at key claude_tg_bot:portfolio (TTL 180s).
+
+OKX live ledger repair: ``trading.reconciliation_daemon`` (not this module’s 10s poll).
 """
 
 from __future__ import annotations
@@ -103,6 +105,39 @@ def get_snapshot() -> dict[str, Any]:
         snap = copy.deepcopy(_data)
     snap["age_sec"] = max(0.0, time.time() - float(snap.get("updated_at") or 0))
     return snap
+
+
+def try_snapshot_from_redis() -> dict[str, Any] | None:
+    """Optional read for multi-process gateways (``REDIS_URL`` + published key)."""
+    url = (os.getenv("REDIS_URL") or "").strip()
+    if not url:
+        return None
+    try:
+        import redis  # type: ignore
+
+        r = redis.Redis.from_url(url, decode_responses=True)
+        raw = r.get("claude_tg_bot:portfolio")
+        if not raw:
+            return None
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return None
+        snap = copy.deepcopy(obj)
+        snap["age_sec"] = max(0.0, time.time() - float(snap.get("updated_at") or 0))
+        snap["_source"] = "redis"
+        return snap
+    except Exception as e:
+        logger.debug("try_snapshot_from_redis: %s", e)
+        return None
+
+
+def get_snapshot_for_gateway() -> dict[str, Any]:
+    """TG panel: prefer Redis mirror when ``GATEWAY_PANEL_READ_REDIS=1``, else in-process cache."""
+    if (os.getenv("GATEWAY_PANEL_READ_REDIS") or "").strip().lower() in ("1", "true", "yes"):
+        r = try_snapshot_from_redis()
+        if r is not None:
+            return r
+    return get_snapshot()
 
 
 def _publish_redis(blob: dict[str, Any]) -> None:

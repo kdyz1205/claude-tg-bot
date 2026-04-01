@@ -1,6 +1,9 @@
 """
 Polymarket CLOB execution gateway (Phase 14).
 
+Delta-neutral spot + perp hedging (DEX buy ∥ OKX short, limping-leg rollback) lives in
+``live_trader.execute_delta_neutral_buy`` / ``_run_delta_neutral_with_recovery``, not here.
+
 Uses Polymarket's official py-clob-client: L1 auth derives API credentials via
 EIP-712-signed headers; `create_order` builds a CTF `Order` struct and signs it
 (EIP-712) through `OrderBuilder` / py-order-utils — private key never leaves

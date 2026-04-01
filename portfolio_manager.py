@@ -2,6 +2,9 @@
 Live portfolio summary for Telegram (MarkdownV2) and plain chain dashboard text.
 
 Uses trading.portfolio_snapshot for OKX + wallet + DEX; optional Jupiter prices for SPL.
+
+OKX live vs local ledger sync: ``trading.reconciliation_daemon`` (default every 15 min;
+``RECONCILE_INTERVAL_SEC``). See ``OKXExecutor.reconcile_state_with_exchange``.
 """
 
 from __future__ import annotations

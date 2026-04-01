@@ -8,7 +8,7 @@ Filter Set 1:
   - 市值 < 800万 USDT
 
 Continuous monitoring: scans every 3 min, pushes to TG on hit.
-Uses OKX + CoinGecko public APIs. No API key needed.
+Uses OKX WebSocket (candles) + CoinGecko (mcap only). No API key needed.
 """
 
 import asyncio
@@ -27,9 +27,7 @@ logger = logging.getLogger(__name__)
 # Tight connect/read so slow nodes (e.g. meme-coin bursts) are abandoned — never block the loop.
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=3.0, read=8.0, write=8.0)
 _HTTP_LIMITS = httpx.Limits(max_connections=24, max_keepalive_connections=12)
-# OKX public API: cap in-flight requests (high concurrent symbol lists = "RPC-like" stalls)
-_OKX_CONCURRENCY = asyncio.Semaphore(8)
-# CoinGecko: separate cap so mcap lookups do not steal all semaphore slots from candles
+# CoinGecko: cap in-flight mcap requests
 _GECKO_CONCURRENCY = asyncio.Semaphore(4)
 
 # Hard ceiling per symbol: entire scan for one instId must finish or we drop it (no indefinite wait).
@@ -77,17 +75,16 @@ DEFAULT_SYMBOLS = [
 async def _fetch_okx_candles(
     client: httpx.AsyncClient, symbol: str, bar: str, limit: int = 10
 ) -> list:
-    """OKX candles: returns [[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm], ...]"""
-    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
+    """OKX candles from public WSS hub (oldest-first). ``client`` unused (mcap still uses HTTP)."""
+    _ = client
     try:
-        async with _OKX_CONCURRENCY:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("code") == "0":
-                return list(reversed(data.get("data", [])))
+        from trading import okx_ws_hub
+
+        await okx_ws_hub.ensure_started()
+        rows = okx_ws_hub.get_candles_sync(symbol, bar, limit=limit + 5)
+        return rows[-limit:] if len(rows) > limit else rows
     except Exception as e:
-        logger.debug("onchain_filter: OKX candle %s %s: %s", symbol, bar, e)
+        logger.debug("onchain_filter: OKX WS candle %s %s: %s", symbol, bar, e)
     return []
 
 
@@ -451,6 +448,13 @@ async def scan_filtered(
         if per_symbol_deadline_sec is not None
         else _DEFAULT_PER_SYMBOL_DEADLINE_SEC
     )
+
+    try:
+        from trading import okx_ws_hub
+
+        await okx_ws_hub.ensure_started(symbols)
+    except Exception as e:
+        logger.debug("onchain_filter: okx_ws_hub ensure_started: %s", e)
 
     # Batch to avoid rate limits (10 concurrent)
     results = []

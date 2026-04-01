@@ -10,6 +10,10 @@ by proactively scanning for:
 Enforces success-rate gate: only auto-applies patches when historical
 repair success rate >= MIN_AUTO_APPLY_RATE (80%), otherwise sends a
 Telegram notification for human review.
+
+Per-file circuit breaker: after SELF_REPAIR_MAX_ATTEMPTS (default 3) consecutive
+failed repair attempts, further auto-repair for that path is skipped and TG is
+notified — prevents infinite LLM/token loops.
 """
 from __future__ import annotations
 
@@ -23,10 +27,13 @@ import py_compile
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+import repair_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,54 @@ REPAIR_LOG = BOT_DIR / ".repair_log.jsonl"
 SCAN_INTERVAL = 300          # seconds between proactive scans
 MIN_AUTO_APPLY_RATE = 0.80   # 80% success rate required for auto-apply
 CLAUDE_CMD = Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd"
+
+_REPAIR_CIRCUIT_LOCK = threading.Lock()
+# resolved path str -> consecutive failure count (generate fail or apply fail)
+_REPAIR_CIRCUIT_FAILS: dict[str, int] = {}
+
+
+def get_max_repair_attempts() -> int:
+    try:
+        return max(1, min(10, int(os.environ.get("SELF_REPAIR_MAX_ATTEMPTS", "3"))))
+    except ValueError:
+        return 3
+
+
+def _circuit_key(path: str) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(path)
+
+
+def circuit_note_failure(path: str) -> int:
+    """Increment failure count for *path*; return new total."""
+    with _REPAIR_CIRCUIT_LOCK:
+        k = _circuit_key(path)
+        _REPAIR_CIRCUIT_FAILS[k] = _REPAIR_CIRCUIT_FAILS.get(k, 0) + 1
+        return _REPAIR_CIRCUIT_FAILS[k]
+
+
+def circuit_note_success(path: str) -> None:
+    with _REPAIR_CIRCUIT_LOCK:
+        _REPAIR_CIRCUIT_FAILS.pop(_circuit_key(path), None)
+
+
+def circuit_is_open(path: str) -> bool:
+    """True if this file has exhausted auto-repair attempts."""
+    with _REPAIR_CIRCUIT_LOCK:
+        return _REPAIR_CIRCUIT_FAILS.get(_circuit_key(path), 0) >= get_max_repair_attempts()
+
+
+def circuit_status() -> dict[str, int]:
+    with _REPAIR_CIRCUIT_LOCK:
+        return dict(_REPAIR_CIRCUIT_FAILS)
+
+
+def circuit_reset_path(path: str) -> None:
+    """Manual / test: clear breaker for one file."""
+    with _REPAIR_CIRCUIT_LOCK:
+        _REPAIR_CIRCUIT_FAILS.pop(_circuit_key(path), None)
 
 # Files to skip (generated, lock, env)
 _SKIP_PATTERNS = {".env", ".bot.lock", ".bot.pid"}
@@ -371,6 +426,10 @@ async def _apply_syntax_fix(
         logger.info("self_repair: rollback cooldown active, skip auto-apply for %s", file_path)
         return False
 
+    if circuit_is_open(file_path):
+        logger.info("self_repair: circuit breaker open, skip auto-apply for %s", file_path)
+        return False
+
     stats = _get_repair_stats()
 
     # Success-rate gate
@@ -420,6 +479,11 @@ async def _apply_syntax_fix(
             "backed_up": False,
             "skipped_reason": "fix_still_has_syntax_error",
         })
+        n = circuit_note_failure(file_path)
+        if n == get_max_repair_attempts() and notify_fn:
+            await notify_fn(
+                f"🛑 *修复熔断* `{error_info['file']}`：无效补丁已失败 {n} 次，停止自动修复该文件。"
+            )
         return False
 
     try:
@@ -434,6 +498,11 @@ async def _apply_syntax_fix(
         if notify_fn:
             await notify_fn(
                 f"⚠️ *无法创建断点快照*\n跳过自动修复 `{error_info['file']}`（防止无回滚写入）"
+            )
+        n = circuit_note_failure(file_path)
+        if n == get_max_repair_attempts() and notify_fn:
+            await notify_fn(
+                f"🛑 *修复熔断* `{error_info['file']}`：快照失败累计 {n} 次。"
             )
         return False
 
@@ -497,9 +566,15 @@ async def _apply_syntax_fix(
                         snapshot_name=snap.name,
                     )
                 )
+            n = circuit_note_failure(file_path)
+            if n == get_max_repair_attempts() and notify_fn:
+                await notify_fn(
+                    f"🛑 *已达最大自动修复次数*（{n}）— `{error_info['file']}` 暂停自愈，请人工处理。"
+                )
             return False
 
         logger.info("self_repair: applied syntax fix to %s", error_info["file"])
+        circuit_note_success(file_path)
         clear_repair_cooldown(file_path)
         _append_repair_log({
             "ts": datetime.now().isoformat(),
@@ -527,6 +602,11 @@ async def _apply_syntax_fix(
             restore_snapshot_to_target(snap, Path(file_path))
         except Exception as rb_e:
             logger.critical("self_repair: emergency rollback failed: %s", rb_e)
+        n = circuit_note_failure(file_path)
+        if n == get_max_repair_attempts() and notify_fn:
+            await notify_fn(
+                f"🛑 *修复熔断* `{error_info['file']}`：写入异常后已回滚（累计失败 {n} 次）。"
+            )
         _append_repair_log({
             "ts": datetime.now().isoformat(),
             "file": error_info["file"],
@@ -639,19 +719,33 @@ class ProactiveSelfRepair:
         syntax_errors = scan_syntax_errors()
         results["syntax_errors"] = syntax_errors
         for err in syntax_errors:
+            path = err.get("path", "") or ""
             logger.warning("ProactiveSelfRepair: SyntaxError in %s: %s", err.get("file", "?"), str(err.get("error_msg", ""))[:80])
-            fixed_source = await _generate_syntax_fix(err.get("path", ""), err.get("error_msg", ""))
-            if fixed_source:
-                success = await _apply_syntax_fix(err.get("path", ""), fixed_source, err, self._notify_fn)
-                if success:
-                    results["fixed"].append(err.get("file", "?"))
-                    if self._notify_fn:
-                        await self._notify_fn(
-                            f"🔧 *自动修复成功*\n"
-                            f"文件: `{err['file']}`\n"
-                            f"错误: SyntaxError\n"
-                            f"已备份原文件并应用修复"
-                        )
+            if not path:
+                continue
+            if circuit_is_open(path):
+                logger.info("ProactiveSelfRepair: circuit open, skip %s", err.get("file", "?"))
+                continue
+            fixed_source = await _generate_syntax_fix(path, err.get("error_msg", ""))
+            if not fixed_source:
+                n = circuit_note_failure(path)
+                if n >= get_max_repair_attempts() and self._notify_fn:
+                    await self._notify_fn(
+                        f"🛑 *自动修复已停止*（`{err.get('file', '?')}` 已连续失败 {n} 次）\n"
+                        f"无法生成有效补丁 — 请人工修复，避免无限消耗 Token。\n"
+                        f"快照目录: `{repair_snapshot.get_snapshot_root()}`"
+                    )
+                continue
+            success = await _apply_syntax_fix(path, fixed_source, err, self._notify_fn)
+            if success:
+                results["fixed"].append(err.get("file", "?"))
+                if self._notify_fn:
+                    await self._notify_fn(
+                        f"🔧 *自动修复成功*\n"
+                        f"文件: `{err['file']}`\n"
+                        f"错误: SyntaxError\n"
+                        f"已备份原文件并应用修复"
+                    )
 
         # --- Import scan (only check files with no syntax errors) ---
         broken_files = {e["file"] for e in syntax_errors}

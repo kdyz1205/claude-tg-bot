@@ -1,8 +1,15 @@
 """
-Telegram-facing helpers wrapping `pipeline.cli_bridge` (formatting only).
+Telegram-facing helpers wrapping ``pipeline.cli_bridge`` (formatting + streaming).
+
+``run_dev_prompt`` runs the local Claude CLI via ``asyncio.create_subprocess_exec`` by
+default (see ``TG_DEV_USE_HTTP``). Pass ``on_stdout_line`` for live TG chunks.
 """
 
 from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Optional
 
 from pipeline.cli_bridge import (
     CliDevRunResult as TgDevRunResult,
@@ -17,7 +24,50 @@ __all__ = [
     "format_telegram_report",
     "git_changed_files",
     "run_dev_prompt",
+    "run_dev_prompt_with_stream",
 ]
+
+
+async def run_dev_prompt_with_stream(
+    prompt: str,
+    send_text_chunk: Callable[[str], Awaitable[None]],
+    *,
+    cwd: Optional[Path] = None,
+    timeout_sec: Optional[int] = None,
+    min_interval_sec: float = 2.0,
+) -> TgDevRunResult:
+    """
+    Run dev CLI and periodically forward buffered stdout lines to Telegram (rate-limited).
+    """
+    import time as _time
+
+    last_send = 0.0
+    buf: list[str] = []
+    max_buf_lines = 40
+
+    async def on_line(line: str) -> None:
+        nonlocal last_send
+        buf.append(line)
+        if len(buf) > max_buf_lines:
+            del buf[: len(buf) - max_buf_lines]
+        now = _time.monotonic()
+        if now - last_send < min_interval_sec:
+            return
+        last_send = now
+        text = "\n".join(buf[-max_buf_lines:])
+        if len(text) > 3500:
+            text = text[-3500:]
+        try:
+            await send_text_chunk(f"📟 `{_time.strftime('%H:%M:%S')}`\n{text}")
+        except Exception:
+            pass
+
+    return await run_dev_prompt(
+        prompt,
+        cwd=cwd,
+        timeout_sec=timeout_sec,
+        on_stdout_line=on_line,
+    )
 
 
 def format_telegram_report(result: TgDevRunResult) -> str:
