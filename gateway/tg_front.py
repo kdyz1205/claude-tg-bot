@@ -64,7 +64,7 @@ def _hedge_section_v2(snap: dict, open_live: list[dict]) -> str:
         else:
             leg = e(f"${sym} (OKX空)")
         sign = "+" if upl >= 0 else ""
-        lines.append(f"{n}\\. {leg} \\| 浮盈: {sign}{upl:.2f}")
+        lines.append(f"{n}\\. {leg} \\| 浮盈: {sign}{_num_v2(upl, '.2f')}")
         n += 1
 
     if n == 1 and open_live:
@@ -111,6 +111,9 @@ def render_dashboard_text(
     d_sign = "+" if daily_usd >= 0 else ""
     p_sign = "+" if pct >= 0 else ""
     emoji_pnl = "🟢" if daily_usd >= 0 else "🔴"
+    eq_v = _num_v2(eq, ",.2f")
+    du_v = _num_v2(abs(daily_usd), ".2f")
+    pct_v = _num_v2(abs(pct), ".1f")
 
     try:
         import live_trader
@@ -222,7 +225,7 @@ def render_home_text(mode: str) -> str:
 tg_gw_render_home_text = render_home_text
 
 
-def build_main_keyboard(mode: str, *, god_engine_active: bool = False):
+def build_main_keyboard(mode: str):
     if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
         return None
     import trade_scheduler

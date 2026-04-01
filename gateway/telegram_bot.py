@@ -88,7 +88,7 @@ _ALLOWED = _allowed_user_ids()
 
 
 async def _gw_post_init(application: Application) -> None:
-    """Bind heavy work to PTB’s loop via ``application.create_task`` (see god_orchestrator)."""
+    """PTB lifecycle hook: polling loop is ready."""
     logger.info("Gateway Telegram post_init — polling loop ready")
 
 
@@ -99,14 +99,6 @@ async def _gw_post_shutdown(application: Application) -> None:
         await stop_autonomous_engine()
     except Exception:
         logger.exception("Gateway post_shutdown: god engine stop failed")
-
-
-def _gw_schedule(application: Application, coro) -> asyncio.Task:
-    """Prefer PTB task scheduling so work shares the official polling event loop."""
-    fn = getattr(application, "create_task", None)
-    if fn is not None:
-        return fn(coro)
-    return asyncio.create_task(coro)
 
 
 def _session_store_lock(application: Application) -> asyncio.Lock:
@@ -375,45 +367,91 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     m = _DEV_CMD.match(raw)
     prompt = (m.group(1) if m else "").strip()
     if not prompt:
-        await update.message.reply_text("用法：`/dev <你的开发需求>`")
+        await update.message.reply_text(
+            "用法：`/dev <你的开发需求>`\n也可直接发自然语言，Jarvis 会自动识别开发意图。"
+        )
         return
 
     await update.message.reply_text(
-        "🚀 收到架构师指令，本地 Claude CLI 开发进程已唤醒，正在后台阅览全库并重构代码，请等待战报..."
+        "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
     )
-    bot = context.bot
-    chat_id = update.message.chat_id
+    _gw_schedule(
+        context.application,
+        process_dev_task(
+            bot=context.bot,
+            chat_id=update.message.chat_id,
+            prompt=prompt,
+            timeout_sec=600,
+            min_interval_sec=3.0,
+        ),
+    )
 
-    async def _run_bridge() -> None:
-        from pipeline.tg_dev_bridge import (
-            format_telegram_report,
-            run_dev_prompt_with_stream,
+
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """非命令纯文本：CHAT / TRADE / AUTO_DEV。"""
+    global USER_MODE
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    from gateway.jarvis_semantic import (
+        chat_reply,
+        classify_intent,
+        execute_trade_from_user_text,
+        llm_backend_configured,
+        user_semantic_lock,
+    )
+
+    if not llm_backend_configured():
+        await update.message.reply_text(
+            "⚙️ 未配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY（或本地 Ollama），"
+            "Jarvis 无法调用意图模型。"
         )
+        return
 
-        async def _stream_chunk(t: str) -> None:
-            try:
-                await bot.send_message(chat_id=chat_id, text=t[:4090])
-            except Exception as ex:
-                logger.debug("cmd_dev stream chunk: %s", ex)
+    store = await _session_store_async(context.application)
+    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
+    application = context.application
 
-        try:
-            result = await run_dev_prompt_with_stream(
-                prompt, _stream_chunk, timeout_sec=600, min_interval_sec=3.0
+    async with user_semantic_lock(uid):
+        row = await classify_intent(text, uid=uid)
+        intent = str(row.get("intent") or "CHAT").upper()
+
+        if intent == "AUTO_DEV":
+            req = (row.get("extracted_requirement") or "").strip() or text
+            await update.message.reply_text(
+                "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
             )
-            if result.ok and result.modified_files:
-                text = "✅ 自动编程完成。您的代码库已被修改。"
-            else:
-                text = format_telegram_report(result)
-        except Exception as e:
-            logger.exception("cmd_dev bridge: %s", e)
-            text = f"❌ 桥接执行异常：{e!s}"
-        text = text[:4096]
-        try:
-            await bot.send_message(chat_id=chat_id, text=text)
-        except Exception as e:
-            logger.warning("cmd_dev report send failed: %s", e)
+            _gw_schedule(
+                application,
+                process_dev_task(
+                    bot=context.bot,
+                    chat_id=update.message.chat_id,
+                    prompt=req,
+                    timeout_sec=600,
+                    min_interval_sec=3.0,
+                ),
+            )
+            return
 
-    asyncio.create_task(_run_bridge())
+        if intent == "TRADE":
+            _ok, msg = await execute_trade_from_user_text(
+                text, uid=uid, user_mode=USER_MODE
+            )
+            await update.message.reply_text(msg[:4096])
+            return
+
+        reply, err = await chat_reply(text, uid=uid)
+        if err:
+            await update.message.reply_text(f"（模型不可用：{err[:800]}）")
+            return
+        if reply:
+            await update.message.reply_text(reply[:4096])
 
 
 async def handle_gateway_callback(
