@@ -13,6 +13,11 @@ The scanner:
   4. Estimates expected PnL net of round-trip trading costs.
   5. Returns opportunities ranked by annualised rate.
 
+Alt mode (``fetch_usdt_swap_inst_ids`` / ``fetch_funding_rates_concurrent`` /
+``scan_extreme_negative_funding``): discover all OKX USDT perpetuals (optional
+altcoin-only), pull funding concurrently, and filter deeply negative rates for
+use by ``arbitrage_engine`` funding-carry tasks.
+
 Designed for production use: proper session management, rate limiting,
 graceful error handling, structured logging, and full type coverage.
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Collection
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +42,10 @@ OKX_BASE_URL = "https://www.okx.com"
 FUNDING_RATE_PATH = "/api/v5/public/funding-rate"
 FUNDING_HISTORY_PATH = "/api/v5/public/funding-rate-history"
 MARK_PRICE_PATH = "/api/v5/public/mark-price"
+INSTRUMENTS_PATH = "/api/v5/public/instruments"
+
+# Bases excluded when scanning “altcoin” USDT swaps (majors).
+DEFAULT_ALTCOIN_EXCLUDE_BASES: frozenset[str] = frozenset({"BTC", "ETH"})
 
 # ---------------------------------------------------------------------------
 # Default instrument list -- major USDT-margined perpetual swaps
@@ -191,9 +201,15 @@ class FundingRateScanner:
             raise RuntimeError(f"No funding rate data for {symbol}")
 
         rec = data[0]
+
+        def _f(x: Any, default: float = 0.0) -> float:
+            if x is None or x == "":
+                return default
+            return float(x)
+
         return {
-            "fundingRate": float(rec.get("fundingRate", 0)),
-            "nextFundingRate": float(rec.get("nextFundingRate", 0)),
+            "fundingRate": _f(rec.get("fundingRate"), 0.0),
+            "nextFundingRate": _f(rec.get("nextFundingRate"), 0.0),
             "fundingTime": rec.get("fundingTime", ""),
             "nextFundingTime": rec.get("nextFundingTime", ""),
         }
@@ -215,9 +231,14 @@ class FundingRateScanner:
         )
         rows: list[dict] = []
         for rec in body.get("data", []):
+            fr = rec.get("fundingRate", 0)
+            try:
+                fr_f = float(fr) if fr not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                fr_f = 0.0
             rows.append(
                 {
-                    "fundingRate": float(rec.get("fundingRate", 0)),
+                    "fundingRate": fr_f,
                     "fundingTime": rec.get("fundingTime", ""),
                 }
             )
@@ -234,6 +255,139 @@ class FundingRateScanner:
                 return float(rec["markPx"])
 
         raise RuntimeError(f"Mark price not found for {symbol}")
+
+    async def fetch_usdt_swap_inst_ids(
+        self,
+        *,
+        exclude_bases: Collection[str] | None = None,
+        altcoins_only: bool = True,
+    ) -> list[str]:
+        """List OKX USDT-margined perpetual ``instId`` values (e.g. ``DOGE-USDT-SWAP``).
+
+        When *altcoins_only* is True, bases in :data:`DEFAULT_ALTCOIN_EXCLUDE_BASES`
+        are dropped unless *exclude_bases* overrides the effective exclusion set.
+        """
+        body = await self._get(INSTRUMENTS_PATH, {"instType": "SWAP"})
+        exclude: set[str]
+        if exclude_bases is not None:
+            exclude = {b.upper() for b in exclude_bases}
+        elif altcoins_only:
+            exclude = set(DEFAULT_ALTCOIN_EXCLUDE_BASES)
+        else:
+            exclude = set()
+
+        out: list[str] = []
+        for rec in body.get("data", []):
+            iid = rec.get("instId") or ""
+            if not iid.endswith("-USDT-SWAP"):
+                continue
+            state = rec.get("state", "")
+            if state and state != "live":
+                continue
+            base = iid.replace("-USDT-SWAP", "")
+            if base.upper() in exclude:
+                continue
+            out.append(iid)
+        return out
+
+    @staticmethod
+    def base_from_swap_inst(inst_id: str) -> str:
+        """``DOGE-USDT-SWAP`` → ``DOGE``."""
+        return inst_id.replace("-USDT-SWAP", "")
+
+    async def fetch_funding_rates_concurrent(
+        self,
+        symbols: list[str],
+        *,
+        max_concurrency: int = 40,
+    ) -> list[dict[str, Any]]:
+        """Concurrent current funding snapshot for many ``instId``s (one HTTP GET each).
+
+        Failed symbols are skipped (logged at debug).
+        """
+        sem = asyncio.Semaphore(max(1, max_concurrency))
+
+        async def _one(inst_id: str) -> dict[str, Any] | None:
+            async with sem:
+                try:
+                    return await self.get_funding_rate(inst_id)
+                except Exception:
+                    logger.debug("funding fetch failed for %s", inst_id, exc_info=True)
+                    return None
+
+        tasks = [_one(sym) for sym in symbols]
+        raw = await asyncio.gather(*tasks)
+        rows: list[dict[str, Any]] = []
+        for inst_id, fr in zip(symbols, raw, strict=True):
+            if fr is None:
+                continue
+            rows.append({"instId": inst_id, **fr})
+        return rows
+
+    async def scan_extreme_negative_funding(
+        self,
+        *,
+        min_negative_abs_pct: float = 0.05,
+        symbols: list[str] | None = None,
+        altcoins_only: bool = True,
+        max_concurrency: int = 40,
+    ) -> list[dict[str, Any]]:
+        """All (or given) USDT swaps concurrently; keep *severely negative* funding.
+
+        *min_negative_abs_pct* is the minimum |rate| in **percent per funding period**
+        (e.g. ``0.05`` → funding must be ≤ ``-0.05`` %).
+
+        Returns rows sorted by most negative rate first, with ``annualized_rate``,
+        ``rate_pct``, ``base``, and timing fields for downstream orchestration.
+        """
+        syms = symbols
+        if syms is None:
+            syms = await self.fetch_usdt_swap_inst_ids(altcoins_only=altcoins_only)
+        if not syms:
+            return []
+
+        snapshots = await self.fetch_funding_rates_concurrent(
+            syms, max_concurrency=max_concurrency
+        )
+
+        qualified: list[dict[str, Any]] = []
+        for row in snapshots:
+            inst_id = row["instId"]
+            raw_frac = float(row.get("fundingRate", 0))
+            rate_pct = raw_frac * 100.0
+            if rate_pct >= -min_negative_abs_pct:
+                continue
+
+            pred = float(row.get("nextFundingRate", 0))
+            ann = self.compute_annualized_rate(rate_pct)
+            nft_raw = row.get("nextFundingTime", "")
+            try:
+                nft_iso = datetime.fromtimestamp(
+                    int(nft_raw) / 1000, tz=timezone.utc
+                ).isoformat()
+            except (ValueError, TypeError, OSError):
+                nft_iso = str(nft_raw)
+
+            qualified.append(
+                {
+                    "symbol": inst_id,
+                    "base": self.base_from_swap_inst(inst_id),
+                    "funding_rate_frac": raw_frac,
+                    "rate_pct": round(rate_pct, 8),
+                    "predicted_rate_pct": round(pred * 100.0, 8),
+                    "annualized_rate": round(ann, 2),
+                    "next_funding_time": nft_iso,
+                }
+            )
+
+        qualified.sort(key=lambda x: x["rate_pct"])
+        logger.info(
+            "Extreme negative funding: %d / %d symbols (threshold -%.4f%% / period)",
+            len(qualified),
+            len(syms),
+            min_negative_abs_pct,
+        )
+        return qualified
 
     # ------------------------------------------------------------------
     # Analytics

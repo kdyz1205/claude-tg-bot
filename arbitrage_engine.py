@@ -10,6 +10,8 @@ Signal flow:
                                        AND volume > MIN_VOLUME_USDT
                                        AND net_profit > 0 → record + alert
   2. REST scanner (5 min) → top-50 by volume → same threshold checks → record + alert
+  3. Funding carry (optional) → OKX all USDT alt perps concurrent funding poll;
+     extreme negative funding + DexScreener Solana pool depth → delta-neutral carry instructions
 """
 
 import asyncio
@@ -55,6 +57,23 @@ TG_MSG_LIMIT = 4096              # Telegram message character limit
 SMART_WALLETS_FILE = ".smart_wallets.json"
 MAX_WALLETS_ARB_SIGNALS = 50      # max arb signals kept in .smart_wallets.json
 
+# ── OKX funding × Solana DEX “carry” (delta-neutral funding harvest) ───────────
+# Scans all USDT altcoin perps for deeply negative funding; if DexScreener shows
+# enough Solana spot liquidity, emits structured hedge instructions.
+FUNDING_CARRY_ENABLED = os.getenv("FUNDING_CARRY_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+FUNDING_CARRY_SCAN_INTERVAL = int(os.getenv("FUNDING_CARRY_SCAN_INTERVAL", "300"))
+FUNDING_CARRY_MIN_NEG_ABS_PCT = float(os.getenv("FUNDING_CARRY_MIN_NEG_ABS_PCT", "0.05"))
+FUNDING_CARRY_MIN_POOL_USD = float(os.getenv("FUNDING_CARRY_MIN_POOL_USD", "50000"))
+FUNDING_CARRY_MAX_POOL_CHECKS = int(os.getenv("FUNDING_CARRY_MAX_POOL_CHECKS", "120"))
+FUNDING_CARRY_DEX_RPS = int(os.getenv("FUNDING_CARRY_DEX_RPS", "6"))
+FUNDING_CARRY_OKX_RPS = int(os.getenv("FUNDING_CARRY_OKX_RPS", "15"))
+FUNDING_CARRY_JSONL = ".funding_carry_signals.jsonl"
+MAX_FUNDING_CARRY_WALLET_SNAPSHOT = 25
+
 
 # ── Symbol format helpers ─────────────────────────────────────────────────────
 
@@ -71,6 +90,90 @@ def _to_binance(pair: str) -> str:
 # Pre-build reverse maps
 _BYBIT_TO_CANONICAL   = {_to_bybit(s): s   for s in SYMBOLS}
 _BINANCE_TO_CANONICAL = {_to_binance(s): s  for s in SYMBOLS}
+
+_SOLANA_QUOTE_SYMBOLS = frozenset({"USDC", "USDT", "USD1", "SOL"})
+
+
+async def _dexscreener_solana_best_pool(
+    session: aiohttp.ClientSession,
+    base_symbol: str,
+    min_liquidity_usd: float,
+) -> Optional[dict]:
+    """Return best Solana pair on DexScreener matching *base_symbol* with enough USD liq."""
+    q = base_symbol.strip().upper()
+    if not q:
+        return None
+    url = "https://api.dexscreener.com/latest/dex/search"
+    try:
+        async with session.get(url, params={"q": q}, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    except Exception as e:
+        logger.debug("DexScreener search failed for %s: %s", q, e)
+        return None
+
+    pairs = data.get("pairs") or []
+    best: Optional[dict] = None
+    best_liq = 0.0
+    for p in pairs:
+        if str(p.get("chainId", "")).lower() != "solana":
+            continue
+        bt = p.get("baseToken") or {}
+        if str(bt.get("symbol", "")).upper() != q:
+            continue
+        qt = str((p.get("quoteToken") or {}).get("symbol", "")).upper()
+        if qt not in _SOLANA_QUOTE_SYMBOLS:
+            continue
+        liq = float((p.get("liquidity") or {}).get("usd") or 0)
+        if liq < min_liquidity_usd or liq <= best_liq:
+            continue
+        best_liq = liq
+        best = {
+            "liquidity_usd": liq,
+            "mint": bt.get("address", ""),
+            "pair_address": p.get("pairAddress", ""),
+            "dex_id": p.get("dexId", ""),
+            "quote_symbol": qt,
+            "price_usd": float(p.get("priceUsd") or 0),
+            "url": p.get("url", ""),
+        }
+    return best
+
+
+def _format_funding_carry_alert(sig: dict) -> str:
+    """Telegram / log text for a funding-carry instruction."""
+    sol = sig.get("solana_pool") or {}
+    liq_k = sol.get("liquidity_usd", 0) / 1000.0
+    base = sig.get("base", "?")
+    return (
+        "📉 **资金费套利（德尔塔中性）**\n"
+        f"标的: **{base}**  (`{sig.get('okx_inst_id', '')}`)\n"
+        f"当前资金费: **{sig.get('funding_rate_pct', 0):.4f}%** / 期  "
+        f"年化约 **{sig.get('annualized_funding_pct', 0):.1f}%**\n"
+        f"Solana 池: **${liq_k:.0f}k** liq · {sol.get('dex_id', '?')} "
+        f"({sol.get('quote_symbol', '')})\n"
+        f"{sig.get('structure_note', '')}\n"
+        f"链上 CA: `{sol.get('mint', '')}`\n"
+        f"参考名义: **{sig.get('notional_hint_usdt', 0):.0f} USDT**（请自行对齐合约面值与滑点）"
+    )
+
+
+def _append_funding_carry_jsonl(sig: dict) -> None:
+    try:
+        line = json.dumps(sig, ensure_ascii=False, default=str)
+        with open(FUNDING_CARRY_JSONL, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        try:
+            with open(FUNDING_CARRY_JSONL, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > 3000:
+                with open(FUNDING_CARRY_JSONL, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-2000:])
+        except OSError:
+            pass
+    except Exception as e:
+        logger.warning("funding carry jsonl append failed: %s", e)
 
 
 # ── Main engine ───────────────────────────────────────────────────────────────
@@ -106,6 +209,10 @@ class ArbEngine:
             asyncio.create_task(self._binance_ws(),       name="arb_binance"),
             asyncio.create_task(self._periodic_scanner(), name="arb_scanner"),
         ]
+        if FUNDING_CARRY_ENABLED:
+            self._tasks.append(
+                asyncio.create_task(self._funding_carry_loop(), name="funding_carry"),
+            )
         for t in self._tasks:
             t.add_done_callback(self._on_task_done)
         logger.info("ArbEngine started (OKX + Bybit + Binance WS + REST scanner)")
@@ -447,6 +554,153 @@ class ArbEngine:
         except Exception as e:
             logger.warning("Bybit price batch fetch error: %s", e)
             return {}
+
+    async def _funding_carry_loop(self) -> None:
+        """Periodic OKX funding scan + Solana pool screen → carry instructions."""
+        await asyncio.sleep(50)
+        while self._running:
+            try:
+                await self._funding_carry_scan_once()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error("ArbEngine funding carry loop error: %s", e)
+            try:
+                await asyncio.sleep(FUNDING_CARRY_SCAN_INTERVAL)
+            except asyncio.CancelledError:
+                return
+
+    async def _funding_carry_scan_once(self) -> None:
+        """One pass: extreme negative OKX funding + DexScreener Solana liquidity."""
+        from trading_skills.funding_scanner import FundingRateScanner
+
+        async with FundingRateScanner(max_rps=FUNDING_CARRY_OKX_RPS) as scanner:
+            negs = await scanner.scan_extreme_negative_funding(
+                min_negative_abs_pct=FUNDING_CARRY_MIN_NEG_ABS_PCT,
+                altcoins_only=True,
+                max_concurrency=min(60, max(FUNDING_CARRY_OKX_RPS * 4, 20)),
+            )
+
+        if not negs:
+            logger.debug("ArbEngine funding carry: no symbols under funding threshold")
+            return
+
+        to_check = negs[: max(1, FUNDING_CARRY_MAX_POOL_CHECKS)]
+        dex_sem = asyncio.Semaphore(max(1, FUNDING_CARRY_DEX_RPS))
+        now = time.time()
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as session:
+
+            async def _probe(row: dict) -> Optional[dict]:
+                async with dex_sem:
+                    pool = await _dexscreener_solana_best_pool(
+                        session,
+                        row["base"],
+                        FUNDING_CARRY_MIN_POOL_USD,
+                    )
+                if not pool or not pool.get("mint"):
+                    return None
+                inst_id = row["symbol"]
+                structure_note = (
+                    "负费率下 **永续多头** 收取资金费。德尔塔中性："
+                    "**OKX 做多该永续** + **Solana 上建立等量现货空头敞口**（卖出/换为稳定币）。"
+                    "「DEX 买现货 + OKX 做空」适用于 **正** 资金费率（空头收息），请勿与当前负费率混淆。"
+                )
+                return {
+                    "type": "funding_carry_delta_neutral",
+                    "source": "funding_carry_solana",
+                    "pair": f"{row['base']}-USDT",
+                    "base": row["base"],
+                    "okx_inst_id": inst_id,
+                    "funding_rate_pct": row["rate_pct"],
+                    "annualized_funding_pct": row["annualized_rate"],
+                    "predicted_next_pct": row.get("predicted_rate_pct"),
+                    "next_funding_time": row.get("next_funding_time", ""),
+                    "structure_note": structure_note,
+                    "okx_perpet_leg": {"side": "long", "instId": inst_id},
+                    "dex_spot_leg": {
+                        "chain": "solana",
+                        "action": "sell_or_swap_to_stable",
+                        "mint": pool["mint"],
+                        "venue_hint": "Jupiter / 对应 DEX 池",
+                    },
+                    "solana_pool": pool,
+                    "notional_hint_usdt": TRADE_SIZE_USDT,
+                    "timestamp": now,
+                    "live_execute_delta_neutral_buy_compat": False,
+                }
+
+            raw_sigs = await asyncio.gather(*(_probe(r) for r in to_check))
+        signals = [s for s in raw_sigs if s]
+
+        if not signals:
+            logger.info(
+                "ArbEngine funding carry: %d funding hits, none met Solana liquidity ≥ $%.0f",
+                len(negs),
+                FUNDING_CARRY_MIN_POOL_USD,
+            )
+            return
+
+        today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        emitted = 0
+        for sig in signals:
+            ck = f"fc:{sig.get('okx_inst_id', '')}"
+            if now - self._alert_cooldown.get(ck, 0) < ALERT_COOLDOWN:
+                continue
+            self._alert_cooldown[ck] = now
+            self._prune_alert_cooldown()
+
+            sig["date"] = today
+            _append_funding_carry_jsonl(sig)
+            self._write_funding_carry_to_wallets(sig)
+            emitted += 1
+
+            if self._send:
+                try:
+                    await self._send(_format_funding_carry_alert(sig))
+                except Exception as e:
+                    logger.error("ArbEngine funding carry alert error: %s", e)
+
+        logger.info(
+            "ArbEngine funding carry: emitted %d alert(s), %d pool-qualified (from %d funding hits)",
+            emitted,
+            len(signals),
+            len(negs),
+        )
+
+    def _write_funding_carry_to_wallets(self, sig: dict) -> None:
+        """Mirror latest funding-carry instructions into ``.smart_wallets.json``."""
+        with self._wallets_lock:
+            try:
+                if os.path.exists(SMART_WALLETS_FILE):
+                    with open(SMART_WALLETS_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                else:
+                    data = {}
+                lst = data.get("funding_carry_signals", [])
+                entry = {
+                    "pair": sig.get("pair", "?"),
+                    "base": sig.get("base", "?"),
+                    "okx_inst_id": sig.get("okx_inst_id", ""),
+                    "funding_rate_pct": sig.get("funding_rate_pct", 0),
+                    "annualized_funding_pct": sig.get("annualized_funding_pct", 0),
+                    "solana_mint": (sig.get("solana_pool") or {}).get("mint", ""),
+                    "liquidity_usd": (sig.get("solana_pool") or {}).get("liquidity_usd", 0),
+                    "timestamp": sig.get("timestamp", time.time()),
+                    "date": sig.get("date", ""),
+                }
+                lst.append(entry)
+                data["funding_carry_signals"] = lst[-MAX_FUNDING_CARRY_WALLET_SNAPSHOT:]
+                tmp = str(SMART_WALLETS_FILE) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, str(SMART_WALLETS_FILE))
+            except Exception as e:
+                logger.warning("ArbEngine _write_funding_carry_to_wallets error: %s", e)
 
     # ── History management ────────────────────────────────────────────────────
 
