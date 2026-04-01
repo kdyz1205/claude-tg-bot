@@ -264,6 +264,7 @@ def start_bot(bot_dir):
 
     kill_existing(bot_dir)
 
+    # run.py = Supervisor + auto-restart + TG alerts on crash (see run.py supervisor_main)
     log("Starting bot (python run.py)...")
     kwargs = {}
     if sys.platform == "win32":

@@ -10,8 +10,10 @@ pipeline (trade memory gate, LLM hallucination filter, self-monitor alerts).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
+import os
 import random
 import time
 from datetime import datetime, timezone
@@ -35,6 +37,50 @@ TICK_INTERVAL_SEC = 60
 EVOLVE_EVERY_N_TRADES = 10
 MIN_TRADES_FOR_EVAL = 5
 SIGNAL_DEDUP_WINDOW_SEC = 14_400
+
+# Offload NumPy / torch forward from the asyncio loop (TG + trading I/O stay responsive).
+_strategy_brain_cpu_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def get_strategy_brain_cpu_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _strategy_brain_cpu_executor
+    if _strategy_brain_cpu_executor is None:
+        workers = max(2, min(8, (os.cpu_count() or 2) * 2))
+        _strategy_brain_cpu_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="strategy_brain_cpu",
+        )
+    return _strategy_brain_cpu_executor
+
+
+def market_regime_from_arrays(
+    close: np.ndarray, atr_arr: np.ndarray
+) -> tuple[str, float]:
+    """Pure regime estimate (same rules as LessonsLedger.detect_regime)."""
+    if len(close) < 60:
+        return "unknown", 0.0
+    ma20 = sma(close, 20)
+    i = len(close) - 1
+    if np.isnan(ma20[i]):
+        return "unknown", 0.0
+    slope_20 = slope(ma20, 10, i)
+    atr_val = atr_arr[i] if not np.isnan(atr_arr[i]) else 0
+    atr_pct = atr_val / close[i] * 100 if close[i] > 0 else 0
+
+    if abs(slope_20) > 0.5 and atr_pct < 4.0:
+        regime = "trending"
+        confidence = min(abs(slope_20) / 2.0, 1.0)
+    elif atr_pct > 4.0:
+        regime = "volatile"
+        confidence = min(atr_pct / 8.0, 1.0)
+    elif abs(slope_20) < 0.2:
+        regime = "ranging"
+        confidence = 1.0 - abs(slope_20) / 0.2
+    else:
+        regime = "mixed"
+        confidence = 0.5
+
+    return regime, round(float(confidence), 2)
 
 
 def _audit_log(event: dict):
@@ -104,31 +150,9 @@ class LessonsLedger:
         return any(le["category"] == category for le in recent)
 
     def detect_regime(self, close: np.ndarray, atr_arr: np.ndarray) -> str:
-        if len(close) < 60:
-            return "unknown"
-        ma20 = sma(close, 20)
-        i = len(close) - 1
-        if np.isnan(ma20[i]):
-            return "unknown"
-        slope_20 = slope(ma20, 10, i)
-        atr_val = atr_arr[i] if not np.isnan(atr_arr[i]) else 0
-        atr_pct = atr_val / close[i] * 100 if close[i] > 0 else 0
-
-        if abs(slope_20) > 0.5 and atr_pct < 4.0:
-            regime = "trending"
-            confidence = min(abs(slope_20) / 2.0, 1.0)
-        elif atr_pct > 4.0:
-            regime = "volatile"
-            confidence = min(atr_pct / 8.0, 1.0)
-        elif abs(slope_20) < 0.2:
-            regime = "ranging"
-            confidence = 1.0 - abs(slope_20) / 0.2
-        else:
-            regime = "mixed"
-            confidence = 0.5
-
+        regime, conf = market_regime_from_arrays(close, atr_arr)
         self.market_regime = regime
-        self.regime_confidence = round(confidence, 2)
+        self.regime_confidence = conf
         return regime
 
     def learn_from_trade(
@@ -239,6 +263,194 @@ class PreTradeChecklist:
         return len(failures) == 0, failures
 
 
+def _live_predict_fallback_worker(x: np.ndarray) -> dict | None:
+    """Momentum logit when no PyTorch checkpoint (runs in ThreadPoolExecutor)."""
+    if x.ndim == 3:
+        x0 = x[0]
+    else:
+        x0 = x
+    if x0.shape[0] < 2 or x0.shape[1] < 4:
+        return None
+    c = x0[:, 3].astype(np.float64, copy=False)
+    ret = (c[-1] - c[-2]) / (abs(c[-2]) + 1e-9)
+    z = 30.0 * float(np.tanh(ret * 50))
+    prob = float(1.0 / (1.0 + np.exp(-z)))
+    conf = max(prob, 1.0 - prob)
+    return {
+        "logit": float(z),
+        "prob_up": prob,
+        "confidence": conf,
+        "action": "long" if prob >= 0.5 else "short",
+        "source": "fallback_momentum",
+        "run_dir": "",
+    }
+
+
+def _compute_generate_signal_v6(
+    symbol: str,
+    candles: list,
+    strategy_params: dict,
+    position_side: str | None,
+) -> tuple[dict | None, tuple[str, float]]:
+    """Heavy NumPy path for V6 signals; must not run on the asyncio event loop."""
+    p = strategy_params
+    close = np.array([c[4] for c in candles], dtype=np.float64)
+    high = np.array([c[2] for c in candles], dtype=np.float64)
+    low = np.array([c[3] for c in candles], dtype=np.float64)
+    vol = np.array([c[5] for c in candles], dtype=np.float64)
+
+    atr_temp = atr(high, low, close, 14)
+    regime, conf = market_regime_from_arrays(close, atr_temp)
+    rc = (regime, conf)
+
+    ma5 = sma(close, p["ma5_len"])
+    ma8 = sma(close, p["ma8_len"])
+    ema21 = ema(close, p["ema21_len"])
+    ma55 = sma(close, p["ma55_len"])
+    bb_up = bb_upper(close, p["bb_length"], p["bb_std_dev"])
+    bb_lo = bb_lower(close, p["bb_length"], p["bb_std_dev"])
+    atr_arr = atr(high, low, close, p["atr_period"])
+
+    i = len(close) - 1
+    indicators = [ma5, ma8, ema21, ma55, bb_up, bb_lo, atr_arr]
+    if any(np.isnan(x[i]) for x in indicators):
+        return None, rc
+
+    price = close[i]
+    if np.isnan(price) or price <= 0:
+        return None, rc
+
+    slope_len = p["slope_len"]
+    slope_thresh = p["slope_threshold"]
+
+    atr_pct = atr_arr[i] / price * 100
+    atr_dist_scale = max(1.0, atr_pct / 2.0)
+    atr_slope_scale = max(1.0, atr_pct / 1.5)
+
+    adapted_dist_5_8 = p["dist_ma5_ma8"] * atr_dist_scale
+    adapted_dist_8_21 = p["dist_ma8_ema21"] * atr_dist_scale
+    adapted_dist_21_55 = p["dist_ema21_ma55"] * atr_dist_scale
+    adapted_slope_thresh = slope_thresh * atr_slope_scale
+
+    if atr_pct < 1.5:
+        volatility_regime = "low"
+    elif atr_pct < 4.0:
+        volatility_regime = "normal"
+    else:
+        volatility_regime = "high"
+
+    if position_side == "long":
+        if price < ma55[i]:
+            return {
+                "action": "close",
+                "confidence": 1.0,
+                "reason": "Long SL: price < MA55",
+                "volatility_regime": volatility_regime,
+            }, rc
+        if price >= bb_up[i]:
+            return {
+                "action": "close",
+                "confidence": 0.9,
+                "reason": "Long TP: BB_upper",
+                "volatility_regime": volatility_regime,
+            }, rc
+    elif position_side == "short":
+        if price > ma55[i]:
+            return {
+                "action": "close",
+                "confidence": 1.0,
+                "reason": "Short SL: price > MA55",
+                "volatility_regime": volatility_regime,
+            }, rc
+        if price <= bb_lo[i]:
+            return {
+                "action": "close",
+                "confidence": 0.9,
+                "reason": "Short TP: BB_lower",
+                "volatility_regime": volatility_regime,
+            }, rc
+    if position_side is not None:
+        return None, rc
+
+    long_order = price > ma5[i] > ma8[i] > ema21[i] > ma55[i]
+    short_order = price < ma5[i] < ma8[i] < ema21[i] < ma55[i]
+    if not long_order and not short_order:
+        return None, rc
+
+    def pct_dist(a: float, b: float) -> float:
+        return abs(a - b) / max(abs(b), 1e-10) * 100
+
+    dist_5_8 = pct_dist(ma5[i], ma8[i])
+    dist_8_21 = pct_dist(ma8[i], ema21[i])
+    dist_21_55 = pct_dist(ema21[i], ma55[i])
+    if not (
+        dist_5_8 < adapted_dist_5_8
+        and dist_8_21 < adapted_dist_8_21
+        and dist_21_55 < adapted_dist_21_55
+    ):
+        return None, rc
+
+    s_ma5 = slope(ma5, slope_len, i)
+    s_ma8 = slope(ma8, slope_len, i)
+    s_ema21 = slope(ema21, slope_len, i)
+    s_ma55 = slope(ma55, slope_len, i)
+    slopes = [s_ma5, s_ma8, s_ema21, s_ma55]
+    if long_order:
+        if not all(s > adapted_slope_thresh for s in slopes):
+            return None, rc
+    else:
+        if not all(s < -adapted_slope_thresh for s in slopes):
+            return None, rc
+
+    if long_order and price >= bb_up[i]:
+        return None, rc
+    if short_order and price <= bb_lo[i]:
+        return None, rc
+
+    stack_count = 0
+    for j in range(max(0, i - 5), i + 1):
+        if any(np.isnan(x[j]) for x in [ma5, ma8, ema21, ma55]):
+            continue
+        if long_order and close[j] > ma5[j] > ma8[j] > ema21[j] > ma55[j]:
+            stack_count += 1
+        elif short_order and close[j] < ma5[j] < ma8[j] < ema21[j] < ma55[j]:
+            stack_count += 1
+    confidence = min(stack_count / 5.0, 1.0)
+    if volatility_regime in ("normal", "high"):
+        confidence = min(confidence + 0.1, 1.0)
+
+    if len(vol) > 20:
+        vol_slice = vol[max(0, i - 20) : i] if i >= 20 else vol[: i + 1]
+        vol_ma = np.nanmean(vol_slice) if len(vol_slice) > 0 else 0
+        if vol_ma > 0 and not np.isnan(vol[i]):
+            vol_ratio = vol[i] / vol_ma
+            if vol_ratio < 0.5:
+                return None, rc
+            if vol_ratio > 1.5:
+                confidence = min(confidence + 0.1, 1.0)
+
+    if confidence < 0.4:
+        return None, rc
+
+    action = "long" if long_order else "short"
+    return (
+        {
+            "action": action,
+            "confidence": round(confidence, 2),
+            "reason": (
+                f"V6 {action.title()}: dist={dist_5_8:.1f}/{dist_8_21:.1f}/{dist_21_55:.1f}%, "
+                f"slopes={s_ma5:.2f}/{s_ma8:.2f}/{s_ema21:.2f}/{s_ma55:.2f}%, "
+                f"vol={volatility_regime} atr={atr_pct:.2f}%"
+            ),
+            "sl": round(float(ma55[i]), 6),
+            "tp": round(float(bb_up[i] if long_order else bb_lo[i]), 6),
+            "price": round(float(price), 6),
+            "volatility_regime": volatility_regime,
+        },
+        rc,
+    )
+
+
 class StrategyBrain:
     """V6 self-evolving trading agent integrated with the telegram bot."""
 
@@ -277,142 +489,21 @@ class StrategyBrain:
             log.warning("Data error for %s: %s", symbol, e)
             return None
 
-        p = self.executor.state.strategy_params
-        close = np.array([c[4] for c in candles])
-        high = np.array([c[2] for c in candles])
-        low = np.array([c[3] for c in candles])
-        vol = np.array([c[5] for c in candles])
-
-        atr_temp = atr(high, low, close, 14)
-        self.lessons.detect_regime(close, atr_temp)
-
-        ma5 = sma(close, p["ma5_len"])
-        ma8 = sma(close, p["ma8_len"])
-        ema21 = ema(close, p["ema21_len"])
-        ma55 = sma(close, p["ma55_len"])
-        bb_up = bb_upper(close, p["bb_length"], p["bb_std_dev"])
-        bb_lo = bb_lower(close, p["bb_length"], p["bb_std_dev"])
-        atr_arr = atr(high, low, close, p["atr_period"])
-
-        i = len(close) - 1
-        indicators = [ma5, ma8, ema21, ma55, bb_up, bb_lo, atr_arr]
-        if any(np.isnan(x[i]) for x in indicators):
-            return None
-
-        price = close[i]
-        if np.isnan(price) or price <= 0:
-            return None
-
-        slope_len = p["slope_len"]
-        slope_thresh = p["slope_threshold"]
-
-        atr_pct = atr_arr[i] / price * 100
-        atr_dist_scale = max(1.0, atr_pct / 2.0)
-        atr_slope_scale = max(1.0, atr_pct / 1.5)
-
-        adapted_dist_5_8 = p["dist_ma5_ma8"] * atr_dist_scale
-        adapted_dist_8_21 = p["dist_ma8_ema21"] * atr_dist_scale
-        adapted_dist_21_55 = p["dist_ema21_ma55"] * atr_dist_scale
-        adapted_slope_thresh = slope_thresh * atr_slope_scale
-
-        if atr_pct < 1.5:
-            volatility_regime = "low"
-        elif atr_pct < 4.0:
-            volatility_regime = "normal"
-        else:
-            volatility_regime = "high"
-
-        # Check existing position exits
-        if symbol in self.executor.state.positions:
-            pos = self.executor.state.positions[symbol]
-            if pos.side == "long":
-                if price < ma55[i]:
-                    return {"action": "close", "confidence": 1.0, "reason": "Long SL: price < MA55", "volatility_regime": volatility_regime}
-                if price >= bb_up[i]:
-                    return {"action": "close", "confidence": 0.9, "reason": "Long TP: BB_upper", "volatility_regime": volatility_regime}
-            elif pos.side == "short":
-                if price > ma55[i]:
-                    return {"action": "close", "confidence": 1.0, "reason": "Short SL: price > MA55", "volatility_regime": volatility_regime}
-                if price <= bb_lo[i]:
-                    return {"action": "close", "confidence": 0.9, "reason": "Short TP: BB_lower", "volatility_regime": volatility_regime}
-            return None
-
-        # Layer 1: Trend ordering
-        long_order = price > ma5[i] > ma8[i] > ema21[i] > ma55[i]
-        short_order = price < ma5[i] < ma8[i] < ema21[i] < ma55[i]
-        if not long_order and not short_order:
-            return None
-
-        # Layer 2: Fanning distance
-        def pct_dist(a: float, b: float) -> float:
-            return abs(a - b) / max(abs(b), 1e-10) * 100
-
-        dist_5_8 = pct_dist(ma5[i], ma8[i])
-        dist_8_21 = pct_dist(ma8[i], ema21[i])
-        dist_21_55 = pct_dist(ema21[i], ma55[i])
-        if not (dist_5_8 < adapted_dist_5_8 and dist_8_21 < adapted_dist_8_21 and dist_21_55 < adapted_dist_21_55):
-            return None
-
-        # Layer 3: Slope momentum
-        s_ma5 = slope(ma5, slope_len, i)
-        s_ma8 = slope(ma8, slope_len, i)
-        s_ema21 = slope(ema21, slope_len, i)
-        s_ma55 = slope(ma55, slope_len, i)
-        slopes = [s_ma5, s_ma8, s_ema21, s_ma55]
-        if long_order:
-            if not all(s > adapted_slope_thresh for s in slopes):
-                return None
-        else:
-            if not all(s < -adapted_slope_thresh for s in slopes):
-                return None
-
-        # Layer 4: BB position filter
-        if long_order and price >= bb_up[i]:
-            return None
-        if short_order and price <= bb_lo[i]:
-            return None
-
-        # Confidence from ordering consistency
-        stack_count = 0
-        for j in range(max(0, i - 5), i + 1):
-            if any(np.isnan(x[j]) for x in [ma5, ma8, ema21, ma55]):
-                continue
-            if long_order and close[j] > ma5[j] > ma8[j] > ema21[j] > ma55[j]:
-                stack_count += 1
-            elif short_order and close[j] < ma5[j] < ma8[j] < ema21[j] < ma55[j]:
-                stack_count += 1
-        confidence = min(stack_count / 5.0, 1.0)
-        if volatility_regime in ("normal", "high"):
-            confidence = min(confidence + 0.1, 1.0)
-
-        # Layer 5: Volume confirmation
-        if len(vol) > 20:
-            vol_slice = vol[max(0, i - 20) : i] if i >= 20 else vol[: i + 1]
-            vol_ma = np.nanmean(vol_slice) if len(vol_slice) > 0 else 0
-            if vol_ma > 0 and not np.isnan(vol[i]):
-                vol_ratio = vol[i] / vol_ma
-                if vol_ratio < 0.5:
-                    return None
-                if vol_ratio > 1.5:
-                    confidence = min(confidence + 0.1, 1.0)
-
-        if confidence < 0.4:
-            return None
-
-        action = "long" if long_order else "short"
-        return {
-            "action": action,
-            "confidence": round(confidence, 2),
-            "reason": (
-                f"V6 {action.title()}: dist={dist_5_8:.1f}/{dist_8_21:.1f}/{dist_21_55:.1f}%, "
-                f"slopes={s_ma5:.2f}/{s_ma8:.2f}/{s_ema21:.2f}/{s_ma55:.2f}%, "
-                f"vol={volatility_regime} atr={atr_pct:.2f}%"
-            ),
-            "sl": round(float(ma55[i]), 6),
-            "tp": round(float(bb_up[i] if long_order else bb_lo[i]), 6),
-            "price": round(float(price), 6),
-            "volatility_regime": volatility_regime,
-        }
+        pos = self.executor.state.positions.get(symbol)
+        position_side = pos.side if pos else None
+        p = dict(self.executor.state.strategy_params)
+        loop = asyncio.get_running_loop()
+        signal, regime_pair = await loop.run_in_executor(
+            get_strategy_brain_cpu_executor(),
+            _compute_generate_signal_v6,
+            symbol,
+            candles,
+            p,
+            position_side,
+        )
+        self.lessons.market_regime = regime_pair[0]
+        self.lessons.regime_confidence = regime_pair[1]
+        return signal
 
     # ── Phase 11: live tensor → singularity inference (hot-swappable) ─────
 
@@ -431,33 +522,14 @@ class StrategyBrain:
 
             return load_best_bundle()
 
-        bundle = await asyncio.to_thread(_load)
+        loop = asyncio.get_running_loop()
+        bundle = await loop.run_in_executor(
+            get_strategy_brain_cpu_executor(), _load
+        )
         async with self._singularity_lock:
             self._singularity_bundle = bundle
             self._last_singularity_reload = now
         return bundle is not None
-
-    def _live_predict_fallback(self, x: np.ndarray) -> dict | None:
-        """Momentum logit when no PyTorch checkpoint is available."""
-        if x.ndim == 3:
-            x0 = x[0]
-        else:
-            x0 = x
-        if x0.shape[0] < 2 or x0.shape[1] < 4:
-            return None
-        c = x0[:, 3].astype(np.float64, copy=False)
-        ret = (c[-1] - c[-2]) / (abs(c[-2]) + 1e-9)
-        z = 30.0 * float(np.tanh(ret * 50))
-        prob = float(1.0 / (1.0 + np.exp(-z)))
-        conf = max(prob, 1.0 - prob)
-        return {
-            "logit": float(z),
-            "prob_up": prob,
-            "confidence": conf,
-            "action": "long" if prob >= 0.5 else "short",
-            "source": "fallback_momentum",
-            "run_dir": "",
-        }
 
     async def live_predict(self, x: np.ndarray) -> dict | None:
         """
@@ -475,8 +547,11 @@ class StrategyBrain:
         async with self._singularity_lock:
             bundle = self._singularity_bundle
 
+        loop = asyncio.get_running_loop()
+        ex = get_strategy_brain_cpu_executor()
+
         if bundle is None:
-            return self._live_predict_fallback(x)
+            return await loop.run_in_executor(ex, _live_predict_fallback_worker, x)
 
         def _forward() -> dict:
             import math
@@ -506,7 +581,7 @@ class StrategyBrain:
                 "run_dir": str(bundle["run_dir"]),
             }
 
-        return await asyncio.to_thread(_forward)
+        return await loop.run_in_executor(ex, _forward)
 
     # ── Position management ───────────────────────────────────────────────
 
@@ -709,7 +784,8 @@ class StrategyBrain:
         self._cycle_phase = "evolve"
         tt = self.executor.state.total_trades
         if tt > 0 and tt % EVOLVE_EVERY_N_TRADES == 0 and tt != self._last_evolved_at:
-            self.evolve()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(get_strategy_brain_cpu_executor(), self.evolve)
             self._last_evolved_at = tt
 
         self._cycle_phase = "checkpoint"

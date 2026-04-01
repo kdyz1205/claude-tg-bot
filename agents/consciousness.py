@@ -12,14 +12,14 @@ The "consciousness" is really a meta-cognitive loop:
 - Detect drift or degradation
 - Propose and execute self-improvements
 - Track which improvements actually helped
+
+Persistence goes through adaptive_controller.ConsciousnessStateManager so
+`.consciousness_state.json` has a single writer (asyncio.Lock + aiofiles).
 """
 
-import asyncio
-import json
 import logging
 import os
 import time
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +37,13 @@ class SelfAwareness:
     - Resource usage (token costs, API limits, memory)
     """
 
-    _STATE_FILE = os.path.join(BOT_DIR, ".consciousness_state.json")
     _MAX_EVOLUTION_LOG = 100
     _MAX_CAPABILITY_GAPS = 50
 
     def __init__(self):
-        self.performance_windows: list[dict] = []  # rolling 24h performance snapshots
-        self.capability_gaps: list[dict] = []       # things users asked that bot couldn't do
-        self.evolution_log: list[dict] = []         # self-improvement attempts and results
+        self.performance_windows: list[dict] = []
+        self.capability_gaps: list[dict] = []
+        self.evolution_log: list[dict] = []
         self.identity: dict = {
             "name": "TG Remote Controller",
             "version": "4.0",
@@ -54,47 +53,46 @@ class SelfAwareness:
             "weaknesses": [],
             "last_self_reflection": 0,
         }
-        self._load()
+        self._hydrated = False
 
-    def _load(self):
-        try:
-            if os.path.exists(self._STATE_FILE):
-                with open(self._STATE_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.performance_windows = data.get("performance_windows", [])[-48:]
-                self.capability_gaps = data.get("capability_gaps", [])[-self._MAX_CAPABILITY_GAPS:]
-                self.evolution_log = data.get("evolution_log", [])[-self._MAX_EVOLUTION_LOG:]
-                saved_identity = data.get("identity", {})
-                self.identity.update(saved_identity)
-        except Exception as e:
-            logger.warning(f"Consciousness: load failed: {e}")
+    def _apply_from_dict(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        self.performance_windows = data.get("performance_windows", [])[-48:]
+        self.capability_gaps = data.get("capability_gaps", [])[-self._MAX_CAPABILITY_GAPS:]
+        self.evolution_log = data.get("evolution_log", [])[-self._MAX_EVOLUTION_LOG:]
+        saved_identity = data.get("identity", {})
+        if isinstance(saved_identity, dict):
+            self.identity.update(saved_identity)
 
-    def _save(self):
-        try:
-            data = {
-                "performance_windows": self.performance_windows[-48:],
-                "capability_gaps": self.capability_gaps[-self._MAX_CAPABILITY_GAPS:],
-                "evolution_log": self.evolution_log[-self._MAX_EVOLUTION_LOG:],
-                "identity": self.identity,
-                "saved_at": time.time(),
-            }
-            tmp = self._STATE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self._STATE_FILE)
-        except Exception as e:
-            logger.warning(f"Consciousness: save failed: {e}")
-            try:
-                os.unlink(self._STATE_FILE + ".tmp")
-            except OSError:
-                pass
+    async def ensure_hydrated(self) -> None:
+        if self._hydrated:
+            return
+        from adaptive_controller import get_consciousness_state_manager
+
+        mgr = get_consciousness_state_manager()
+        data = await mgr.load_state()
+        self._apply_from_dict(data)
+        self._hydrated = True
+
+    async def _persist(self) -> None:
+        from adaptive_controller import get_consciousness_state_manager
+
+        patch = {
+            "performance_windows": self.performance_windows[-48:],
+            "capability_gaps": self.capability_gaps[-self._MAX_CAPABILITY_GAPS:],
+            "evolution_log": self.evolution_log[-self._MAX_EVOLUTION_LOG:],
+            "identity": self.identity,
+            "saved_at": time.time(),
+        }
+        mgr = get_consciousness_state_manager()
+        await mgr.commit_state_patch(patch, "SelfAwareness")
 
     # ── Performance monitoring ──
 
-    def record_performance_snapshot(self):
-        """Take a snapshot of current performance metrics."""
+    async def record_performance_snapshot_async(self) -> dict:
+        """Take a snapshot of current performance metrics and persist."""
+        await self.ensure_hydrated()
         snapshot = {
             "timestamp": time.time(),
             "metrics": {},
@@ -104,7 +102,9 @@ class SelfAwareness:
             from self_monitor import self_monitor
             health = self_monitor.get_health_summary()
             snapshot["metrics"]["health"] = health.get("overall", "unknown")
-            snapshot["metrics"]["consecutive_failures"] = health.get("consecutive_failures", 0)
+            snapshot["metrics"]["consecutive_failures"] = health.get(
+                "consecutive_failures", 0
+            )
             snapshot["metrics"]["success_rate"] = health.get("success_rate", 0)
         except Exception:
             pass
@@ -113,14 +113,18 @@ class SelfAwareness:
             import harness_learn
             scores = harness_learn.get_recent_scores(10)
             if scores:
-                avg = sum(s.get("score", 0) for s in scores) / len(scores) if scores else 0
+                avg = (
+                    sum(s.get("score", 0) for s in scores) / len(scores)
+                    if scores
+                    else 0
+                )
                 snapshot["metrics"]["avg_score"] = round(avg, 3)
         except Exception:
             pass
 
         self.performance_windows.append(snapshot)
-        self.performance_windows = self.performance_windows[-48:]  # Keep 48 snapshots (24h at 30min intervals)
-        self._save()
+        self.performance_windows = self.performance_windows[-48:]
+        await self._persist()
         return snapshot
 
     def detect_performance_trend(self) -> str:
@@ -133,7 +137,11 @@ class SelfAwareness:
         older = windows[-8:-4] if len(windows) >= 8 else windows[:4]
 
         def avg_score(w):
-            scores = [s["metrics"].get("avg_score", 0) for s in w if "avg_score" in s.get("metrics", {})]
+            scores = [
+                s["metrics"].get("avg_score", 0)
+                for s in w
+                if "avg_score" in s.get("metrics", {})
+            ]
             return sum(scores) / len(scores) if scores else 0
 
         recent_avg = avg_score(recent)
@@ -147,56 +155,73 @@ class SelfAwareness:
 
     # ── Capability gap tracking ──
 
-    def record_capability_gap(self, user_request: str, failure_reason: str):
-        """Record something the user asked that the bot couldn't do."""
-        self.capability_gaps.append({
-            "request": user_request[:300],
-            "reason": failure_reason[:300],
-            "timestamp": time.time(),
-            "addressed": False,
-        })
+    async def record_capability_gap_async(
+        self, user_request: str, failure_reason: str
+    ) -> None:
+        await self.ensure_hydrated()
+        self.capability_gaps.append(
+            {
+                "request": user_request[:300],
+                "reason": failure_reason[:300],
+                "timestamp": time.time(),
+                "addressed": False,
+            }
+        )
         self.capability_gaps = self.capability_gaps[-self._MAX_CAPABILITY_GAPS:]
-        self._save()
+        await self._persist()
 
     def get_top_gaps(self, n: int = 5) -> list[dict]:
         """Get the most common unaddressed capability gaps."""
         unaddressed = [g for g in self.capability_gaps if not g.get("addressed")]
-        # Group by similar reasons
         reasons = {}
         for g in unaddressed:
             key = g["reason"][:100]
             reasons.setdefault(key, []).append(g)
-        # Sort by frequency
         sorted_gaps = sorted(reasons.items(), key=lambda x: -len(x[1]))
-        return [{"reason": k, "count": len(v), "examples": [x["request"][:100] for x in v[:3]]} for k, v in sorted_gaps[:n]]
+        return [
+            {
+                "reason": k,
+                "count": len(v),
+                "examples": [x["request"][:100] for x in v[:3]],
+            }
+            for k, v in sorted_gaps[:n]
+        ]
 
     # ── Self-evolution ──
 
-    def record_evolution(self, change_type: str, description: str, files_changed: list[str] = None):
-        """Record a self-improvement attempt."""
+    async def record_evolution_async(
+        self,
+        change_type: str,
+        description: str,
+        files_changed: list[str] | None = None,
+    ) -> int:
+        await self.ensure_hydrated()
         entry = {
-            "type": change_type,  # "bug_fix", "new_feature", "optimization", "learning"
+            "type": change_type,
             "description": description[:500],
             "files": files_changed or [],
             "timestamp": time.time(),
-            "outcome": "pending",  # will be updated later
+            "outcome": "pending",
         }
         self.evolution_log.append(entry)
         self.evolution_log = self.evolution_log[-self._MAX_EVOLUTION_LOG:]
-        self._save()
+        await self._persist()
         return len(self.evolution_log) - 1
 
-    def record_evolution_outcome(self, index: int, success: bool, notes: str = ""):
-        """Record whether a self-improvement actually helped."""
+    async def record_evolution_outcome_async(
+        self, index: int, success: bool, notes: str = ""
+    ) -> None:
+        await self.ensure_hydrated()
         if 0 <= index < len(self.evolution_log):
             self.evolution_log[index]["outcome"] = "success" if success else "failed"
             self.evolution_log[index]["notes"] = notes[:300]
-            self._save()
+            await self._persist()
 
     # ── Self-reflection ──
 
-    def self_reflect(self) -> dict:
-        """Generate a self-reflection report."""
+    async def self_reflect_async(self) -> dict:
+        """Generate a self-reflection report and persist."""
+        await self.ensure_hydrated()
         now = time.time()
         self.identity["last_self_reflection"] = now
 
@@ -208,21 +233,18 @@ class SelfAwareness:
             "identity": self.identity,
         }
 
-        # Update strengths/weaknesses based on data
         evolutions = self.evolution_log[-20:]
         successes = [e for e in evolutions if e.get("outcome") == "success"]
         failures = [e for e in evolutions if e.get("outcome") == "failed"]
 
         if successes:
-            self.identity["strengths"] = list(set(
-                e["type"] for e in successes
-            ))[:5]
+            self.identity["strengths"] = list(
+                {e["type"] for e in successes}
+            )[:5]
         if failures:
-            self.identity["weaknesses"] = list(set(
-                e["type"] for e in failures
-            ))[:5]
+            self.identity["weaknesses"] = list({e["type"] for e in failures})[:5]
 
-        self._save()
+        await self._persist()
         return report
 
     def get_self_description(self) -> str:
@@ -244,6 +266,7 @@ class SelfAwareness:
 # ── Singleton ──
 
 _awareness: SelfAwareness | None = None
+
 
 def get_self_awareness() -> SelfAwareness:
     global _awareness

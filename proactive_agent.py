@@ -542,9 +542,11 @@ class ProactiveAgent:
             try:
                 from agents.consciousness import get_self_awareness
                 sa = get_self_awareness()
-                idx = sa.record_evolution("auto_fix", f"Auto-fixed: {top_error[:100]}")
+                idx = await sa.record_evolution_async(
+                    "auto_fix", f"Auto-fixed: {top_error[:100]}"
+                )
                 success = "PASS" in result or "✅" in result
-                sa.record_evolution_outcome(idx, success, result[:200])
+                await sa.record_evolution_outcome_async(idx, success, result[:200])
             except Exception:
                 pass
 

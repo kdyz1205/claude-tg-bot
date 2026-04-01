@@ -352,7 +352,25 @@ async def _apply_syntax_fix(
     error_info: dict,
     notify_fn=None,
 ) -> bool:
-    """Validate and write fixed source. Respects success-rate gate."""
+    """Validate and write fixed source. Respects success-rate gate.
+
+    Breakpoint snapshot under /tmp (or system temp) before write; on py_compile/pytest
+    failure rolls back immediately and notifies for human takeover.
+    """
+    from repair_snapshot import (
+        clear_repair_cooldown,
+        create_snapshot_for_path,
+        human_takeover_message,
+        is_repair_cooldown,
+        record_rollback_cooldown,
+        restore_snapshot_to_target,
+        verify_after_repair,
+    )
+
+    if is_repair_cooldown(file_path):
+        logger.info("self_repair: rollback cooldown active, skip auto-apply for %s", file_path)
+        return False
+
     stats = _get_repair_stats()
 
     # Success-rate gate
@@ -382,8 +400,10 @@ async def _apply_syntax_fix(
         })
         return False
 
-    # Validate fixed source compiles
+    # Validate fixed source compiles (AST, pre-write)
     import ast
+    import difflib
+
     try:
         ast.parse(fixed_source)
     except SyntaxError as se:
@@ -402,32 +422,44 @@ async def _apply_syntax_fix(
         })
         return False
 
-    # Backup original (atomic: write to tmp, fsync, then rename)
+    try:
+        original = Path(file_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("self_repair: cannot read %s: %s", file_path, exc)
+        return False
+
+    snap = create_snapshot_for_path(Path(file_path), original)
+    if snap is None:
+        logger.error("self_repair: snapshot failed — refusing to write %s", file_path)
+        if notify_fn:
+            await notify_fn(
+                f"⚠️ *无法创建断点快照*\n跳过自动修复 `{error_info['file']}`（防止无回滚写入）"
+            )
+        return False
+
+    # Secondary backup alongside project (redundant with tmp snapshot)
     backup_path = file_path + f".bak.{int(time.time())}"
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            original = f.read()
         tmp_backup = backup_path + ".tmp"
         with open(tmp_backup, "w", encoding="utf-8") as f:
             f.write(original)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_backup, backup_path)
-    except Exception as exc:
-        logger.warning("self_repair: backup failed for %s: %s", file_path, exc)
+    except OSError as exc:
+        logger.warning("self_repair: local .bak failed for %s: %s", file_path, exc)
 
-    # Build diff
-    import difflib
-    diff_lines = list(difflib.unified_diff(
-        original.splitlines(keepends=True),
-        fixed_source.splitlines(keepends=True),
-        fromfile=f"{error_info['file']} (original)",
-        tofile=f"{error_info['file']} (fixed)",
-        lineterm="",
-    ))
+    diff_lines = list(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            fixed_source.splitlines(keepends=True),
+            fromfile=f"{error_info['file']} (original)",
+            tofile=f"{error_info['file']} (fixed)",
+            lineterm="",
+        )
+    )
     diff = "".join(diff_lines[:80])
 
-    # Atomic write
     tmp = file_path + ".repair.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -435,7 +467,40 @@ async def _apply_syntax_fix(
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, file_path)
+
+        ok_v, vreason = verify_after_repair(Path(file_path), BOT_DIR)
+        if not ok_v:
+            ok_rb, rb_err = restore_snapshot_to_target(snap, Path(file_path))
+            if not ok_rb:
+                logger.critical("self_repair: rollback failed for %s: %s", file_path, rb_err)
+            record_rollback_cooldown(file_path)
+            _append_repair_log({
+                "ts": datetime.now().isoformat(),
+                "file": error_info["file"],
+                "line": error_info.get("line", 0),
+                "error_type": error_info["error_type"],
+                "error_msg": error_info["error_msg"][:200],
+                "confidence": 0.0,
+                "diff": diff[:2000],
+                "success": False,
+                "backed_up": True,
+                "rolled_back": True,
+                "rollback_reason": vreason[:500],
+                "snapshot": str(snap),
+                "source": "proactive_scan",
+            })
+            if notify_fn:
+                await notify_fn(
+                    human_takeover_message(
+                        file_name=error_info["file"],
+                        reason=vreason,
+                        snapshot_name=snap.name,
+                    )
+                )
+            return False
+
         logger.info("self_repair: applied syntax fix to %s", error_info["file"])
+        clear_repair_cooldown(file_path)
         _append_repair_log({
             "ts": datetime.now().isoformat(),
             "file": error_info["file"],
@@ -446,9 +511,9 @@ async def _apply_syntax_fix(
             "diff": diff[:2000],
             "success": True,
             "backed_up": True,
+            "snapshot": str(snap),
             "source": "proactive_scan",
         })
-        # Hot-reload the fixed module so changes take effect without restart
         mod_name = Path(file_path).stem
         reload_ok, reload_msg = _hot_reload_module(mod_name)
         if reload_ok:
@@ -458,6 +523,10 @@ async def _apply_syntax_fix(
         return True
     except Exception as exc:
         logger.warning("self_repair: write failed for %s: %s", file_path, exc)
+        try:
+            restore_snapshot_to_target(snap, Path(file_path))
+        except Exception as rb_e:
+            logger.critical("self_repair: emergency rollback failed: %s", rb_e)
         _append_repair_log({
             "ts": datetime.now().isoformat(),
             "file": error_info["file"],
@@ -468,6 +537,7 @@ async def _apply_syntax_fix(
             "diff": diff[:2000],
             "success": False,
             "backed_up": True,
+            "rolled_back": True,
             "source": "proactive_scan",
         })
         return False
@@ -906,6 +976,7 @@ class CodeEvolutionEngine:
         # Track error baselines per module (at patch time), capped
         self._patch_baselines: dict[str, int] = {}
         self._patch_backups: dict[str, str] = {}  # module -> backup path
+        self._patch_tmp_snapshots: dict[str, str] = {}  # module -> /tmp snapshot .py path
 
     def set_notify_fn(self, fn) -> None:
         self._notify_fn = fn
@@ -967,6 +1038,13 @@ class CodeEvolutionEngine:
         )
         logger.info("CodeEvolutionEngine: targeting %s (%s)", target["module"], issue)
 
+        from repair_snapshot import is_repair_cooldown
+
+        if is_repair_cooldown(target["path"]):
+            logger.info("CodeEvolutionEngine: rollback cooldown active, skip %s", target["module"])
+            result["status"] = "cooldown"
+            return result
+
         if self._notify_fn:
             await self._notify_fn(
                 f"🧬 *自进化引擎启动*\n"
@@ -1022,7 +1100,15 @@ class CodeEvolutionEngine:
             result["status"] = "staging_failed"
             return result
 
-        # 5. Backup + hot-replace
+        # 5. Breakpoint snapshot (/tmp) + local backup + hot-replace + verify
+        from repair_snapshot import (
+            create_snapshot_for_path,
+            human_takeover_message,
+            record_rollback_cooldown,
+            restore_snapshot_to_target,
+            verify_after_repair,
+        )
+
         backup_path = str(target["path"]) + f".evobak.{int(time.time())}"
         try:
             with open(target["path"], "r", encoding="utf-8") as f:
@@ -1034,10 +1120,21 @@ class CodeEvolutionEngine:
             result["status"] = "backup_failed"
             return result
 
+        snap = create_snapshot_for_path(Path(target["path"]), original)
+        if snap is None:
+            logger.error("CodeEvolutionEngine: tmp snapshot failed — abort apply %s", target["module"])
+            result["status"] = "snapshot_failed"
+            if self._notify_fn:
+                await self._notify_fn(
+                    f"❌ *进化中止*\n模块 `{target['module']}`：无法写入断点快照，未应用补丁。"
+                )
+            return result
+
         self._patch_backups[target["module"]] = backup_path
+        self._patch_tmp_snapshots[target["module"]] = str(snap)
         self._patch_baselines[target["module"]] = _module_errors.get(target["module"], 0)
         # Cap tracking dicts to prevent unbounded growth
-        for d in (self._patch_backups, self._patch_baselines):
+        for d in (self._patch_backups, self._patch_baselines, self._patch_tmp_snapshots):
             if len(d) > self._MAX_PATCH_TRACKING:
                 oldest_keys = list(d.keys())[:len(d) - self._MAX_PATCH_TRACKING]
                 for k in oldest_keys:
@@ -1061,6 +1158,34 @@ class CodeEvolutionEngine:
             })
             return result
 
+        ok_v, vreason = verify_after_repair(Path(target["path"]), BOT_DIR)
+        if not ok_v:
+            restore_snapshot_to_target(snap, Path(target["path"]))
+            record_rollback_cooldown(target["path"])
+            result["applied"] = False
+            result["status"] = "verify_failed_rollback"
+            result["rolled_back"] = True
+            logger.error("CodeEvolutionEngine: post-patch verify failed, rolled back %s: %s",
+                         target["module"], vreason[:200])
+            _append_evo_log({
+                "ts": datetime.now().isoformat(),
+                "module": target["module"],
+                "issue": issue,
+                "applied": False,
+                "rolled_back": True,
+                "reason": f"verify_failed: {vreason[:200]}",
+                "snapshot": str(snap),
+            })
+            if self._notify_fn:
+                await self._notify_fn(
+                    human_takeover_message(
+                        file_name=target["module"] + ".py",
+                        reason=vreason,
+                        snapshot_name=snap.name,
+                    )
+                )
+            return result
+
         result["applied"] = True
         result["status"] = "applied"
         logger.info("CodeEvolutionEngine: patch applied to %s", target["module"])
@@ -1070,6 +1195,7 @@ class CodeEvolutionEngine:
                 f"✅ *补丁已应用*\n"
                 f"模块: `{target['module']}`\n"
                 f"备份: `{Path(backup_path).name}`\n"
+                f"快照: `{snap.name}`\n"
                 f"监控中 ({self.MONITOR_PERIOD}s)..."
             )
 
@@ -1119,12 +1245,30 @@ class CodeEvolutionEngine:
         return False
 
     async def _do_rollback(self, module: str, issue: str, new_errors: int) -> None:
+        from repair_snapshot import restore_snapshot_to_target
+
+        module_path = BOT_DIR / f"{module}.py"
+        snap_s = self._patch_tmp_snapshots.get(module)
+        if snap_s and Path(snap_s).exists():
+            ok, err = restore_snapshot_to_target(Path(snap_s), module_path)
+            if ok:
+                logger.warning(
+                    "CodeEvolutionEngine: rolled back %s from tmp snapshot (new_errors=%d)",
+                    module,
+                    new_errors,
+                )
+                if self._notify_fn:
+                    await self._notify_fn(
+                        f"⏮️ *监控期回滚*\n模块: `{module}`\n原因: 错误率升高\n已从断点快照还原"
+                    )
+                return
+            logger.warning("CodeEvolutionEngine: tmp snapshot rollback failed: %s", err)
+
         backup = self._patch_backups.get(module)
         if not backup or not Path(backup).exists():
             logger.error("CodeEvolutionEngine: cannot rollback %s — no backup", module)
             return
 
-        module_path = str(BOT_DIR / f"{module}.py")
         try:
             with open(backup, "r", encoding="utf-8") as f:
                 original = f.read()

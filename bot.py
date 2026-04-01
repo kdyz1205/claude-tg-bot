@@ -6565,7 +6565,7 @@ async def consciousness_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     try:
         awareness = get_self_awareness()
-        report = awareness.self_reflect()
+        report = await awareness.self_reflect_async()
         desc = awareness.get_self_description()
 
         text = f"🧠 Self-Awareness Report\n\n{desc}\n\n"
@@ -7470,7 +7470,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _autonomy_available and _message_counter % 50 == 0:
             try:
                 awareness = get_self_awareness()
-                awareness.record_performance_snapshot()
+                await awareness.record_performance_snapshot_async()
             except Exception:
                 pass
         # Memory: auto-summary every 30 messages

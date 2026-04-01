@@ -138,6 +138,24 @@ def main():
     report.append(f"Bot dir: {bot_dir}")
     report.append(f"Python: {sys.version}")
     report.append("")
+    try:
+        sys.path.insert(0, str(bot_dir))
+        from repair_snapshot import (
+            get_rollback_cooldown_sec,
+            pytest_enabled,
+            snapshot_dir_status,
+        )
+
+        snap_root, snap_n = snapshot_dir_status()
+        report.append("=== Self-repair snapshots ===")
+        report.append(f"Snapshot dir: {snap_root}")
+        report.append(f"Snapshot .py count: {snap_n}")
+        report.append(f"Post-repair pytest: {pytest_enabled()}")
+        report.append(f"Rollback cooldown (min): {get_rollback_cooldown_sec() // 60}")
+        report.append("")
+    except Exception as exc:
+        report.append(f"Self-repair snapshots: (unavailable) {exc}")
+        report.append("")
 
     # Check claude_agent.py
     ca = bot_dir / "claude_agent.py"

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 PATTERNS_FILE = os.path.join(BOT_DIR, "adaptive_patterns.json")
+ADAPTIVE_PATTERNS_PATH = Path(BOT_DIR) / "adaptive_patterns.json"
 CONSCIOUSNESS_STATE_FILE = Path(BOT_DIR) / ".consciousness_state.json"
 
 
@@ -218,37 +219,83 @@ class AdaptiveController:
         except OSError as exc:
             logger.warning("AdaptiveController: cannot create screenshot dir: %s", exc)
 
-        # Load persisted patterns
-        self._load_patterns()
+        self._patterns_path = ADAPTIVE_PATTERNS_PATH
+        self._patterns_lock = asyncio.Lock()
+        self._patterns_loaded = False
 
     # =====================================================================
     # Persistence
     # =====================================================================
 
-    def _load_patterns(self) -> None:
-        """Load learned UI patterns from disk."""
-        try:
-            if os.path.exists(PATTERNS_FILE):
-                with open(PATTERNS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    logger.warning("AdaptiveController: patterns file has unexpected type, resetting")
-                    return
-                patterns = data.get("patterns", {})
-                offsets = data.get("offsets", {})
-                # Validate types to guard against corrupted data
-                if isinstance(patterns, dict):
-                    self.known_ui_patterns = patterns
-                if isinstance(offsets, dict):
-                    self.click_offset_map = offsets
-                # Enforce size caps on load
-                self._prune_patterns()
-                logger.info("AdaptiveController: loaded %d patterns, %d offset maps",
-                            len(self.known_ui_patterns), len(self.click_offset_map))
-        except (json.JSONDecodeError, OSError, ValueError, TypeError) as exc:
-            logger.warning("AdaptiveController: failed to load patterns (will start fresh): %s", exc)
-            self.known_ui_patterns = {}
-            self.click_offset_map = {}
+    def _apply_patterns_payload(self, data: dict) -> None:
+        """Apply decoded JSON object to in-memory pattern maps."""
+        patterns = data.get("patterns", {})
+        offsets = data.get("offsets", {})
+        if isinstance(patterns, dict):
+            self.known_ui_patterns = patterns
+        if isinstance(offsets, dict):
+            self.click_offset_map = offsets
+        self._prune_patterns()
+
+    async def _ensure_patterns_loaded(self) -> None:
+        """Load adaptive_patterns.json once, under lock (aiofiles)."""
+        async with self._patterns_lock:
+            if self._patterns_loaded:
+                return
+            try:
+                if self._patterns_path.exists():
+                    async with aiofiles.open(
+                        self._patterns_path, mode="r", encoding="utf-8"
+                    ) as f:
+                        content = await f.read()
+                    data = json.loads(content)
+                    if not isinstance(data, dict):
+                        logger.warning(
+                            "AdaptiveController: patterns file has unexpected type, resetting"
+                        )
+                    else:
+                        self._apply_patterns_payload(data)
+                        logger.info(
+                            "AdaptiveController: loaded %d patterns, %d offset maps",
+                            len(self.known_ui_patterns),
+                            len(self.click_offset_map),
+                        )
+            except (json.JSONDecodeError, OSError, ValueError, TypeError) as exc:
+                logger.warning(
+                    "AdaptiveController: failed to load patterns (will start fresh): %s",
+                    exc,
+                )
+                self.known_ui_patterns = {}
+                self.click_offset_map = {}
+            self._patterns_loaded = True
+
+    async def _save_patterns_async(self) -> None:
+        """Atomic write for adaptive_patterns.json under the same lock as load."""
+        async with self._patterns_lock:
+            self._prune_patterns()
+            data = {
+                "patterns": self.known_ui_patterns,
+                "offsets": self.click_offset_map,
+                "saved_at": datetime.now().isoformat(),
+            }
+            tmp = self._patterns_path.with_suffix(".json.tmp")
+            try:
+                async with aiofiles.open(tmp, mode="w", encoding="utf-8") as f:
+                    await f.write(
+                        json.dumps(data, ensure_ascii=False, indent=2, default=str)
+                    )
+
+                def _atomic_replace() -> None:
+                    tmp.replace(self._patterns_path)
+
+                await asyncio.to_thread(_atomic_replace)
+            except OSError as exc:
+                logger.warning("AdaptiveController: failed to save patterns: %s", exc)
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
 
     def _prune_patterns(self) -> None:
         """Evict least-recently-used patterns and offsets to stay within caps."""
@@ -265,29 +312,6 @@ class AdaptiveController:
             keys = list(self.click_offset_map.keys())
             for k in keys[: len(keys) - self._MAX_OFFSETS]:
                 del self.click_offset_map[k]
-
-    def _save_patterns(self) -> None:
-        """Persist learned UI patterns to disk."""
-        try:
-            self._prune_patterns()
-            data = {
-                "patterns": self.known_ui_patterns,
-                "offsets": self.click_offset_map,
-                "saved_at": datetime.now().isoformat(),
-            }
-            tmp = PATTERNS_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, PATTERNS_FILE)
-        except OSError as exc:
-            logger.warning("AdaptiveController: failed to save patterns: %s", exc)
-            # Clean up stale tmp file
-            try:
-                os.unlink(PATTERNS_FILE + ".tmp")
-            except OSError:
-                pass
 
     # =====================================================================
     # Internal helpers
@@ -423,6 +447,8 @@ class AdaptiveController:
             return {"success": False, "x": 0, "y": 0,
                     "method_used": "cancelled", "attempts": 0, "cached": False}
 
+        await self._ensure_patterns_loaded()
+
         pyautogui = _import_pyautogui()
 
         # Take screenshot if needed
@@ -454,7 +480,7 @@ class AdaptiveController:
             if click_result["changed"]:
                 cached["hits"] = cached.get("hits", 0) + 1
                 cached["last_used"] = datetime.now().isoformat()
-                await asyncio.to_thread(self._save_patterns)
+                await self._save_patterns_async()
                 result.update(success=True, x=cx, y=cy,
                               method_used="cached_pattern", cached=True)
                 return result
@@ -500,8 +526,8 @@ class AdaptiveController:
             result["attempts"] += 1
             if click_result["changed"]:
                 s_hash = await asyncio.to_thread(self._screenshot_hash, screenshot_path)
-                await asyncio.to_thread(
-                    self.learn_ui_pattern, cache_key, cx, cy, app_title, s_hash
+                await self.learn_ui_pattern(
+                    cache_key, cx, cy, app_title, s_hash
                 )
                 result.update(success=True, x=cx, y=cy,
                               method_used=method, cached=False)
@@ -517,8 +543,8 @@ class AdaptiveController:
             result["attempts"] += 1
             if click_result["changed"]:
                 s_hash = await asyncio.to_thread(self._screenshot_hash, screenshot_path)
-                await asyncio.to_thread(
-                    self.learn_ui_pattern, cache_key, cx, cy, app_title, s_hash
+                await self.learn_ui_pattern(
+                    cache_key, cx, cy, app_title, s_hash
                 )
                 result.update(success=True, x=cx, y=cy,
                               method_used="color_detection", cached=False)
@@ -536,8 +562,8 @@ class AdaptiveController:
                 result["attempts"] += 1
                 if click_result["changed"]:
                     s_hash = await asyncio.to_thread(self._screenshot_hash, screenshot_path)
-                    await asyncio.to_thread(
-                        self.learn_ui_pattern, cache_key, ex, ey, app_title, s_hash
+                    await self.learn_ui_pattern(
+                        cache_key, ex, ey, app_title, s_hash
                     )
                     result.update(success=True, x=ex, y=ey,
                                   method_used="coordinate_estimation", cached=False)
@@ -1028,8 +1054,8 @@ class AdaptiveController:
     # 4. learn_ui_pattern
     # =====================================================================
 
-    def learn_ui_pattern(self, pattern_name: str, x: int, y: int,
-                         app_title: str, screenshot_hash: str) -> None:
+    async def learn_ui_pattern(self, pattern_name: str, x: int, y: int,
+                               app_title: str, screenshot_hash: str) -> None:
         """Cache a UI element location for future fast lookups.
 
         Args:
@@ -1038,6 +1064,7 @@ class AdaptiveController:
             app_title: Title of the window where this pattern was found.
             screenshot_hash: Perceptual hash of the screenshot context.
         """
+        await self._ensure_patterns_loaded()
         self.known_ui_patterns[pattern_name] = {
             "x": x,
             "y": y,
@@ -1047,7 +1074,7 @@ class AdaptiveController:
             "created": datetime.now().isoformat(),
             "last_used": datetime.now().isoformat(),
         }
-        self._save_patterns()
+        await self._save_patterns_async()
         logger.debug("Learned UI pattern '%s' at (%d, %d) for '%s'",
                       pattern_name, x, y, app_title)
 
@@ -1055,12 +1082,13 @@ class AdaptiveController:
     # 5. get_learned_patterns
     # =====================================================================
 
-    def get_learned_patterns(self) -> dict:
+    async def get_learned_patterns(self) -> dict:
         """Return all learned UI patterns with their hit counts and metadata.
 
         Returns:
             dict mapping pattern_name -> {x, y, app_title, hits, last_used, ...}
         """
+        await self._ensure_patterns_loaded()
         return {
             name: {**info}
             for name, info in self.known_ui_patterns.items()
@@ -1245,7 +1273,7 @@ class AdaptiveController:
     # 8. suggest_action
     # =====================================================================
 
-    def suggest_action(self, context: dict, goal: str) -> list[dict]:
+    async def suggest_action(self, context: dict, goal: str) -> list[dict]:
         """Given the current context and a goal, suggest a sequence of actions.
 
         Args:
@@ -1257,6 +1285,7 @@ class AdaptiveController:
         Returns:
             List of step dicts suitable for execute_task_sequence().
         """
+        await self._ensure_patterns_loaded()
         state = context.get("detected_state", "desktop")
         goal_lower = goal.lower()
         steps: list[dict] = []

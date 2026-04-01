@@ -618,7 +618,7 @@ import asyncio as _asyncio
 import math as _math
 
 _SHARPE_THRESHOLD = 1.5       # minimum annualised Sharpe to promote a strategy
-_BACKTEST_TIMEOUT = 300       # seconds; subprocess timeout for backtest script
+# Backtest wall clock: env EVOLVER_BACKTEST_TIMEOUT (default 30s via evolver_firewall)
 _SKILL_LIB_INDEX = BASE / ".skill_library" / "index.json"
 _SKILL_LIB_SKILLS = BASE / ".skill_library" / "skills"
 
@@ -760,6 +760,15 @@ def _run_subprocess_backtest(
     import json as _json
     import tempfile
 
+    from evolver_firewall import get_backtest_timeout_sec, validate_strategy_file
+
+    ok_ast, ast_msg = validate_strategy_file(Path(script_path))
+    if not ok_ast:
+        log.error("AST firewall rejected %s: %s", script_path, ast_msg)
+        return {"sharpe": -999, "error": f"AST blocked: {ast_msg}"}
+
+    _bt_timeout = get_backtest_timeout_sec()
+
     tmp_data = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, encoding="utf-8"
     )
@@ -779,7 +788,7 @@ def _run_subprocess_backtest(
             [sys.executable, script_path],
             capture_output=True,
             text=True,
-            timeout=_BACKTEST_TIMEOUT,
+            timeout=_bt_timeout,
             cwd=str(BASE),
             env=env,
         )
@@ -797,7 +806,10 @@ def _run_subprocess_backtest(
                     continue
         return {"sharpe": -999, "error": "No JSON found in stdout"}
     except subprocess.TimeoutExpired:
-        return {"sharpe": -999, "error": "Backtest timed out"}
+        return {
+            "sharpe": -999,
+            "error": f"Backtest timed out (>{_bt_timeout}s, treated as hang)",
+        }
     except Exception as e:
         return {"sharpe": -999, "error": str(e)[:500]}
     finally:
@@ -946,6 +958,8 @@ class InfiniteEvolver:
         import copy
         import random
 
+        from evolver_firewall import get_backtest_timeout_sec
+
         try:
             from trading.backtest_engine import quick_backtest, BacktestConfig
         except ImportError:
@@ -983,7 +997,13 @@ class InfiniteEvolver:
         log.info("V6 mutation: testing %s", {k: mutant[k] for k in to_mutate})
 
         try:
-            result = await quick_backtest(mutant)
+            result = await _asyncio.wait_for(
+                quick_backtest(mutant),
+                timeout=float(get_backtest_timeout_sec()),
+            )
+        except _asyncio.TimeoutError:
+            log.error("V6 quick_backtest exceeded timeout (dead-loop guard)")
+            return
         except Exception as e:
             log.warning("V6 backtest failed: %s", e)
             return
@@ -1046,8 +1066,19 @@ class InfiniteEvolver:
 
     async def _sweep_codegen(self) -> None:
         """Classic codegen hypothesis pipeline."""
+        from evolver_firewall import (
+            get_backtest_timeout_sec,
+            try_acquire_daily_slot,
+            validate_strategy_file,
+        )
+
         hypothesis = await self._generate_hypothesis()
         if not hypothesis:
+            return
+
+        ok_q, qmsg = try_acquire_daily_slot("infinite_codegen")
+        if not ok_q:
+            log.warning("InfiniteEvolver codegen skipped (quota): %s", qmsg)
             return
 
         skill_id = f"sk_auto_{int(time.time())}"
@@ -1068,14 +1099,31 @@ class InfiniteEvolver:
 
         script_path = str(BASE / target_path)
 
+        ok_ast, ast_msg = validate_strategy_file(Path(script_path))
+        if not ok_ast:
+            log.error("InfiniteEvolver: AST firewall failed on %s: %s", script_path, ast_msg)
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
+            return
+
         # Try real backtest engine first, fall back to subprocess
         sharpe = -999.0
         backtest: dict = {}
+        _tmo = float(get_backtest_timeout_sec())
         try:
             from trading.backtest_engine import quick_backtest
             from trading.okx_executor import AgentState
-            backtest = await quick_backtest(AgentState().strategy_params)
+            backtest = await _asyncio.wait_for(
+                quick_backtest(AgentState().strategy_params),
+                timeout=_tmo,
+            )
             sharpe = float(backtest.get("sharpe", -999))
+        except _asyncio.TimeoutError:
+            log.error("InfiniteEvolver: quick_backtest timed out (>%ss)", _tmo)
+            backtest = {"sharpe": -999, "error": "quick_backtest timeout"}
+            sharpe = -999.0
         except Exception:
             backtest = await _asyncio.to_thread(
                 _run_subprocess_backtest, script_path, []
@@ -1092,6 +1140,8 @@ class InfiniteEvolver:
                 os.unlink(script_path)
             except OSError:
                 pass
+            if "timed out" in str(err).lower() or "timeout" in str(err).lower():
+                log.error("Destroyed strategy script after hang/timeout: %s", script_path)
             return
 
         genetics = _load_genetics()

@@ -987,6 +987,15 @@ def main():
         pre_bot_pid = _get_bot_pid()
         task_start_ms = int(time.time() * 1000)
 
+        from evolver_firewall import try_acquire_daily_slot
+
+        ok_q, qmsg = try_acquire_daily_slot("smart_task")
+        if not ok_q:
+            log.warning("Smart evolver: %s — sleeping 1h", qmsg)
+            tg(f"🛑 每日进化配额已满: {qmsg}\n⏳ 1小时后重试")
+            time.sleep(3600)
+            continue
+
         result, response_text = run_task(task, state)
 
         task_exec_ms = int(time.time() * 1000) - task_start_ms

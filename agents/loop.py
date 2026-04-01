@@ -326,9 +326,12 @@ async def self_evolve(
     try:
         from agents.consciousness import get_self_awareness
         a = get_self_awareness()
-        idx = a.record_evolution("self_evolve", f"Self-evolution: {focus or 'general improvement'}")
+        idx = await a.record_evolution_async(
+            "self_evolve",
+            f"Self-evolution: {focus or 'general improvement'}",
+        )
         success = "PASS" in result or "✅" in result
-        a.record_evolution_outcome(idx, success, result[:200])
+        await a.record_evolution_outcome_async(idx, success, result[:200])
     except Exception:
         pass
 

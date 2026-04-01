@@ -13,6 +13,7 @@ singularity_engine.py — 奇点主循环（异步）
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -34,6 +35,31 @@ PROMOTED_DIR = BASE / "models" / "singularity_promoted"
 # 晋升阈值（可调）
 DEFAULT_MAX_VAL_LOSS = 0.65
 DEFAULT_MIN_VAL_WIN_RATE = 0.52
+
+# Blocking filesystem work (large copytree) must not run on the asyncio loop.
+_singularity_fs_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _get_singularity_fs_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _singularity_fs_executor
+    if _singularity_fs_executor is None:
+        _singularity_fs_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="singularity_fs",
+        )
+    return _singularity_fs_executor
+
+
+def _promote_run_dir_sync(src: Path, dst: Path, promoted_meta: Dict[str, Any]) -> None:
+    """rmtree + copytree + promoted.json (runs in ThreadPoolExecutor)."""
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    (dst / "promoted.json").write_text(
+        json.dumps(promoted_meta, indent=2),
+        encoding="utf-8",
+    )
+
 
 # ── 内置隔离训练脚本（Codex 失败或未启用时使用）──────────────────────────────
 
@@ -411,11 +437,16 @@ async def run_daemon(interval_sec: float = 3600.0, **engine_kw: Any) -> None:
 
 
 def run_sandbox_training_episodes(n: int = 3) -> List[Dict[str, Any]]:
-    """兼容旧 API：同步跑 n 次子进程训练（非 RL rollout）。"""
-    out: List[Dict[str, Any]] = []
-    for _ in range(max(1, n)):
-        out.append(asyncio.run(SingularityEngine(use_codex=False).run_cycle()))
-    return out
+    """兼容旧 API：同步跑 n 次子进程训练（单事件循环，避免嵌套 asyncio.run）。"""
+
+    async def _sequential() -> List[Dict[str, Any]]:
+        eng = SingularityEngine(use_codex=False)
+        out: List[Dict[str, Any]] = []
+        for _ in range(max(1, n)):
+            out.append(await eng.run_cycle())
+        return out
+
+    return asyncio.run(_sequential())
 
 
 if __name__ == "__main__":
