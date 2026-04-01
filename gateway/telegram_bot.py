@@ -33,6 +33,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from telegram import Update
@@ -73,6 +74,20 @@ from gateway.handlers.router import (
 from tracker.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
+
+
+def _load_gateway_env() -> None:
+    """Load repo-root ``.env`` then CWD ``.env`` (``override=False`` — shell env wins)."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    root = Path(__file__).resolve().parent.parent
+    p = root / ".env"
+    if p.is_file():
+        load_dotenv(p, override=False)
+    load_dotenv(override=False)
+
 
 # Fast path：长官一键平账（脊髓反射，不经 Jarvis LLM）
 _LEDGER_RESYNC_TRIGGERS_CN = ("校准", "平账", "同步账本")
@@ -223,7 +238,9 @@ def _gw_schedule(application: Application, coro) -> None:
 
 async def _gw_post_init(application: Application) -> None:
     """PTB lifecycle hook: polling loop is ready; force-refresh slash command menu."""
-    logger.info("Gateway Telegram post_init — polling loop ready")
+    logger.info(
+        "Gateway Telegram: polling loop ready — Telegram API link up (post_init)."
+    )
     await sync_slash_command_menu(application.bot)
     await start_auto_research_background(application)
 
@@ -946,14 +963,26 @@ class TelegramBot:
 
 
 def main() -> None:
+    _load_gateway_env()
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         level=logging.INFO,
     )
     mode = (os.environ.get("GATEWAY_UI") or "panel").strip().lower()
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
+        logger.error(
+            "TELEGRAM_BOT_TOKEN missing: put it in repo-root .env or export it before "
+            "running python -m gateway.telegram_bot."
+        )
         raise SystemExit("TELEGRAM_BOT_TOKEN is required.")
+    logger.info(
+        "Gateway Telegram: TELEGRAM_BOT_TOKEN loaded from environment (communications online; len=%d).",
+        len(token),
+    )
+    logger.info(
+        "Fast Path Initialized: FAST_COMMANDS (dashboard/refresh) + trade_panel triggers active."
+    )
 
     if mode in ("terminal", "bloomberg", "conv", "state"):
         from gateway.terminal_ui import build_terminal_application
