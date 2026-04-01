@@ -228,3 +228,19 @@ def render_strategy_text(mode: str) -> str:
             "· 详细执行逻辑见项目内 `trading/` 与 `live_trader` 配置。"
         )
     return f"{banner}\n\n{body}"
+
+
+# ─── Legacy ``tg_gw_*`` names (was ``gateway.tg_panel``) ─────────────────────
+tg_gw_escape_v2 = escape_v2
+tg_gw_mode_label = mode_label
+tg_gw_build_main_keyboard = build_main_keyboard
+tg_gw_build_back_keyboard = build_back_keyboard
+tg_gw_build_positions_keyboard = build_positions_keyboard
+tg_gw_render_home_text = render_home_text
+tg_gw_render_positions_text = render_positions_text
+tg_gw_render_strategy_text = render_strategy_text
+
+
+def tg_gw_render_callback_pending_text() -> str:
+    """Deprecated: gateway uses plain ``⏳ 正在切换…`` in ``telegram_bot``."""
+    return tg_gw_escape_v2("⏳ 正在切换…")

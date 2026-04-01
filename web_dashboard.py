@@ -1,7 +1,7 @@
 """
 Flask web dashboard for bot performance monitoring (http://localhost:8080).
 
-Separated from ``gateway.tg_panel`` so the Telegram gateway does not import Flask.
+Separated from ``gateway.tg_front`` so the Telegram gateway does not import Flask.
 """
 
 from __future__ import annotations
