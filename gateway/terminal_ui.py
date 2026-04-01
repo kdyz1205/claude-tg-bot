@@ -2,6 +2,10 @@
 Terminal-style Telegram UI: ConversationHandler state machine, in-place edits,
 address interceptor, and Telegram API throttling.
 
+Slash menu与可选 ``auto_research`` 后台与面板共用 ``gateway.gateway_lifecycle``（
+``GATEWAY_AUTO_RESEARCH`` / ``GATEWAY_AUTO_RESEARCH_NOTIFY_CHAT_ID``）。
+全局命令（group -2）：``/help`` ``/trade`` ``/config`` ``/feed`` ``/dev``（复用 ``telegram_bot`` 处理器）。
+
 Callback routing (prefix ``term:`` to avoid clashes with bot.py):
   term:main_menu
   term:view_positions
@@ -37,7 +41,17 @@ from telegram.ext import (
     filters,
 )
 
+from gateway.gateway_lifecycle import (
+    cancel_auto_research_background,
+    mark_gateway_user_activity,
+    start_auto_research_background,
+    sync_slash_command_menu,
+)
+from gateway.telegram_bot import cmd_config, cmd_dev, cmd_feed, cmd_help, cmd_trade
+
 logger = logging.getLogger(__name__)
+
+_GLOBAL_COMMAND_GROUP = -2
 
 
 def _allowed_user_ids() -> set[int]:
@@ -395,6 +409,22 @@ async def _edit_or_send_panel(
 # ── Handlers ─────────────────────────────────────────────────────────────────-
 
 
+async def _terminal_post_init(application: Application) -> None:
+    logger.info("Terminal UI post_init — menu sync + optional auto_research")
+    await sync_slash_command_menu(application.bot)
+    await start_auto_research_background(application)
+
+
+async def _terminal_post_shutdown(application: Application) -> None:
+    await cancel_auto_research_background(application)
+    try:
+        from pipeline.god_orchestrator import stop_autonomous_engine
+
+        await stop_autonomous_engine()
+    except Exception:
+        logger.exception("Terminal post_shutdown: god engine stop failed")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.effective_chat or not update.effective_user:
         return ConversationHandler.END
@@ -403,6 +433,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if update.message:
             await update.message.reply_text("⛔ 未授权使用此网关机器人。")
         return ConversationHandler.END
+    mark_gateway_user_activity()
     chat_id = update.effective_chat.id
     s = get_session(uid)
     s.active_screen = "main"
@@ -451,7 +482,10 @@ async def global_address_interceptor(
         return
     if not _is_authorized(update.effective_user.id):
         return
+    mark_gateway_user_activity()
     text = update.message.text or ""
+    if text.strip().startswith("/"):
+        return
     evm, sol = extract_contract_addresses(text)
     if not evm and not sol:
         return
@@ -504,6 +538,7 @@ async def on_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not _is_authorized(uid):
         await q.answer("⛔ 未授权", show_alert=True)
         return ConversationHandler.END
+    mark_gateway_user_activity()
     data = q.data
     s = get_session(uid)
 
@@ -602,6 +637,7 @@ async def on_non_address_text(
 ) -> int:
     """Keep conversation state; no extra messages (terminal stays in-place)."""
     uid = update.effective_user.id if update.effective_user else 0
+    mark_gateway_user_activity()
     s = get_session(uid)
     return {
         "main": TerminalState.MAIN_MENU,
@@ -625,7 +661,22 @@ def _terminal_text_handler() -> MessageHandler:
 
 
 def build_terminal_application(token: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_terminal_post_init)
+        .post_shutdown(_terminal_post_shutdown)
+        .build()
+    )
+
+    for cmd, fn in (
+        ("help", cmd_help),
+        ("trade", cmd_trade),
+        ("config", cmd_config),
+        ("feed", cmd_feed),
+        ("dev", cmd_dev),
+    ):
+        app.add_handler(CommandHandler(cmd, fn), group=_GLOBAL_COMMAND_GROUP)
 
     conv = ConversationHandler(
         entry_points=[

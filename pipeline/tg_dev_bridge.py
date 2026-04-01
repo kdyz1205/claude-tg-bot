@@ -188,6 +188,31 @@ async def process_dev_task(
                 _register_factor_skills_from_git, result.modified_files, prompt
             )
         if result.ok and result.modified_files:
+            import os
+
+            if (os.environ.get("JARVIS_QUEUE_SESSION_COMMANDER") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                try:
+                    from session_commander import append_jarvis_pending_command
+
+                    _drain = (os.environ.get("JARVIS_QUEUE_DRAIN_SESSION") or "").strip() or None
+                    append_jarvis_pending_command(
+                        prompt=(prompt or "")[:8000],
+                        source="jarvis_gateway_dev_ok",
+                        sub_intent=sub_intent,
+                        chat_id=chat_id,
+                        modified_files=result.modified_files,
+                        drain_session=_drain,
+                        extra={
+                            "hint": "Review git diff, run tests, integrate with skill_library / evolver.",
+                        },
+                    )
+                except Exception as ex:
+                    _logger.warning("session_commander jarvis queue append failed: %s", ex)
             text = "✅ 自动编程完成。您的代码库已被修改。"
         else:
             text = format_telegram_report(result)

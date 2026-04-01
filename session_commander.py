@@ -20,6 +20,7 @@ import hashlib
 import requests
 import subprocess
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -79,6 +80,16 @@ DEFAULT_CONFIG = {
     "dry_run": False,                  # If True, log clicks but don't execute them
     "rate_limit_plan_requests_per_hour": 50,  # Known plan limit (adjust as needed)
     "rate_limit_usage_log": str(Path(__file__).parent / "_usage_timestamps.json"),
+    # Jarvis / 网关造物任务入队，供 session_commander 或其它消费者 pop 后送入 Claude Code
+    "jarvis_pending_commands": [],
+    # monitor/watch 在会话空闲时是否自动把队列首条送入 Claude（也可用环境变量开启）
+    "jarvis_auto_consume": False,
+    # 若为空字符串或省略键，则使用 target_session
+    "jarvis_drain_target_session": "",
+    # 按 sub_intent 路由到不同 Claude 侧边栏会话名；可含 "default" / "_default"
+    "jarvis_drain_routes": {},
+    # 非空时：本 watch/monitor 进程只消费 resolve 后等于该名的队列项（多进程并行 drain）
+    "jarvis_consumer_filter_session": "",
 }
 
 def load_config():
@@ -100,6 +111,307 @@ def save_config(cfg):
         f.flush()
         os.fsync(f.fileno())
     os.replace(str(tmp), str(CONFIG_PATH))
+
+
+@contextmanager
+def _jarvis_queue_lock():
+    """跨进程互斥：用独占创建目录（Windows / POSIX 均可用）保护队列读写。"""
+    lock_dir = CONFIG_PATH.parent / ".session_commander_jarvis.lockdir"
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + float(os.environ.get("JARVIS_QUEUE_LOCK_TIMEOUT_SEC", "60"))
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            break
+        except FileExistsError:
+            if time.time() > deadline:
+                raise TimeoutError("jarvis queue lock timeout") from None
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
+
+
+_JARVIS_PENDING_MAX = int(os.environ.get("JARVIS_PENDING_QUEUE_MAX", "50"))
+
+
+def _session_names_match(a, b):
+    return (a or "").strip().casefold() == (b or "").strip().casefold()
+
+
+def jarvis_consumer_filter_session_resolved():
+    env = (os.environ.get("SESSION_COMMANDER_JARVIS_FILTER_SESSION") or "").strip()
+    if env:
+        return env
+    c = load_config().get("jarvis_consumer_filter_session")
+    return (c or "").strip() if isinstance(c, str) else ""
+
+
+def resolve_jarvis_drain_session(item, cfg, monitor_fallback_session):
+    """
+    解析本条任务应送达的 Claude 会话名。
+    优先级：entry.drain_session → jarvis_drain_routes[sub_intent] → routes.default →
+    jarvis_drain_target_session → monitor_fallback_session → target_session
+    """
+    if isinstance(item, dict):
+        ds = (item.get("drain_session") or "").strip()
+        if ds:
+            return ds
+    routes = cfg.get("jarvis_drain_routes") if isinstance(cfg, dict) else {}
+    if not isinstance(routes, dict):
+        routes = {}
+    if isinstance(item, dict):
+        sub = item.get("sub_intent")
+        if sub is not None:
+            k = str(sub).strip()
+            for key in (k, k.upper()):
+                if key in routes:
+                    v = routes[key]
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+        for dk in ("default", "_default"):
+            if dk in routes:
+                v = routes[dk]
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    g = (cfg.get("jarvis_drain_target_session") or "").strip() if isinstance(cfg, dict) else ""
+    if g:
+        return g
+    fb = (monitor_fallback_session or "").strip()
+    if fb:
+        return fb
+    return str((cfg or {}).get("target_session") or "")
+
+
+def select_jarvis_queue_index(cfg, monitor_session):
+    """
+    返回 (index, item_copy)。若配置了 consumer filter，则扫描队列找第一条
+    resolve 后与 filter 匹配的项（支持多 watch 并行消费不同会话）。
+    """
+    q = cfg.get("jarvis_pending_commands")
+    if not isinstance(q, list) or not q:
+        return -1, None
+    filt = jarvis_consumer_filter_session_resolved()
+    for i, raw in enumerate(q):
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        target = resolve_jarvis_drain_session(item, cfg, monitor_session)
+        if not filt:
+            return i, item
+        if _session_names_match(target, filt):
+            return i, item
+    return -1, None
+
+
+def _jarvis_item_identity_tuple(item):
+    if not isinstance(item, dict):
+        return None
+    return (
+        item.get("created_at"),
+        item.get("source"),
+        hash(item.get("prompt") or ""),
+    )
+
+
+def append_jarvis_pending_command(
+    prompt,
+    source="jarvis_gateway",
+    sub_intent=None,
+    chat_id=None,
+    modified_files=None,
+    extra=None,
+    drain_session=None,
+):
+    """
+    Append one entry to ``jarvis_pending_commands`` in session_commander_config.json.
+
+    Called by Telegram 造物桥（见 ``JARVIS_QUEUE_SESSION_COMMANDER=1``）或其它自动化。
+    ``drain_session`` 可显式指定目标会话（覆盖路由表）。
+    """
+    global CFG
+    with _jarvis_queue_lock():
+        cfg = load_config()
+        q = cfg.get("jarvis_pending_commands")
+        if not isinstance(q, list):
+            q = []
+        entry = {
+            "source": str(source)[:120],
+            "prompt": str(prompt or "")[:8000],
+            "sub_intent": sub_intent,
+            "chat_id": chat_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        ds = (drain_session or "").strip() if drain_session else ""
+        if ds:
+            entry["drain_session"] = ds[:500]
+        if modified_files:
+            entry["modified_files"] = [str(x)[:500] for x in modified_files[:40]]
+        if extra and isinstance(extra, dict):
+            meta = {}
+            for i, (k, v) in enumerate(extra.items()):
+                if i >= 15:
+                    break
+                if isinstance(k, str) and k.isidentifier():
+                    meta[k] = str(v)[:800]
+            if meta:
+                entry["meta"] = meta
+        q.append(entry)
+        if len(q) > _JARVIS_PENDING_MAX:
+            del q[0 : len(q) - _JARVIS_PENDING_MAX]
+        cfg["jarvis_pending_commands"] = q
+        save_config(cfg)
+    CFG = load_config()
+    return entry
+
+
+def pop_next_jarvis_pending_command():
+    """FIFO pop; returns None if queue empty."""
+    global CFG
+    with _jarvis_queue_lock():
+        cfg = load_config()
+        q = cfg.get("jarvis_pending_commands")
+        if not isinstance(q, list) or not q:
+            return None
+        item = q.pop(0)
+        cfg["jarvis_pending_commands"] = q
+        save_config(cfg)
+    CFG = load_config()
+    return item
+
+
+def list_jarvis_pending_commands():
+    """Return a shallow copy of the pending queue (for CLI / status)."""
+    with _jarvis_queue_lock():
+        cfg = load_config()
+        q = cfg.get("jarvis_pending_commands")
+        if not isinstance(q, list):
+            return []
+        return list(q)
+
+
+def peek_next_jarvis_pending_command():
+    """Return a copy of the next queue item without removing it (FIFO head, 无视 filter)."""
+    with _jarvis_queue_lock():
+        cfg = load_config()
+        q = cfg.get("jarvis_pending_commands")
+        if not isinstance(q, list) or not q:
+            return None
+        first = q[0]
+        return dict(first) if isinstance(first, dict) else None
+
+
+_JARVIS_SEND_MAX = int(os.environ.get("JARVIS_PENDING_SEND_MAX_CHARS", "14000"))
+
+
+def format_jarvis_pending_for_send(item, resolved_target=""):
+    """Turn a queue entry into one paste block for Claude Code."""
+    lines = [
+        "[Jarvis / Telegram 造物队列]",
+        f"source: {item.get('source', '')}",
+    ]
+    if resolved_target:
+        lines.append(f"resolved_session: {resolved_target}")
+    lines.extend(
+        [
+            f"sub_intent: {item.get('sub_intent', '')}",
+            f"created_at: {item.get('created_at', '')}",
+            "",
+            "--- user prompt ---",
+            str(item.get("prompt") or "")[: _JARVIS_SEND_MAX],
+        ]
+    )
+    mfiles = item.get("modified_files")
+    if isinstance(mfiles, list) and mfiles:
+        lines.append("")
+        lines.append("--- modified_files ---")
+        for p in mfiles[:35]:
+            lines.append(f"• {p}")
+    meta = item.get("meta")
+    if isinstance(meta, dict) and meta:
+        lines.append("")
+        lines.append("--- meta ---")
+        for k, v in list(meta.items())[:12]:
+            lines.append(f"{k}: {v}")
+    body = "\n".join(lines)
+    if len(body) > _JARVIS_SEND_MAX + 2000:
+        body = body[: _JARVIS_SEND_MAX + 2000] + "\n…(truncated)"
+    return body
+
+
+def jarvis_auto_consume_enabled():
+    env = (os.environ.get("SESSION_COMMANDER_JARVIS_AUTO") or "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    return bool(load_config().get("jarvis_auto_consume"))
+
+
+def try_send_jarvis_pending_on_idle(session: str) -> str:
+    """
+    If queue non-empty and auto-consume on: send formatted message to Claude, then pop.
+
+    Returns: none | disabled | dry_run | jarvis_sent | error
+    """
+    global CFG, _last_prod_time
+
+    if not jarvis_auto_consume_enabled():
+        return "disabled"
+
+    with _jarvis_queue_lock():
+        cfg = load_config()
+        idx, item = select_jarvis_queue_index(cfg, session)
+        if idx < 0 or not item:
+            return "none"
+        identity = _jarvis_item_identity_tuple(item)
+        target = resolve_jarvis_drain_session(item, cfg, session)
+        item_copy = dict(item)
+        is_dry = bool(cfg.get("dry_run"))
+
+    if is_dry:
+        print(
+            f"[DRY-RUN] Would send jarvis queue item from {item_copy.get('source')} "
+            f"→ session '{target}' idx={idx} ({len(format_jarvis_pending_for_send(item_copy, resolved_target=target))} chars)"
+        )
+        return "dry_run"
+
+    msg = format_jarvis_pending_for_send(item_copy, resolved_target=target)
+    ok = send_to_session(msg, target)
+    if not ok:
+        print("[JARVIS-QUEUE] Send failed; item left in queue")
+        return "error"
+
+    with _jarvis_queue_lock():
+        cfg = load_config()
+        q = cfg.get("jarvis_pending_commands")
+        if not isinstance(q, list) or idx >= len(q):
+            print("[JARVIS-QUEUE] Warning: queue shrunk after send; could not pop by index")
+        else:
+            cur = q[idx]
+            if isinstance(cur, dict) and _jarvis_item_identity_tuple(cur) == identity:
+                q.pop(idx)
+                cfg["jarvis_pending_commands"] = q
+                save_config(cfg)
+            else:
+                print("[JARVIS-QUEUE] Warning: queue entry changed after send; not popping")
+
+    CFG = load_config()
+    _last_prod_time = time.time()
+    try:
+        send_photo(
+            "current_screen.png",
+            f"Jarvis queue → '{target}'\n{item_copy.get('source', '')}",
+        )
+    except Exception:
+        pass
+    print(f"[JARVIS-QUEUE] Sent and popped idx={idx}: {item_copy.get('source', '')}")
+    return "jarvis_sent"
+
 
 CFG = load_config()
 
@@ -1077,6 +1389,12 @@ def monitor_and_prod(session=None, prod_msg=None):
 
     if is_idle:
         print(f"[IDLE] {reason}")
+        jq = try_send_jarvis_pending_on_idle(session)
+        if jq == "jarvis_sent":
+            return "jarvis_sent"
+        if jq == "dry_run":
+            return "jarvis_dry_run"
+
         success = send_to_session(prod_msg, session)
         if success:
             _last_prod_time = time.time()
@@ -1106,6 +1424,15 @@ def monitor_loop(session=None, interval=30):
     print(f"[MONITOR] Monitoring paths: {CFG['monitored_paths']}")
     print(f"[MONITOR] Safe click zone: Y [{CFG.get('safe_click_y_min', 80)}-{CFG.get('safe_click_y_max', _SCREEN_H-50)}]")
     print(f"[MONITOR] Dry run: {CFG.get('dry_run', False)}")
+    print(
+        f"[MONITOR] Jarvis queue auto-consume: {jarvis_auto_consume_enabled()} "
+        f"(config jarvis_auto_consume or SESSION_COMMANDER_JARVIS_AUTO=1)"
+    )
+    _jf = jarvis_consumer_filter_session_resolved()
+    print(
+        f"[MONITOR] Jarvis consumer filter: {(repr(_jf) if _jf else '(none — FIFO head)')} "
+        f"| SESSION_COMMANDER_JARVIS_FILTER_SESSION / jarvis_consumer_filter_session"
+    )
     print(f"[MONITOR] Press Ctrl+C to stop")
 
     # Initialize file snapshot
@@ -1170,6 +1497,12 @@ if __name__ == "__main__":
         print("  session_commander.py rate-status          - Show rate limit status")
         print("  session_commander.py rate-reset           - Clear rate limit cooldown")
         print("  session_commander.py rate-simulate-hit    - Simulate a rate limit hit")
+        print("  session_commander.py jarvis-queue         - List Jarvis 造物待发送队列 (JSON)")
+        print("  session_commander.py jarvis-pop           - Pop one entry (FIFO) and print JSON")
+        print("  session_commander.py jarvis-peek          - Show next queue item without removing")
+        print("  session_commander.py jarvis-auto <on|off> - Toggle jarvis_auto_consume in config")
+        print("  session_commander.py jarvis-routes       - Show jarvis_drain_routes + filter")
+        print("  session_commander.py jarvis-filter [clear|<name>] - Show/set consumer filter session")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -1293,6 +1626,54 @@ if __name__ == "__main__":
         print("[TEST] Simulating rate limit hit...")
         wait = rate_scheduler.on_limit_hit()
         print(f"[TEST] Would sleep {wait/60:.1f} minutes until reset")
+
+    elif cmd == "jarvis-queue":
+        print(json.dumps(list_jarvis_pending_commands(), indent=2, ensure_ascii=False))
+
+    elif cmd == "jarvis-pop":
+        item = pop_next_jarvis_pending_command()
+        if item is None:
+            print("[]")
+        else:
+            print(json.dumps(item, indent=2, ensure_ascii=False))
+
+    elif cmd == "jarvis-peek":
+        p = peek_next_jarvis_pending_command()
+        print(json.dumps(p, indent=2, ensure_ascii=False) if p else "null")
+
+    elif cmd == "jarvis-auto":
+        if len(sys.argv) < 3:
+            print("Usage: session_commander.py jarvis-auto <on|off>")
+            sys.exit(1)
+        on = sys.argv[2].strip().lower() in ("on", "1", "true", "yes")
+        CFG["jarvis_auto_consume"] = on
+        save_config(CFG)
+        CFG = load_config()
+        print(f"[OK] jarvis_auto_consume = {on}")
+
+    elif cmd == "jarvis-routes":
+        out = {
+            "jarvis_drain_routes": CFG.get("jarvis_drain_routes"),
+            "jarvis_drain_target_session": CFG.get("jarvis_drain_target_session"),
+            "jarvis_consumer_filter_session": CFG.get("jarvis_consumer_filter_session"),
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+
+    elif cmd == "jarvis-filter":
+        if len(sys.argv) < 3:
+            print(json.dumps(CFG.get("jarvis_consumer_filter_session") or "", ensure_ascii=False))
+        else:
+            val = " ".join(sys.argv[2:]).strip()
+            if val.lower() in ("", "clear", "none", "-"):
+                CFG["jarvis_consumer_filter_session"] = ""
+            else:
+                CFG["jarvis_consumer_filter_session"] = val
+            save_config(CFG)
+            CFG = load_config()
+            print(
+                "[OK] jarvis_consumer_filter_session =",
+                json.dumps(CFG.get("jarvis_consumer_filter_session") or "", ensure_ascii=False),
+            )
 
     else:
         # Legacy: treat first arg as session name, rest as message

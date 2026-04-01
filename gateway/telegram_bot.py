@@ -8,6 +8,17 @@ Telegram Gateway — PTB：极简全自动看板。
 - 引擎启停：`TradeScheduler`（live/paper 由 ``USER_MODE`` 决定）；紧急停止后调用
   ``hard_risk_kill.hard_kill`` 尝试 OKX 全平。
 
+环境变量（可选）：
+  ``GATEWAY_TELEGRAM_USER_IDS`` — 逗号分隔 uid，空则不限。
+  ``GATEWAY_AUTO_RESEARCH`` — 设为 1/true 时在本进程启动 ``auto_research`` 空闲实验循环。
+  ``GATEWAY_AUTO_RESEARCH_NOTIFY_CHAT_ID`` — 实验结果 Telegram 通知 chat id。
+  ``JARVIS_INTENT_LLM`` — 设为 1/true 且已配置 OpenAI/Anthropic 时，对「疑似闲聊」做一次 LLM 意图纠错。
+  ``JARVIS_INTENT_MODEL`` — 覆盖默认小模型（OpenAI 默认 ``gpt-4o-mini``，Anthropic 默认 haiku）。
+  ``JARVIS_QUEUE_SESSION_COMMANDER`` — 造物任务成功且产生文件变更时，向 ``jarvis_pending_commands`` 入队。
+  ``JARVIS_QUEUE_DRAIN_SESSION`` — 入队项显式 ``drain_session``（覆盖路由表）。
+  ``SESSION_COMMANDER_JARVIS_FILTER_SESSION`` — 本机 watch 只消费 resolve 后等于该名的任务（并行 drain）。
+  ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
+
 Run:   python -m gateway.telegram_bot
 """
 
@@ -43,6 +54,13 @@ from gateway.tg_front import (
     escape_v2,
     render_dashboard_text,
     render_risk_settings_text,
+)
+from gateway.gateway_lifecycle import (
+    auto_research_env_enabled,
+    cancel_auto_research_background,
+    mark_gateway_user_activity,
+    start_auto_research_background,
+    sync_slash_command_menu,
 )
 from tracker.session_store import SessionStore
 
@@ -96,11 +114,15 @@ _ALLOWED = _allowed_user_ids()
 
 
 async def _gw_post_init(application: Application) -> None:
-    """PTB lifecycle hook: polling loop is ready."""
+    """PTB lifecycle hook: polling loop is ready; force-refresh slash command menu."""
     logger.info("Gateway Telegram post_init — polling loop ready")
+    await sync_slash_command_menu(application.bot)
+    await start_auto_research_background(application)
 
 
 async def _gw_post_shutdown(application: Application) -> None:
+    await cancel_auto_research_background(application)
+
     try:
         from pipeline.god_orchestrator import stop_autonomous_engine
 
@@ -341,6 +363,81 @@ async def _gw_panel_work(
             logger.warning("gateway panel error edit failed: %s", e2)
 
 
+async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dedicated /trade handler — never routed through Jarvis plain-text."""
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
+        return
+    mark_gateway_user_activity()
+    await update.message.reply_text(
+        "⚔️ *手动交易*\n"
+        "• 直接发自然语言指令（买/卖/平仓等），Jarvis 会走交易意图通道。\n"
+        "• 或发送 `/start` 打开主控面板与引擎控制。\n"
+        "• 链接情绪分析可用 `/feed` 或单独一条 http(s) 链接。",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
+        return
+    mark_gateway_user_activity()
+    global USER_MODE
+    store = await _session_store_async(context.application)
+    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
+    import live_trader
+
+    cfg = live_trader._load_config()
+    await update.message.reply_text(
+        render_risk_settings_text(USER_MODE, cfg),
+        reply_markup=build_risk_keyboard(USER_MODE),
+        parse_mode="MarkdownV2",
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
+        return
+    mark_gateway_user_activity()
+    ar_on = auto_research_env_enabled()
+    ar_line = (
+        "• 自主实验循环：`GATEWAY_AUTO_RESEARCH=1` 启动（与主 bot 同源 `auto_research`）；"
+        "可选 `GATEWAY_AUTO_RESEARCH_NOTIFY_CHAT_ID` 接收 TG 通知。\n"
+        if ar_on
+        else "• 自主实验：设环境变量 `GATEWAY_AUTO_RESEARCH=1` 可在本进程启动后台研究循环。\n"
+    )
+    await update.message.reply_text(
+        "📖 *Jarvis 网关速查*\n\n"
+        "/start — 主控面板（持仓、引擎启停、刷新）\n"
+        "/trade — 手动交易说明\n"
+        "/config — 风控与参数（纸/实盘模式切换）\n"
+        "/feed — 链接或正文情绪分析\n"
+        "/dev — 开发/因子造物任务\n\n"
+        f"{ar_line}"
+        "自然语言会按意图分流（策略/因子→造物引擎；买卖→交易提示）；"
+        "以 `/` 开头的消息只走命令处理器。\n"
+        "日志调试：分类结果带 `reasoning` 字段（见网关 debug 日志）。\n"
+        "• LLM 二次分流：`JARVIS_INTENT_LLM=1` + API Key，可减少「策略长文被判成闲聊」。\n"
+        "• 研发→桌面 Claude：`JARVIS_QUEUE_SESSION_COMMANDER=1` 入队；`jarvis-auto on` 或 "
+        "`SESSION_COMMANDER_JARVIS_AUTO=1` 后，`watch`/`monitor` 空闲时自动粘贴到目标会话。\n"
+        "`jarvis-queue` / `jarvis-peek` / `jarvis-pop` 手动查看与取出。\n"
+        "• 实验室：`AUTO_RESEARCH_LAB=1 AUTO_RESEARCH_SKIP_IDLE=1 python auto_research.py`；轮换知识域加 `AUTO_RESEARCH_LAB_ROTATE=1`。\n"
+        "• 路由：`session_commander_config.json` 里 `jarvis_drain_routes`（如 FACTOR_FORGE→会话名）；并行消费用 `jarvis-filter` 或环境变量 FILTER。",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global USER_MODE
     if not update.effective_user or not update.message:
@@ -349,6 +446,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(uid):
         await update.message.reply_text("⛔ 未授权使用此网关机器人。")
         return
+    mark_gateway_user_activity()
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
     snap, st, stats = _dashboard_sync()
@@ -373,6 +471,7 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(uid):
         await update.message.reply_text("⛔ 未授权使用此网关机器人。")
         return
+    mark_gateway_user_activity()
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
     from gateway.sentiment_feed import process_sentiment_feed
@@ -404,6 +503,7 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(uid):
         await update.message.reply_text("⛔ 未授权使用此网关机器人。")
         return
+    mark_gateway_user_activity()
     raw = (update.message.text or "").strip()
     m = _DEV_CMD.match(raw)
     prompt = (m.group(1) if m else "").strip()
@@ -479,8 +579,12 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     uid = update.effective_user.id
     if not _is_authorized(uid):
         return
+    mark_gateway_user_activity()
     text = (update.message.text or "").strip()
     if not text:
+        return
+    # 斜杠指令必须由 CommandHandler 处理；此处杜绝误入 Jarvis 语义层（含漏注册或边界情况）
+    if text.startswith("/"):
         return
 
     from gateway.jarvis_semantic import (
@@ -508,6 +612,13 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     async with user_semantic_lock(uid):
         row = await classify_intent(text, uid=uid)
         intent = str(row.get("intent") or "CHAT").upper()
+        logger.debug(
+            "jarvis_route uid=%s intent=%s sub=%s reasoning=%s",
+            uid,
+            intent,
+            row.get("sub_intent"),
+            row.get("reasoning"),
+        )
 
         if intent == "CHAOS_IMMUNITY":
             await update.message.reply_text(
@@ -590,6 +701,7 @@ async def handle_gateway_callback(
     if not _is_authorized(uid):
         await query.answer("⛔ 未授权", show_alert=True)
         return
+    mark_gateway_user_activity()
 
     parsed = _parse_gw_callback(query.data or "")
     if not parsed:
@@ -635,7 +747,11 @@ class TelegramBot:
             .post_shutdown(_gw_post_shutdown)
             .build()
         )
+        # CommandHandler 必须在全局 MessageHandler 之前注册，保证斜杠指令绝对优先
         app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("trade", cmd_trade))
+        app.add_handler(CommandHandler("config", cmd_config))
+        app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("feed", cmd_feed))
         app.add_handler(CommandHandler("dev", cmd_dev))
         app.add_handler(
