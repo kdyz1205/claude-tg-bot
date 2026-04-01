@@ -93,6 +93,7 @@ _restart.ps1
 action_memory.json
 evolution_log.jsonl
 _risk_events.jsonl
+.funding_carry_signals.jsonl
 
 # Knowledge and session data
 .knowledge/
