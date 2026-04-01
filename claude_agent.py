@@ -502,16 +502,22 @@ async def async_claude_code_prompt(
     cwd: str | None = None,
     resume: str | None = None,
     timeout_sec: float | None = None,
+    wall_cap_sec: float | None = None,
 ) -> tuple[str, str, str | None]:
     """
     One local ``claude -p`` round-trip under ``CLI_SEMAPHORE``.
     stdin=DEVNULL (non-interactive); stdout/stderr PIPE; ``wait_for`` + kill on timeout.
+    ``wall_cap_sec`` raises the default 45s ceiling when set (e.g. gateway CHAT).
     Returns ``(text, stderr_tail, session_id)``.
     """
     from pipeline.cli_bridge import find_claude_executable
 
     tlim = float(timeout_sec) if timeout_sec is not None else _cli_hard_timeout()
-    tlim = max(5.0, min(45.0, tlim))
+    if wall_cap_sec is None:
+        _cap = 45.0
+    else:
+        _cap = max(5.0, min(600.0, float(wall_cap_sec)))
+    tlim = max(5.0, min(_cap, tlim))
 
     exe = find_claude_executable()
     if not Path(exe).is_file():
@@ -623,6 +629,102 @@ async def async_claude_code_prompt(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+_GATEWAY_CLI_AUTH_HINTS = (
+    "not logged in",
+    "not authenticated",
+    "auth failed",
+    "login required",
+    "invalid x-api-key",
+    "环境变量丢失",
+    "api key 发给",
+)
+
+
+async def jarvis_gateway_cli_chat(
+    system_prompt: str,
+    user_text: str,
+    *,
+    chat_id: int,
+    timeout_sec: float,
+) -> tuple[str, str]:
+    """
+    Telegram gateway CHAT: one ``claude -p`` turn with per-``chat_id`` ``--resume`` (``_claude_sessions``).
+
+    Returns ``(reply, "")`` on success, or ``("", diag)`` where ``diag`` is
+    ``auth`` | ``cli_missing`` | ``timeout`` | ``empty`` | ``error`` for callers to map UX.
+    """
+    sys_t = (system_prompt or "").strip()
+    usr_t = (user_text or "").strip()
+    if not usr_t:
+        return "", ""
+
+    from pipeline.cli_bridge import find_claude_executable
+
+    exe = find_claude_executable()
+    if not Path(exe).is_file():
+        logger.warning("jarvis_gateway_cli_chat: executable missing: %s", exe)
+        return "", "cli_missing"
+
+    resume = _normalize_cli_resume_id(_claude_sessions.get(chat_id))
+    cap = max(15.0, min(600.0, float(timeout_sec)))
+
+    combined = (
+        "=== GATEWAY SYSTEM INSTRUCTIONS ===\n"
+        f"{sys_t[:180_000]}\n\n"
+        "=== USER MESSAGE ===\n"
+        f"{usr_t[:200_000]}"
+    )
+
+    try:
+        r_text, err_tail, sid_new = await async_claude_code_prompt(
+            combined,
+            cwd=BOT_PROJECT_DIR,
+            resume=resume,
+            timeout_sec=cap,
+            wall_cap_sec=cap,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("jarvis_gateway_cli_chat asyncio.TimeoutError chat_id=%s", chat_id)
+        return "", "timeout"
+    except Exception as e:
+        logger.exception("jarvis_gateway_cli_chat transport chat_id=%s: %s", chat_id, e)
+        return "", "error"
+
+    err_l = (err_tail or "").lower()
+    out = (r_text or "").strip()
+    blob_l = (out + "\n" + (err_tail or "")).lower()
+
+    if "timeout" in err_l or "timeout after" in err_l:
+        return "", "timeout"
+
+    if not out:
+        if "claude cli not found" in err_l or "not found" in err_l and "claude" in err_l:
+            return "", "cli_missing"
+        if any(h in blob_l for h in _GATEWAY_CLI_AUTH_HINTS):
+            _claude_sessions.pop(chat_id, None)
+            _session_timestamps.pop(chat_id, None)
+            _save_sessions()
+            return "", "auth"
+        logger.warning(
+            "jarvis_gateway_cli_chat empty output chat_id=%s err=%s",
+            chat_id,
+            (err_tail or "")[:500],
+        )
+        return "", "empty"
+
+    if len(out) < 300 and any(h in out.lower() for h in _GATEWAY_CLI_AUTH_HINTS):
+        _claude_sessions.pop(chat_id, None)
+        _session_timestamps.pop(chat_id, None)
+        _save_sessions()
+        return "", "auth"
+
+    if sid_new:
+        _set_session(chat_id, sid_new)
+        _save_sessions()
+
+    return out, ""
 
 
 async def reask_trade_json_via_cli(round_idx: int, previous_output: str) -> str:

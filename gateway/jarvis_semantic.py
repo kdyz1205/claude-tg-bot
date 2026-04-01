@@ -6,8 +6,8 @@ messages that would otherwise be CHAT (small JSON classification call).
 
 v2: broader quant / 造物 routing, secondary spec detector, ``reasoning`` on every path.
 
-CHAT 对话走 ``llm_http_client.complete_turn``；可选 ``JARVIS_CHAT_MODEL``、
-``JARVIS_CHAT_TIMEOUT_SEC``（秒，默认参考 ``config.API_REQUEST_TIMEOUT_SEC``）。
+CHAT 对话走本地 ``claude`` CLI（``claude_agent.jarvis_gateway_cli_chat``，订阅会话 / ``--resume``）；
+可选 ``JARVIS_CHAT_TIMEOUT_SEC``（秒，默认参考 ``config.API_REQUEST_TIMEOUT_SEC``，上限 600）。
 """
 
 from __future__ import annotations
@@ -411,7 +411,7 @@ async def execute_trade_from_user_text(
     return False, "请在主机器人或专用交易流程中下单；网关面板仅展示与引擎控制。"
 
 
-# 网关日常对话：经 llm_http_client.complete_turn（aiohttp，与 agents/sessions 同栈）
+# 网关日常对话：经本地 Claude Code CLI（与 claude_agent 同栈，无计费 HTTP complete_turn）
 _JARVIS_CHAT_SYSTEM = """你是 Jarvis，长官的专属高频量化作战副官。
 
 风格（强制）：
@@ -423,7 +423,12 @@ _JARVIS_CHAT_SYSTEM = """你是 Jarvis，长官的专属高频量化作战副官
 
 回答长度默认控制在必要最小；若长官明确要求深度推演再展开。"""
 
-_JARVIS_CHAT_ERR_USER = "LLM 节点连接失败或超时"
+_JARVIS_CHAT_ERR_USER = "本地 CLI 未就绪、超时或无输出；请确认本机已登录 Claude Code 并可用 `claude` 命令。"
+_JARVIS_CHAT_ERR_AUTH = (
+    "本地 CLI 未登录或订阅会话失效。请在终端运行 `claude` 完成登录，并确认订阅有效。"
+)
+_JARVIS_CHAT_ERR_CLI = "未检测到本机 `claude` 可执行文件。请安装 Claude Code CLI 或将其加入 PATH。"
+_JARVIS_CHAT_ERR_TIMEOUT = "本地 CLI 响应超时。请稍后重试或检查本机网络与订阅状态。"
 
 # 与 agents.sessions 的 8_000_000+ 虚拟 id 错开，按 Telegram uid 稳定映射多轮记忆
 _JARVIS_GW_CHAT_BASE = 71_000_000
@@ -451,45 +456,56 @@ def _jarvis_chat_timeout_sec() -> float:
 
 async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
     """
-    网关 CHAT 意图：真实 LLM 一轮（带 per-uid HTTP 会话记忆）。
+    网关 CHAT 意图：本地 ``claude -p`` 一轮（per-uid 合成 chat_id + CLI ``--resume`` 记忆）。
 
     成功: (reply_text, "")
-    失败: ("", _JARVIS_CHAT_ERR_USER) — 细节只写日志，交给外层展示统一文案。
+    失败: ("", user_message) — 按场景给出订阅 / CLI 提示；细节写日志。
     """
     t = (text or "").strip()
     if not t:
         return "", ""
 
-    import llm_http_client
+    import claude_agent
 
     chat_id = _jarvis_gateway_chat_id(uid)
-    model_hint = (os.environ.get("JARVIS_CHAT_MODEL") or "").strip() or None
+    timeout_sec = _jarvis_chat_timeout_sec()
 
     try:
-        assistant_text, _sid, err = await llm_http_client.complete_turn(
+        reply, diag = await claude_agent.jarvis_gateway_cli_chat(
+            _JARVIS_CHAT_SYSTEM,
+            t[:120_000],
             chat_id=chat_id,
-            system_prompt=_JARVIS_CHAT_SYSTEM,
-            user_text=t[:120_000],
-            model_hint=model_hint,
-            timeout_sec=_jarvis_chat_timeout_sec(),
+            timeout_sec=timeout_sec,
         )
     except asyncio.TimeoutError:
         logger.warning("jarvis chat_reply asyncio.TimeoutError uid=%s", uid)
-        return "", _JARVIS_CHAT_ERR_USER
+        return "", _JARVIS_CHAT_ERR_TIMEOUT
     except Exception as e:
         logger.exception("jarvis chat_reply transport uid=%s: %s", uid, e)
         return "", _JARVIS_CHAT_ERR_USER
 
-    if err:
+    if diag == "auth":
+        logger.warning("jarvis chat_reply CLI auth uid=%s chat_id=%s", uid, chat_id)
+        return "", _JARVIS_CHAT_ERR_AUTH
+    if diag == "cli_missing":
+        logger.warning("jarvis chat_reply CLI missing uid=%s chat_id=%s", uid, chat_id)
+        return "", _JARVIS_CHAT_ERR_CLI
+    if diag == "timeout":
+        logger.warning("jarvis chat_reply CLI timeout uid=%s chat_id=%s", uid, chat_id)
+        return "", _JARVIS_CHAT_ERR_TIMEOUT
+    if diag in ("empty", "error"):
         logger.warning(
-            "jarvis chat_reply LLM err uid=%s chat_id=%s: %s",
+            "jarvis chat_reply CLI fail uid=%s chat_id=%s diag=%s",
             uid,
             chat_id,
-            (err or "")[:800],
+            diag,
         )
         return "", _JARVIS_CHAT_ERR_USER
+    if diag:
+        logger.warning("jarvis chat_reply unknown diag uid=%s: %s", uid, diag)
+        return "", _JARVIS_CHAT_ERR_USER
 
-    out = (assistant_text or "").strip()
+    out = (reply or "").strip()
     if not out:
         logger.warning("jarvis chat_reply empty assistant uid=%s chat_id=%s", uid, chat_id)
         return "", _JARVIS_CHAT_ERR_USER
