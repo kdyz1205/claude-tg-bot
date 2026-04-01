@@ -1,9 +1,8 @@
 """
 Declarative mapping: Telegram command name(s) → handler attribute name on bot.py.
 
-仅注册核心斜杠 ``/start`` 与 ``/trade``（及 ``/t``）。其余 ``/…`` 不注册
-CommandHandler，由 ``bot.py`` 的 ``MessageHandler(filters.COMMAND, …)`` 交给
-``handle_message`` → 主对话 / Jarvis；避免「幽灵斜杠」绕过语义层。
+Blueprint：仅 ``/start``、``/trade`` 注册为 CommandHandler；其它斜杠由
+``handle_unknown_slash_command`` 提示；自然语言走 ``jarvis_plain_text_entry`` → Jarvis。
 """
 
 from __future__ import annotations
@@ -12,10 +11,9 @@ from typing import Any, Callable
 
 from telegram.ext import Application, CommandHandler
 
-# (command names..., handler_dict_key) — 仅此两条硬接线
 COMMAND_BINDINGS: list[tuple[tuple[str, ...], str]] = [
-    (("start",), "start"),
-    (("trade", "t"), "trade_dashboard_command"),
+    (("start",), "jarvis_start"),
+    (("trade",), "jarvis_trade"),
 ]
 
 
