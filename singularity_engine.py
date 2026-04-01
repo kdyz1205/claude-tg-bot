@@ -4,7 +4,9 @@ singularity_engine.py — 奇点主循环（异步）
 流程：
   1) await skills.sk_academic_researcher.run_skill() → 架构 + codex 提示
   2) 可选：codex_charger.CodexCharger.run_task() 从回复抽取 Python → 否则使用内置 PyTorch 训练模板
-  3) 在 harness/singularity_isolated/run_*/ 下写入 arch.json + train.py 并子进程隔离执行
+  3) 在 harness/singularity_isolated/run_*/ 下写入 arch.json + train.py；
+     训练由 ``ProcessPoolExecutor`` + ``loop.run_in_executor`` 执行，外层
+     ``asyncio.wait_for(..., EVOLVER_HEAVY_ASYNC_TIMEOUT 默认 30s)`` 熔断，避免拖死 TG 事件循环
   4) 读取 metrics.json，按 val_loss / val_win_rate 决定是否晋升到 models/singularity_promoted/
 
 与 Multi-Agent 兼容：使用 asyncio.Lock、状态文件 _singularity_engine_state.json、可注入 notify 回调。
@@ -48,6 +50,54 @@ def _get_singularity_fs_executor() -> concurrent.futures.ThreadPoolExecutor:
             thread_name_prefix="singularity_fs",
         )
     return _singularity_fs_executor
+
+
+_singularity_train_pool: concurrent.futures.ProcessPoolExecutor | None = None
+
+
+def _get_singularity_train_pool() -> concurrent.futures.ProcessPoolExecutor:
+    """Run train.py (NumPy/torch loops) off the bot asyncio thread."""
+    global _singularity_train_pool
+    if _singularity_train_pool is None:
+        _singularity_train_pool = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+    return _singularity_train_pool
+
+
+def _singularity_run_train_sync(run_dir: str) -> Dict[str, Any]:
+    """Worker-process entry: ``subprocess.run(train.py)`` with wall-clock cap."""
+    from evolver_firewall import get_heavy_async_timeout_sec
+
+    rd = Path(run_dir)
+    train_py = rd / "train.py"
+    fuse = int(get_heavy_async_timeout_sec())
+    sub_timeout = max(5, fuse - 2)
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    try:
+        r = subprocess.run(
+            [sys.executable, str(train_py)],
+            cwd=str(rd),
+            capture_output=True,
+            text=True,
+            timeout=sub_timeout,
+            env=env,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return {
+            "returncode": r.returncode,
+            "stdout": r.stdout or "",
+            "stderr": r.stderr or "",
+            "subprocess_timeout": False,
+        }
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout if isinstance(e.stdout, str) else ""
+        err = e.stderr if isinstance(e.stderr, str) else ""
+        return {
+            "returncode": -1,
+            "stdout": out,
+            "stderr": err + "\n[singularity: train.py wall timeout]",
+            "subprocess_timeout": True,
+        }
 
 
 def _promote_run_dir_sync(src: Path, dst: Path, promoted_meta: Dict[str, Any]) -> None:
@@ -362,17 +412,31 @@ class SingularityEngine:
         (run_dir / "arch.json").write_text(json.dumps(architecture, indent=2, ensure_ascii=False), encoding="utf-8")
         (run_dir / "train.py").write_text(script_body, encoding="utf-8")
 
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(run_dir / "train.py"),
-            cwd=str(run_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "PYTHONUTF8": "1"},
-        )
-        out_b, err_b = await proc.communicate()
-        stdout = (out_b or b"").decode("utf-8", errors="replace")
-        stderr = (err_b or b"").decode("utf-8", errors="replace")
+        from evolver_firewall import get_heavy_async_timeout_sec
+
+        loop = asyncio.get_running_loop()
+        pool = _get_singularity_train_pool()
+        fuse = get_heavy_async_timeout_sec()
+        try:
+            train_out = await asyncio.wait_for(
+                loop.run_in_executor(pool, _singularity_run_train_sync, str(run_dir.resolve())),
+                timeout=fuse,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "singularity train asyncio fuse exceeded (>%ss); pool worker may still finish",
+                fuse,
+            )
+            train_out = {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"asyncio_timeout_after_{fuse}s",
+                "subprocess_timeout": True,
+            }
+
+        train_rc = int(train_out.get("returncode", -1))
+        stdout = str(train_out.get("stdout") or "")
+        stderr = str(train_out.get("stderr") or "")
 
         metrics_path = run_dir / "metrics.json"
         metrics: Dict[str, Any] = {}
@@ -384,14 +448,14 @@ class SingularityEngine:
         else:
             metrics = {
                 "missing_metrics": True,
-                "returncode": proc.returncode,
+                "returncode": train_rc,
                 "stderr_tail": stderr[-1500:],
                 "stdout_tail": stdout[-1500:],
             }
 
         promoted = False
         reason = "criteria_not_met"
-        if proc.returncode == 0 and not metrics.get("missing_metrics"):
+        if train_rc == 0 and not metrics.get("missing_metrics"):
             vl = float(metrics.get("val_loss", 99))
             vw = float(metrics.get("val_win_rate", 0))
             if vl <= self.max_val_loss and vw >= self.min_val_win_rate:
@@ -409,7 +473,7 @@ class SingularityEngine:
             else:
                 reason = f"val_loss={vl:.4f} (need <= {self.max_val_loss}) or win_rate={vw:.4f} (need >= {self.min_val_win_rate})"
         else:
-            reason = f"subprocess_exit_{proc.returncode}"
+            reason = f"subprocess_exit_{train_rc}"
 
         record = {
             "run_id": run_id,

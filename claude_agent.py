@@ -38,6 +38,15 @@ logger = logging.getLogger(__name__)
 # 全库唯一 CLI 飞行：禁止并发多个 claude-code 进程（内存与交互爆炸）
 CLI_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(1)
 
+# Windows/npm.cmd: argv for ``-p`` must stay small (~8k) or CreateProcess fails with
+# "The command line is too long." Long prompts spill to a temp file (see async_claude_code_prompt).
+_CLI_PROMPT_INLINE_MAX = int(
+    os.environ.get(
+        "CLAUDE_CLI_PROMPT_INLINE_MAX",
+        "6000" if os.name == "nt" else "24000",
+    )
+)
+
 # ─── Screenshot Forwarding ────────────────────────────────────────────────────
 
 _TG_SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tg_screenshots")
@@ -507,10 +516,9 @@ async def async_claude_code_prompt(
     if not body:
         return "", "empty prompt", None
 
-    max_inline = 24000
     tmp_path: str | None = None
     try:
-        if len(body) > max_inline:
+        if len(body) > _CLI_PROMPT_INLINE_MAX:
             import tempfile
 
             fd, tmp_path = tempfile.mkstemp(

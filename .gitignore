@@ -56,6 +56,7 @@ _vital_signs.json
 _watcher_state.json
 _watcher.lock
 _performance_stats.json
+_signal_history.json
 _error_log.txt
 _bot_subprocess_stderr.log
 _evolution_queue.json

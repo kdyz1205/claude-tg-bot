@@ -529,6 +529,45 @@ class OKXExecutor:
             "instId": inst_id,
         }
 
+    async def limping_fuse_flatten_short(
+        self,
+        symbol: str,
+        *,
+        reason: str = "limping_leg_fuse",
+        max_verify_rounds: int = 8,
+    ) -> dict:
+        """
+        Circuit breaker: OKX short leg succeeded but DEX failed — **immediately** market-reduce
+        exchange exposure (no waiting on local retry loops), then run verified flatten until flat.
+        """
+        inst_id = self._inst_id(symbol)
+        out: dict[str, Any] = {
+            "ok": False,
+            "verified": False,
+            "instId": inst_id,
+            "force_reduce": None,
+            "verified_pass": None,
+        }
+        if self.state.mode == "live" and self.has_api_keys():
+            try:
+                fr = await self.force_reduce_live_net(symbol)
+                out["force_reduce"] = fr
+            except Exception as e:
+                log.warning("limping_fuse force_reduce_live_net %s: %s", inst_id, e)
+                out["force_reduce"] = {"ok": False, "reason": str(e)}
+        verified = await self.emergency_flatten_short_verified(
+            symbol, reason=reason, max_rounds=max_verify_rounds
+        )
+        out["verified_pass"] = verified
+        out["verified"] = bool(isinstance(verified, dict) and verified.get("verified"))
+        out["ok"] = bool(isinstance(verified, dict) and verified.get("ok"))
+        out["reason"] = (
+            verified.get("reason", "fuse_complete")
+            if isinstance(verified, dict)
+            else "verified_not_dict"
+        )
+        return out
+
     async def close_position(self, symbol: str, reason: str = "SIGNAL") -> dict:
         async with self._lock:
             if symbol not in self.state.positions:
@@ -1049,6 +1088,13 @@ class OKXDeltaNeutralExecutor:
     ) -> dict[str, Any]:
         return await self._ex.emergency_flatten_short_verified(
             symbol, reason=reason, max_rounds=max_rounds
+        )
+
+    async def limping_fuse_flatten_short(
+        self, symbol: str, *, reason: str = "limping_leg_fuse", max_verify_rounds: int = 8
+    ) -> dict[str, Any]:
+        return await self._ex.limping_fuse_flatten_short(
+            symbol, reason=reason, max_verify_rounds=max_verify_rounds
         )
 
     async def close(self) -> None:

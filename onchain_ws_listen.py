@@ -1,10 +1,14 @@
 """
-Real-time chain listeners via WebSocket (no periodic HTTP block explorer polling).
+Real-time chain listeners via WebSocket.
 
-- EVM (ETH / BSC): AsyncWeb3 + WebSocketProvider, eth_subscribe on logs + newHeads.
-- Solana: solana.rpc.websocket_api logs_subscribe (mentions) + RPC get_transaction for enrichment.
+- EVM (ETH / BSC): AsyncWeb3 + ``wss://`` WebSocketProvider, ``eth_subscribe`` on logs + newHeads.
+- Solana: ``logs_subscribe`` (mentions) over WSS; tx bodies via Solana JSON-RPC (not used for spot quotes).
 
-Each chain runner uses ``while True`` with try/except and backoff reconnect.
+Each chain runner: **outer** ``while tracker._running`` + ``try/except`` + **exponential backoff**
+(``_reconnect_sleep_s``) so a dropped socket or hub error cannot leave the radar idle forever.
+
+Smart-money path: stablecoin/SOL/USDC/USDT only — no HTTP price APIs. Spot USD for majors comes from
+``onchain_tracker._get_prices`` → OKX public **ticker WebSocket** hub.
 """
 
 from __future__ import annotations
@@ -53,6 +57,19 @@ _erc20_decimals_cache: dict[str, int] = {}
 
 def _reconnect_sleep_s(attempt: int) -> float:
     return min(120.0, 2.0 ** min(attempt, 7)) + random.uniform(0, 2.0)
+
+
+def _evm_stable_symbol_decimals(network: str, contract: str) -> tuple[str, int] | None:
+    """Known main-net stables only — smart-money WS path skips all other ERC-20 (no HTTP quote)."""
+    cmap = _STABLE_CONTRACTS_ETH if network == "eth" else _STABLE_CONTRACTS_BSC
+    try:
+        c = Web3.to_checksum_address(contract).lower()
+    except Exception:
+        c = (contract or "").lower()
+    for addr, pair in cmap.items():
+        if addr.lower() == c:
+            return pair
+    return None
 
 
 def _pad_addr_topic(addr: str) -> str:
@@ -335,7 +352,7 @@ async def _run_evm_ws_smart(
     from web3.providers.persistent import WebSocketProvider
     from web3.utils.subscriptions import LogsSubscription
 
-    import httpx
+    from onchain_tracker import _get_prices
 
     addrs = [a for a, m in tracker._wallets.items() if m.get("network") == network]
     if not addrs or not wss_url:
@@ -349,67 +366,63 @@ async def _run_evm_ws_smart(
     attempt = 0
     while tracker._running:
         try:
-            headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money_ws"}
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(25.0, connect=8.0),
-                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
-                headers=headers,
-            ) as http:
-                async with AsyncWeb3(WebSocketProvider(wss_url)) as w3:
-                    attempt = 0
-                    w3.subscription_manager.parallelize = True
+            async with AsyncWeb3(WebSocketProvider(wss_url)) as w3:
+                attempt = 0
+                w3.subscription_manager.parallelize = True
 
-                    async def on_in(ctx: Any) -> None:
-                        try:
-                            log = ctx.result
-                            topics = [
-                                t.hex() if hasattr(t, "hex") else str(t)
-                                for t in (log.get("topics") or [])
-                            ]
-                            if not topics or topics[0].lower() != TRANSFER_EVENT_TOPIC.lower():
-                                return
-                            c_raw = log.get("address")
-                            if not c_raw:
-                                return
-                            contract = Web3.to_checksum_address(c_raw)
-                            to_a = _topic_to_addr(topics[2]).lower()
-                            if to_a not in watched_in:
-                                return
-                            raw_amt = _raw_transfer_amount(log)
-                            if raw_amt <= 0:
-                                return
-                            try:
-                                dec = await _erc20_decimals(w3, contract)
-                            except Exception as e:
-                                logger.debug("smart decimals %s: %s", contract[:10], e)
-                                return
-                            txd = _synthetic_erc20_tx(
-                                log=log,
-                                topics=topics,
-                                token_symbol="UNKNOWN",
-                                decimals=dec,
-                                raw_amount=raw_amt,
-                                contract=contract,
-                            )
-                            addr, label = labels[to_a]
-                            sig = await tracker._classify_erc20_buy(
-                                http, txd, addr, label, network, await _get_prices_dict(http)
-                            )
-                            if sig:
-                                await tracker._ingest_smart_signal(sig)
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as e:
-                            logger.debug("smart on_in %s: %s", network, e)
+                async def on_in(ctx: Any) -> None:
+                    try:
+                        log = ctx.result
+                        topics = [
+                            t.hex() if hasattr(t, "hex") else str(t)
+                            for t in (log.get("topics") or [])
+                        ]
+                        if not topics or topics[0].lower() != TRANSFER_EVENT_TOPIC.lower():
+                            return
+                        c_raw = log.get("address")
+                        if not c_raw:
+                            return
+                        contract = Web3.to_checksum_address(c_raw)
+                        to_a = _topic_to_addr(topics[2]).lower()
+                        if to_a not in watched_in:
+                            return
+                        raw_amt = _raw_transfer_amount(log)
+                        if raw_amt <= 0:
+                            return
+                        sd = _evm_stable_symbol_decimals(network, contract)
+                        if not sd:
+                            return
+                        sym, dec = sd
+                        txd = _synthetic_erc20_tx(
+                            log=log,
+                            topics=topics,
+                            token_symbol=sym,
+                            decimals=dec,
+                            raw_amount=raw_amt,
+                            contract=contract,
+                        )
+                        if not txd:
+                            return
+                        addr, label = labels[to_a]
+                        prices = await _get_prices(None)
+                        sig = await tracker._classify_erc20_buy(
+                            txd, addr, label, network, prices
+                        )
+                        if sig:
+                            await tracker._ingest_smart_signal(sig)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.debug("smart on_in %s: %s", network, e)
 
-                    inc = LogsSubscription(
-                        topics=[TRANSFER_EVENT_TOPIC, None, topic_in],
-                        handler=on_in,
-                        label=f"smart-{network}-erc20-in",
-                    )
-                    await w3.subscription_manager.subscribe(inc)
-                    logger.info("SmartMoneyTracker WS connected (%s)", network)
-                    await w3.subscription_manager.handle_subscriptions(run_forever=True)
+                inc = LogsSubscription(
+                    topics=[TRANSFER_EVENT_TOPIC, None, topic_in],
+                    handler=on_in,
+                    label=f"smart-{network}-erc20-in",
+                )
+                await w3.subscription_manager.subscribe(inc)
+                logger.info("SmartMoneyTracker WS connected (%s)", network)
+                await w3.subscription_manager.handle_subscriptions(run_forever=True)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -426,12 +439,6 @@ async def _run_evm_ws_smart(
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 raise
-
-
-async def _get_prices_dict(client: Any) -> dict:
-    from onchain_tracker import _get_prices
-
-    return await _get_prices(client)
 
 
 async def _native_sol_delta_for_wallet(resp: Any, wallet: str) -> int:
@@ -579,8 +586,6 @@ async def _run_solana_ws_smart(
     from solders.rpc.responses import LogsNotification, SubscriptionResult
     from solana.rpc.websocket_api import connect
 
-    import httpx
-
     addrs = [a for a, m in tracker._wallets.items() if m.get("network") == "sol"]
     if not addrs or not wss_url or not http_rpc:
         logger.info("onchain_ws smart: skip sol")
@@ -591,44 +596,38 @@ async def _run_solana_ws_smart(
 
     while tracker._running:
         try:
-            headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money_sol_ws"}
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(25.0, connect=8.0),
-                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
-                headers=headers,
-            ) as http:
-                async with connect(wss_url) as ws:
-                    attempt = 0
-                    sub_id_to_addr: dict[int, str] = {}
-                    for addr in addrs:
-                        await ws.logs_subscribe(
-                            RpcTransactionLogsFilterMentions(Pubkey.from_string(addr))
-                        )
-                    sub_idx = 0
-                    while sub_idx < len(addrs):
-                        batch = await ws.recv()
-                        for msg in batch:
-                            if isinstance(msg, SubscriptionResult):
-                                sub_id_to_addr[int(msg.result)] = addrs[sub_idx]
-                                sub_idx += 1
+            async with connect(wss_url) as ws:
+                attempt = 0
+                sub_id_to_addr: dict[int, str] = {}
+                for addr in addrs:
+                    await ws.logs_subscribe(
+                        RpcTransactionLogsFilterMentions(Pubkey.from_string(addr))
+                    )
+                sub_idx = 0
+                while sub_idx < len(addrs):
+                    batch = await ws.recv()
+                    for msg in batch:
+                        if isinstance(msg, SubscriptionResult):
+                            sub_id_to_addr[int(msg.result)] = addrs[sub_idx]
+                            sub_idx += 1
 
-                    logger.info("SmartMoney Solana WS connected, %d log subscriptions", len(addrs))
+                logger.info("SmartMoney Solana WS connected, %d log subscriptions", len(addrs))
 
-                    while tracker._running:
-                        batch = await ws.recv()
-                        for msg in batch:
-                            if isinstance(msg, LogsNotification):
-                                sub_id = int(msg.subscription)
-                                addr = sub_id_to_addr.get(sub_id)
-                                if not addr:
-                                    continue
-                                if msg.result.value.err is not None:
-                                    continue
-                                sig_str = str(msg.result.value.signature)
-                                asyncio.create_task(
-                                    _sol_smart_process_sig(tracker, http, addr, sig_str, http_rpc, sem),
-                                    name=f"sol-smart-{sig_str[:8]}",
-                                )
+                while tracker._running:
+                    batch = await ws.recv()
+                    for msg in batch:
+                        if isinstance(msg, LogsNotification):
+                            sub_id = int(msg.subscription)
+                            addr = sub_id_to_addr.get(sub_id)
+                            if not addr:
+                                continue
+                            if msg.result.value.err is not None:
+                                continue
+                            sig_str = str(msg.result.value.signature)
+                            asyncio.create_task(
+                                _sol_smart_process_sig(tracker, addr, sig_str, http_rpc, sem),
+                                name=f"sol-smart-{sig_str[:8]}",
+                            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -648,7 +647,6 @@ async def _run_solana_ws_smart(
 
 async def _sol_smart_process_sig(
     tracker: Any,
-    http: Any,
     wallet: str,
     sig_str: str,
     http_rpc: str,
@@ -670,7 +668,9 @@ async def _sol_smart_process_sig(
             logger.debug("sol smart get_tx %s: %s", sig_str[:12], e)
             return
 
-    prices = await _get_prices_dict(http)
+    from onchain_tracker import _get_prices
+
+    prices = await _get_prices(None)
     label = tracker._wallets.get(wallet, {}).get("label", wallet[:8])
 
     pre_tb = []
@@ -698,7 +698,7 @@ async def _sol_smart_process_sig(
             "blockTime": int(time.time()),
             "dst": wallet,
         }
-        sig = await tracker._classify_sol_buy(http, fake, wallet, label, prices)
+        sig = await tracker._classify_sol_buy(fake, wallet, label, prices)
         if sig:
             await tracker._ingest_smart_signal(sig)
 
@@ -727,7 +727,7 @@ async def _sol_smart_process_sig(
                 "blockTime": int(time.time()),
                 "dst": wallet,
             }
-            sig2 = await tracker._classify_sol_buy(http, fake, wallet, label, prices)
+            sig2 = await tracker._classify_sol_buy(fake, wallet, label, prices)
             if sig2:
                 await tracker._ingest_smart_signal(sig2)
         except Exception as e:

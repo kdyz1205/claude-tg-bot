@@ -137,6 +137,166 @@ def format_chain_snapshot(snapshot: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_chain_compact(snapshot: dict[str, Any]) -> str:
+    """
+    Short overview for /chain first message (callbacks + keyboard).
+    No per-token enumeration — details go in format_chain_snapshot_chunks.
+    """
+    sp = float(snapshot.get("sol_price") or 0)
+    ox = snapshot.get("okx") or {}
+    dx = snapshot.get("dex") or {}
+    w = snapshot.get("wallet") or {}
+    poly = snapshot.get("poly") or {}
+    age = float(snapshot.get("age_sec") or 0)
+    lines: list[str] = ["【速览·四市场】", f"快照约 {age:.0f}s 前 · OKX ≠ 链上 ≠ DEX ≠ Poly"]
+
+    if ox.get("has_keys") and ox.get("ok"):
+        eq = float(ox.get("total_equity_usd") or 0)
+        u = float(ox.get("usdt_available") or 0)
+        np = len(ox.get("positions") or [])
+        lines.append(f"OKX: ~${_fmt_usd(eq)} · 可用 {u:.2f} USDT · 挂单/持仓 {np} 笔")
+    elif ox.get("has_keys") and not ox.get("ok"):
+        lines.append(f"OKX: 异常 {str(ox.get('error') or '?')[:72]}")
+    else:
+        lines.append("OKX: 未配置 API 密钥")
+
+    sol_bal = float(w.get("sol_bal") or 0)
+    tc = int(w.get("token_count") or 0)
+    pk = (w.get("pubkey_short") or "").strip() or "?"
+    usd_sol = sol_bal * sp if sp > 0 else 0.0
+    if w.get("ok"):
+        lines.append(f"Solana: {pk} · {sol_bal:.4f} SOL (~${_fmt_usd(usd_sol)}) · SPL {tc} 种")
+    else:
+        lines.append("Solana: 未就绪 → /wallet_setup")
+
+    dex_pos = list(dx.get("positions") or [])
+    dex_v = float(dx.get("total_value_sol") or 0)
+    if dex_pos:
+        lines.append(f"DEX 记账: {len(dex_pos)} 笔 · 约 {dex_v:.3f} SOL 敞口")
+    else:
+        lines.append("DEX 记账: 无跟踪仓")
+
+    if poly.get("configured"):
+        oe = "开" if poly.get("oracle_enabled") else "关"
+        lines.append(f"Polymarket: 已配置 · live 神谕 {oe}")
+    else:
+        lines.append("Polymarket: 未配置（可忽略）")
+
+    err = (snapshot.get("last_error") or "").strip()
+    if err:
+        lines.append(f"⚠ {err[:90]}")
+    return "\n".join(lines)
+
+
+def format_chain_snapshot_chunks(
+    snapshot: dict[str, Any], *, max_spl: int = 6
+) -> list[str]:
+    """
+    Split the chain snapshot into several Telegram-sized messages (headers OKX / Sol / DEX+Poly).
+    """
+    sp = float(snapshot.get("sol_price") or 0)
+    ox = snapshot.get("okx") or {}
+    dx = snapshot.get("dex") or {}
+    w = snapshot.get("wallet") or {}
+    poly = snapshot.get("poly") or {}
+    age = float(snapshot.get("age_sec") or 0)
+
+    chunks: list[str] = []
+
+    okx_lines: list[str] = [
+        "📊 明细 ①/③ · OKX · 中心化所",
+        f"（{age:.0f}s 前 · 与链上/DEX 不同账）",
+        "",
+    ]
+    okx_eq = float(ox.get("total_equity_usd") or 0)
+    if ox.get("has_keys") and ox.get("ok"):
+        okx_lines.append(f"权益 ~${_fmt_usd(okx_eq)} · 可用 USDT {float(ox.get('usdt_available') or 0):,.2f}")
+        for row in (ox.get("positions") or [])[:8]:
+            inst = row.get("instId") or "?"
+            upl = float(row.get("upl") or 0)
+            nu = float(row.get("notionalUsd") or 0)
+            em = "🟢" if upl >= 0 else "🔴"
+            sd = "空" if float(row.get("pos") or 0) < 0 else "多"
+            okx_lines.append(f" · {inst} {sd} 名义${nu:,.0f} 浮盈{em}${upl:+,.2f}")
+        if not (ox.get("positions") or []):
+            okx_lines.append(" · 无挂单持仓")
+    elif ox.get("has_keys") and not ox.get("ok"):
+        okx_lines.append(f"✗ {str(ox.get('error') or '?')[:120]}")
+    else:
+        okx_lines.append("未配置 API 密钥")
+    chunks.append("\n".join(okx_lines))
+
+    sol_lines: list[str] = [
+        "📊 明细 ②/③ · Solana · 链上钱包",
+        "（SPL 为钱包真实余额，非 DEX 策略账）",
+        "",
+    ]
+    sol_bal = float(w.get("sol_bal") or 0)
+    tc = int(w.get("token_count") or 0)
+    usd_sol = sol_bal * sp if sp > 0 else 0.0
+    pk = (w.get("pubkey_short") or "").strip() or "?"
+    if w.get("ok"):
+        sol_lines.append(f"{pk} · {sol_bal:.4f} SOL (~${_fmt_usd(usd_sol)}) · SPL {tc} 种")
+        for t in (w.get("tokens") or [])[:max_spl]:
+            lab = str(t.get("label") or "?")[:18].strip()
+            amt = float(t.get("amount") or 0)
+            m = (t.get("mint") or "").strip()
+            tail = f" ({m[:4]}…{m[-4:]})" if len(m) > 10 else ""
+            sol_lines.append(f" · {lab}{tail}  {_fmt_qty(amt)}")
+        if tc > max_spl:
+            sol_lines.append(f" · … 另有 {tc - max_spl} 种未列出")
+        if not (w.get("tokens") or []):
+            sol_lines.append(" · 无 SPL（或仅 SOL）")
+    else:
+        sol_lines.append("未就绪 → /wallet_setup")
+    chunks.append("\n".join(sol_lines))
+
+    dex_lines: list[str] = [
+        "📊 明细 ③/③ · DEX + Polymarket",
+        "",
+        "━━ DEX · 引擎/Jupiter 跟踪 ━━",
+        "（本地策略仓位；与 OKX、上方 SPL 不是同一套账）",
+    ]
+    dex_v = float(dx.get("total_value_sol") or 0)
+    dex_pos = list(dx.get("positions") or [])
+    if dex_pos:
+        dex_lines.append(f"共 {len(dex_pos)} 笔 · 约 {dex_v:.3f} SOL 敞口")
+        for p in sorted(dex_pos, key=lambda x: float(x.get("amount_sol", 0) or 0), reverse=True)[:8]:
+            sym = (p.get("symbol") or p.get("name") or "?")[:14]
+            amt = float(p.get("amount_sol", 0) or 0)
+            pnl = float(p.get("pnl_pct", 0) or 0)
+            em = "🟢" if pnl >= 0 else "🔴"
+            dex_lines.append(f" · {sym} {amt:.2f}SOL {em}{pnl:+.1f}%")
+    else:
+        dex_lines.append("无跟踪仓")
+    dex_lines.extend(["", "━━ Polymarket · Polygon CLOB ━━"])
+    if poly.get("configured"):
+        oe = "开" if poly.get("oracle_enabled") else "关"
+        dex_lines.append(f"密钥已配置 · live 神谕: {oe}")
+    else:
+        dex_lines.append("未配置（POLYMARKET_PRIVATE_KEY / POLY_PRIVATE_KEY）— 可忽略")
+    rec = list(poly.get("recent") or [])
+    if rec:
+        dex_lines.append("最近执行:")
+        for r in rec[:5]:
+            ts = float(r.get("ts") or 0)
+            tss = time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts > 0 else "—"
+            okm = "✓" if r.get("ok") else "✗"
+            tid = str(r.get("token_id") or "?")
+            dex_lines.append(f" · [{tss}] ~${float(r.get('stake_usd') or 0):.2f} {okm} {tid[:20]}")
+    else:
+        dex_lines.append("最近执行: 无")
+    perr = str(poly.get("error") or "").strip()
+    if perr:
+        dex_lines.append(f"⚠ Poly: {perr[:100]}")
+    chunks.append("\n".join(dex_lines))
+
+    err = (snapshot.get("last_error") or "").strip()
+    if err:
+        chunks.append(f"⚠ 快照提示\n{err[:200]}")
+    return chunks
+
+
 def format_portfolio_plain(snapshot: dict[str, Any]) -> str:
     """Plain-text fallback; mirrors format_chain_snapshot 分栏."""
     return format_chain_snapshot(snapshot)

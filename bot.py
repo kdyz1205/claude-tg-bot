@@ -3135,6 +3135,26 @@ _CHAIN_WALLET_CACHE_SEC = 40
 _CHAIN_DASHBOARD_CACHE_SEC = 45
 
 
+def _split_chain_message_body(text: str, limit: int = 3900) -> list[str]:
+    """Split a long dashboard tail into Telegram-safe chunks (prefer newline breaks)."""
+    t = (text or "").strip()
+    if not t:
+        return []
+    out: list[str] = []
+    while t:
+        if len(t) <= limit:
+            out.append(t)
+            break
+        cut = t.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunk = t[:cut].strip()
+        if chunk:
+            out.append(chunk)
+        t = t[cut:].lstrip("\n")
+    return [x for x in out if x]
+
+
 async def _resolve_chain_token_labels(tokens: list) -> list:
     """Build display rows for wallet SPL (symbol via DexScreener when available)."""
     if not tokens:
@@ -3157,8 +3177,14 @@ async def _resolve_chain_token_labels(tokens: list) -> list:
     return list(await asyncio.gather(*[_one(t) for t in tokens[:8]]))
 
 
-async def _build_chain_dashboard(user_id: int | None = None) -> str:
-    """Build on-chain dashboard from portfolio snapshot (no RPC/OKX in this coroutine)."""
+async def _build_chain_dashboard_parts(
+    user_id: int | None = None,
+) -> tuple[str, str, list[str]]:
+    """
+    Build /chain panel: full text for cache, first Telegram message (keyboard), follow-up chunks.
+
+    Follow-ups split OKX/Solana/DEX 资金明细 + 调度/模拟 tail so the panel is not one wall of text.
+    """
     now_ts = time.time()
     try:
         from trading.portfolio_snapshot import get_snapshot as _portfolio_get_snapshot
@@ -3263,75 +3289,100 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
             pass
 
     # ═══════════════════════════════════════
-    # BUILD THE DASHBOARD TEXT（单层快照 + 分块引擎/模拟，避免重复）
+    # BUILD: head（首条+按钮） / 资金明细分条 / ops（调度·引擎·模拟）
     # ═══════════════════════════════════════
-    L = []
+    import portfolio_manager as _pm
+
+    head: list[str] = []
     se = "🟢" if sol_chg >= 0 else "🔴"
     age_s = float(ps.get("age_sec", 0) or 0)
     snap_note = f"{age_s:.0f}s前" if ps.get("updated_at") else "未就绪"
     sched_lbl = "🔴实盘调度" if is_live else ("📝模拟交易开" if paper_on else "⚪未跑调度")
     ui_lbl = "界面强调·实盘" if ui_mode == "live" else "界面强调·模拟"
 
-    L.append("━━━━ /chain ━━━━")
+    head.append("━━━━ /chain ━━━━")
     if sol_price > 0:
-        L.append(
+        head.append(
             f"{se} SOL ${sol_price:.2f} ({sol_chg:+.1f}%)  ·  {sched_lbl}  ·  {ui_lbl}  ·  数据{snap_note}"
         )
     else:
-        L.append(f"SOL $--  ·  {sched_lbl}  ·  {ui_lbl}  ·  {snap_note}")
-    L.append("（上方状态：调度=是否跑 live_trader；界面=面板排版偏好；与 paper 假仓无关）")
+        head.append(f"SOL $--  ·  {sched_lbl}  ·  {ui_lbl}  ·  {snap_note}")
+    head.append("💡 调度=实盘循环 · 界面=排版偏好（与 paper 无关）")
     if not ps.get("updated_at"):
-        L.append("⏳ 首次同步约10–15s → 点 🔄 刷新")
+        head.append("⏳ 首次同步约10–15s → 点 🔄 刷新")
     err_ps = (ps.get("last_error") or "").strip()
     if err_ps:
-        L.append(f"⚠ {err_ps[:100]}")
-    L.append("")
+        head.append(f"⚠ {err_ps[:100]}")
+    head.append("")
 
     snap_ok = bool(ps.get("updated_at"))
+    snap_block_for_full: list[str] = []
+    snap_chunks: list[str] = []
+    first_mid: list[str] = []
+
     if snap_ok:
         try:
-            import portfolio_manager as _pm
-
-            L.append("【资金快照】OKX · Solana 链上 · DEX · Polymarket（分栏）")
-            L.append(_pm.format_chain_snapshot(ps))
-            L.append("")
+            first_mid = [
+                _pm.format_chain_compact(ps),
+                "",
+                "────────",
+                "📎 下列消息分条发送：OKX → Solana → DEX/Poly → 调度/模拟",
+            ]
+            snap_chunks = _pm.format_chain_snapshot_chunks(ps)
+            snap_block_for_full = [
+                "【资金快照】OKX · Solana 链上 · DEX · Polymarket（分栏）",
+                _pm.format_chain_snapshot(ps),
+                "",
+            ]
         except Exception:
             try:
-                import portfolio_manager as _pm
-
-                L.append(_pm.format_portfolio_plain(ps))
-                L.append("")
+                fb = _pm.format_portfolio_plain(ps)
+                snap_block_for_full = ["【资金快照】", fb, ""]
+                snap_chunks = _split_chain_message_body(fb, 3900)
+                first_mid = ["【速览】快照解析降级", "────────", "📎 完整分栏见下一条起"]
             except Exception:
-                pass
+                first_mid = ["⚠ 资金快照暂不可用 · 点 🔄 刷新", "────────", "📎 下方为引擎/模拟状态"]
     elif wallet_ok:
         usd = sol_bal * sol_price if sol_price > 0 else 0
-        L.append("【钱包】")
-        L.append(f"{pubkey[:6]}…{pubkey[-4:]}  {sol_bal:.4f} SOL ≈ ${usd:,.2f}")
-        L.append("")
+        snap_block_for_full = [
+            "【钱包】",
+            f"{pubkey[:6]}…{pubkey[-4:]}  {sol_bal:.4f} SOL ≈ ${usd:,.2f}",
+            "",
+        ]
+        first_mid = [
+            "【钱包】",
+            f"{pubkey[:6]}…{pubkey[-4:]}  {sol_bal:.4f} SOL ≈ ${usd:,.2f}",
+            "",
+            "────────",
+            "📎 引擎/模拟等见下一条起",
+        ]
+    else:
+        first_mid = ["────────", "📎 调度/模拟/脚页见下一条起"]
 
+    ops: list[str] = []
     if is_live:
         st0 = sched_state.get("start_time") or 0
         up_min = max(0, (now_ts - st0) / 60) if st0 else 0
-        L.append("📡 调度监控")
-        L.append(
+        ops.append("📡 调度监控")
+        ops.append(
             f"   运行 {int(up_min // 60)}h{int(up_min % 60):02d}m · "
             f"周期 {sched_state.get('total_scans', 0)} · 异常 {sched_state.get('errors', 0)}"
         )
         if live_stats:
             ls = live_stats
             emd = "🟢" if ls["daily_pnl_sol"] >= 0 else "🔴"
-            L.append(
+            ops.append(
                 f"{emd} 今日 {ls['daily_pnl_sol']:+.4f} SOL | 累计 {ls['total_pnl_sol']:+.4f} SOL | "
                 f"WR {ls['win_rate']:.0f}%"
             )
-            L.append(
+            ops.append(
                 f"   开局基准 {ls['starting_balance']:.4f} SOL · "
                 f"引擎 {ls['open_positions']}仓 · 已平 {ls['closed_trades']}"
             )
-        L.append("")
+        ops.append("")
 
         if live_open:
-            L.append(f"🔴 自动引擎仓 ({len(live_open)})")
+            ops.append(f"🔴 自动引擎仓 ({len(live_open)})")
             for p in sorted(live_open, key=lambda x: x.get("amount_sol", 0) or 0, reverse=True)[:8]:
                 sym = (p.get("symbol") or "?")[:14]
                 sol_a = p.get("amount_sol", 0) or 0
@@ -3343,29 +3394,29 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
                     extra = f" 入${ep:.2f}"
                 else:
                     extra = ""
-                L.append(f"   {sym} {sol_a:.2f}SOL 峰值{peak:+.1f}%{extra}")
-            L.append("")
+                ops.append(f"   {sym} {sol_a:.2f}SOL 峰值{peak:+.1f}%{extra}")
+            ops.append("")
         else:
-            L.append("🔴 自动引擎仓: 无 (扫信号中)")
-            L.append("")
+            ops.append("🔴 自动引擎仓: 无 (扫信号中)")
+            ops.append("")
 
     if not snap_ok and not wallet_ok:
-        L.append("💼 钱包未连接 → /wallet_setup")
-        L.append("")
+        ops.append("💼 钱包未连接 → /wallet_setup")
+        ops.append("")
 
     if not is_live:
         pm = "模拟开" if paper_on else "模拟关"
-        L.append(f"⚙️ 📝{pm}（非实盘调度）")
+        ops.append(f"⚙️ 📝{pm}（非实盘调度）")
         lst_scan = sched_state.get("last_scan_time") or 0
         if lst_scan:
-            L.append(f"📡 上次调度扫描 {time.strftime('%m-%d %H:%M', time.localtime(lst_scan))}")
+            ops.append(f"📡 上次调度扫描 {time.strftime('%m-%d %H:%M', time.localtime(lst_scan))}")
         else:
-            L.append("📡 调度: 暂无（🚀启动实盘后周期扫描）")
-        L.append("")
+            ops.append("📡 调度: 暂无（🚀启动实盘后周期扫描）")
+        ops.append("")
 
         disp_onchain = _chain_cache.get("chain_tokens_display") or []
         if not snap_ok and wallet_ok and disp_onchain:
-            L.append(f"🔗 链上 SPL · 真实余额 ({len(disp_onchain)})")
+            ops.append(f"🔗 链上 SPL · 真实余额 ({len(disp_onchain)})")
             for row in disp_onchain[:8]:
                 a = float(row.get("amount") or 0)
                 if a >= 1e6:
@@ -3376,34 +3427,34 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
                     as_ = f"{a:.4g}"
                 else:
                     as_ = f"{a:.6g}"
-                L.append(f"   · {str(row.get('label', '?'))[:14]:<14} {as_} [链上]")
-            L.append("")
+                ops.append(f"   · {str(row.get('label', '?'))[:14]:<14} {as_} [链上]")
+            ops.append("")
         elif not snap_ok and wallet_ok:
-            L.append("🔗 链上 SPL: 仅 SOL 或无可见代币")
-            L.append("")
+            ops.append("🔗 链上 SPL: 仅 SOL 或无可见代币")
+            ops.append("")
 
     if not snap_ok:
         if dex_positions:
             total_sol = sum(p.get("amount_sol", 0) or 0 for p in dex_positions)
             total_usd = total_sol * sol_price if sol_price > 0 else 0
             cap = 8 if not is_live else 6
-            L.append(f"📌 dex_trader [DEX] ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
+            ops.append(f"📌 dex_trader [DEX] ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
             for p in sorted(dex_positions, key=lambda x: x.get("amount_sol", 0) or 0, reverse=True)[:cap]:
                 name = p.get("name") or p.get("symbol", "?")
                 sym = p.get("symbol", "?")
                 display = name if name != sym else sym
                 pnl = p.get("pnl_pct", 0) or 0
                 em = "🟢" if pnl > 1 else "🔴" if pnl < -1 else "⚪"
-                L.append(
+                ops.append(
                     f" {em} {str(display)[:12]:<12} {p.get('amount_sol', 0):.2f}SOL {pnl:+.1f}% [DEX]"
                 )
-            L.append("")
+            ops.append("")
         else:
-            L.append("📌 dex_trader [DEX]: 无（或等快照）")
-            L.append("")
+            ops.append("📌 dex_trader [DEX]: 无（或等快照）")
+            ops.append("")
 
     if paper_trades_open:
-        L.append(f"📝 paper [模拟] ({len(paper_trades_open)})")
+        ops.append(f"📝 paper [模拟] ({len(paper_trades_open)})")
         for t in sorted(paper_trades_open, key=lambda x: x.get("position_sol", 0) or 0, reverse=True)[:8]:
             name = t.get("name", "")
             sym = t.get("symbol", "?")
@@ -3411,11 +3462,11 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
             pnl = t.get("pnl_pct", 0) or 0
             sol_t = t.get("position_sol", 0) or 0
             em = "🟢" if pnl > 1 else "🔴" if pnl < -1 else "⚪"
-            L.append(f" {em} {display:<12} {sol_t:.2f}SOL {pnl:+.1f}% [模拟]")
-        L.append("")
+            ops.append(f" {em} {display:<12} {sol_t:.2f}SOL {pnl:+.1f}% [模拟]")
+        ops.append("")
     elif paper_on:
-        L.append("📝 paper [模拟]: 当前无开仓")
-        L.append("")
+        ops.append("📝 paper [模拟]: 当前无开仓")
+        ops.append("")
 
     if paper_on or paper_closed > 0:
         pp = "🟢" if paper_pnl >= 0 else "🔴"
@@ -3425,11 +3476,11 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
         elif paper_closed > 0:
             pct_done = min(paper_closed / 100 * 100, 100)
             grad = f" ({pct_done:.0f}%毕业)"
-        L.append(
+        ops.append(
             f"📝 汇总 {len(paper_trades_open)}仓/{paper_closed}平 WR{paper_wr:.0f}% "
             f"{pp}{paper_pnl:+.3f}SOL{grad}"
         )
-        L.append("")
+        ops.append("")
 
     if is_live:
         try:
@@ -3437,40 +3488,52 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
         except Exception:
             recent = []
         if recent:
-            L.append("📜 最近引擎平仓")
+            ops.append("📜 最近引擎平仓")
             for c in recent:
                 sym = (c.get("symbol") or "?")[:12]
                 pnl_c = c.get("pnl_pct", 0) or 0
                 pnl_sol_c = c.get("pnl_sol", 0) or 0
                 rs = (c.get("close_reason") or "")[:10]
-                L.append(f"   {sym} {pnl_c:+.1f}% ({pnl_sol_c:+.4f} SOL) · {rs}")
-            L.append("")
+                ops.append(f"   {sym} {pnl_c:+.1f}% ({pnl_sol_c:+.4f} SOL) · {rs}")
+            ops.append("")
 
     evo_bar_len = 8
     if evo_signals > 0:
         filled = int(evo_wr / 100 * evo_bar_len)
         bar = "█" * filled + "░" * (evo_bar_len - filled)
-        L.append(f"🧬 [{bar}] WR:{evo_wr:.0f}% ({evo_signals}信号)")
+        ops.append(f"🧬 [{bar}] WR:{evo_wr:.0f}% ({evo_signals}信号)")
     else:
-        L.append("🧬 进化学习中...")
+        ops.append("🧬 进化学习中...")
 
     if _dex_available and _dex:
         s = _dex.get_settings()
         mev = "🛡" if s.get("mev_protection") else "✗"
-        L.append(
+        ops.append(
             f"⚙ {s.get('auto_buy_sol', 0.5)}SOL Slip:{s.get('buy_slippage_pct', 15)}/"
             f"{s.get('sell_slippage_pct', 20)}% TP{s.get('default_tp_pct', 100)} "
             f"SL{s.get('default_sl_pct', -30)} {mev}"
         )
 
-    L.append("━━━━━━━━━━━━━━━━━━━━━━━")
+    foot: list[str] = []
+    foot.append("━━━━━━━━━━━━━━━━━━━━━━━")
     if is_live:
-        L.append("📡 简报=详情 | 🔄 刷新=同步链上 | 约30分钟推送简报")
-    L.append("🔄 刷新=重拉快照 | /portfolio 聚合持仓 | 粘贴CA→买入 | /buy /sell")
-    result = "\n".join(L)
+        foot.append("📡 简报=详情 | 🔄 刷新=同步链上 | 约30分钟推送简报")
+    foot.append("🔄 刷新=重拉快照 | /portfolio 聚合持仓 | 粘贴CA→买入 | /buy /sell")
+
+    result = "\n".join(head + snap_block_for_full + ops + foot)
     _chain_cache["dashboard_text"] = result
     _chain_cache["dashboard_ts"] = time.time()
-    return result
+
+    tail_joined = "\n".join(ops + foot)
+    follow_ups = [*(snap_chunks or []), *_split_chain_message_body(tail_joined, 3900)]
+    follow_ups = [p for p in follow_ups if p.strip()]
+    first_msg = "\n".join(head + first_mid)[:4090]
+    return result, first_msg, follow_ups
+
+
+async def _build_chain_dashboard(user_id: int | None = None) -> str:
+    full, _, _ = await _build_chain_dashboard_parts(user_id)
+    return full
 
 
 def _build_chain_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
@@ -3530,14 +3593,32 @@ def _build_chain_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+async def _reply_chain_dashboard_multipart(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int | None,
+) -> None:
+    """First message + keyboard, then follow-up chunks (OKX/SOL/DEX + 调度/模拟 tail)."""
+    _full, first, follows = await _build_chain_dashboard_parts(user_id)
+    kb = _build_chain_keyboard(user_id)
+    await _safe_reply(message, first, reply_markup=kb)
+    if not message:
+        return
+    cid = message.chat_id
+    for seg in follows:
+        if seg.strip():
+            try:
+                await context.bot.send_message(chat_id=cid, text=seg[:4096])
+            except Exception as e:
+                logger.debug("chain dashboard follow-up send failed: %s", e)
+
+
 async def chain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """On-chain (Solana DEX) trading dashboard. /chain"""
     if not update.message:
         return
     uid = update.effective_user.id if update.effective_user else None
-    text = await _build_chain_dashboard(uid)
-    kb = _build_chain_keyboard(uid)
-    await _safe_reply(update.message, text, reply_markup=kb)
+    await _reply_chain_dashboard_multipart(update.message, context, uid)
 
 
 async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3572,7 +3653,7 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "ch_ui_mode_paper":
         await query.answer("界面：模拟盘", show_alert=False)
         _ui_session_store.set_telegram_panel_mode(uid_cb, "paper")
-        text = await _build_chain_dashboard(uid_cb)
+        _, text, _ = await _build_chain_dashboard_parts(uid_cb)
         try:
             await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
         except Exception:
@@ -3581,7 +3662,7 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "ch_ui_mode_live":
         await query.answer("界面：实盘（全息持仓）", show_alert=False)
         _ui_session_store.set_telegram_panel_mode(uid_cb, "live")
-        text = await _build_chain_dashboard(uid_cb)
+        _, text, _ = await _build_chain_dashboard_parts(uid_cb)
         try:
             await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
         except Exception:
@@ -3715,7 +3796,7 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── Refresh / Back ──
     if data == "ch_back":
-        text = await _build_chain_dashboard(uid_cb)
+        _, text, _ = await _build_chain_dashboard_parts(uid_cb)
         try:
             await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
         except Exception:
@@ -3729,7 +3810,7 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
             asyncio.create_task(_pf_refresh())
         except Exception:
             pass
-        text = await _build_chain_dashboard(uid_cb)
+        _, text, _ = await _build_chain_dashboard_parts(uid_cb)
         try:
             await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
         except Exception:
@@ -7322,9 +7403,7 @@ async def _try_trading_intent(text: str, lower: str, chat_id: int, update, conte
     # ── Chain dashboard shortcut: "链上" / "onchain" / "dex" ──
     if lower in ("链上", "链上面板", "onchain", "dex", "dex面板", "sol交易"):
         uix = update.effective_user.id if update.effective_user else None
-        text_d = await _build_chain_dashboard(uix)
-        kb = _build_chain_keyboard(uix)
-        await _safe_reply(update.message, text_d, reply_markup=kb)
+        await _reply_chain_dashboard_multipart(update.message, context, uix)
         return True
 
     # ── Dashboard shortcut: "交易" / "面板" / "dashboard" ──

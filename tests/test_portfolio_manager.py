@@ -91,6 +91,34 @@ def test_format_chain_snapshot_compact_tree():
     assert mint[:4] in out and mint[-4:] in out
 
 
+def test_format_chain_compact_and_chunks():
+    import portfolio_manager as pm
+
+    snap = {
+        "updated_at": 1.0,
+        "age_sec": 8.0,
+        "sol_price": 90.0,
+        "sol_chg_pct": 0.0,
+        "okx": {"has_keys": True, "ok": True, "total_equity_usd": 12.0, "usdt_available": 1.0, "positions": []},
+        "dex": {"positions": [], "total_value_sol": 0.0},
+        "wallet": {
+            "ok": True,
+            "pubkey_short": "Ab…yz",
+            "sol_bal": 0.1,
+            "token_count": 0,
+            "tokens": [],
+        },
+        "poly": {"configured": False, "oracle_enabled": False, "recent": []},
+        "last_error": "",
+    }
+    c = pm.format_chain_compact(snap)
+    assert "【速览" in c
+    assert "OKX:" in c and "Solana:" in c
+    chunks = pm.format_chain_snapshot_chunks(snap)
+    assert len(chunks) == 3
+    assert "OKX" in chunks[0] and "Solana" in chunks[1] and "DEX" in chunks[2]
+
+
 @pytest.mark.asyncio
 async def test_get_live_portfolio_summary_minimal(monkeypatch):
     import portfolio_manager as pm

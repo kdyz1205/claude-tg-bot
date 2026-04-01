@@ -6,8 +6,11 @@ Chain activity uses **WebSocket subscriptions** (see ``onchain_ws_listen``):
   ``newHeads`` for native transfers; automatic reconnect (``while True`` + try/except).
 - Solana: ``logs_subscribe`` (mentions) over WSS + per-event ``get_transaction`` for amounts.
 
-Spot reference prices (ETH/BNB/SOL) come from the OKX public ticker WebSocket hub
-(``trading.okx_ws_hub``), not HTTP polling.
+Spot reference prices (ETH/BNB/SOL) come only from the OKX public ticker WebSocket hub
+(``trading.okx_ws_hub``) via ``_get_prices`` — no REST/HTTP polling for spot quotes.
+
+Smart-money ERC-20 alerts are **stablecoin receives only** (known contract map on chain WS).
+No DexScreener or other HTTP price feeds for the on-chain radar path.
 
 Configure RPC endpoints via ``ONCHAIN_ETH_WSS``, ``ONCHAIN_BSC_WSS``, ``ONCHAIN_SOL_WSS``,
 and ``SOLANA_RPC_HTTP`` in ``config`` / environment.
@@ -19,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime
@@ -374,23 +378,25 @@ class OnchainTracker:
             logger.error("OnchainTracker background task crashed: %s", e, exc_info=True)
 
     async def _price_refresh_loop(self):
-        await asyncio.sleep(5)
-        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/onchain_tracker"}
+        """OKX public ticker hub (WSS) only — exponential backoff if hub/read fails."""
+        await asyncio.sleep(2)
+        fail_streak = 0
         while self._running:
             try:
-                async with httpx.AsyncClient(
-                    timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
-                ) as client:
-                    p = await _get_prices(client)
-                    self._prices_live = p
+                p = await _get_prices(None)
+                self._prices_live = p
+                fail_streak = 0
+                await asyncio.sleep(_PRICE_CACHE_TTL)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.debug("OnchainTracker price refresh: %s", e)
-            try:
-                await asyncio.sleep(_PRICE_CACHE_TTL)
-            except asyncio.CancelledError:
-                break
+                fail_streak = min(fail_streak + 1, 10)
+                delay = min(120.0, 2.0 ** fail_streak) + random.uniform(0, 2.0)
+                logger.warning("OnchainTracker price refresh error: %s — retry in %.1fs", e, delay)
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    break
 
     async def _push_whale_signal_from_classified(
         self, classified: dict, address: str, label: str, network: str
@@ -521,9 +527,15 @@ whale_tracker = OnchainTracker()
 # ── Smart Money Tracker ───────────────────────────────────────────────────────
 
 SMART_WALLETS_FILE = os.path.join(BASE_DIR, ".smart_wallets.json")
-SMART_MIN_BUY_USD = 50_000    # $50k threshold for ETH/BSC
+SMART_MIN_BUY_USD = 50_000    # $50k threshold for ETH/BSC (stablecoin transfers only)
 SMART_MIN_SOL = 10            # 10 SOL minimum for Solana buys
 SMART_SCAN_INTERVAL = 300     # housekeeping interval (seconds)
+
+# Solana mainnet stable mints — valued at ~$1 without HTTP (WS radar path only)
+_SOL_STABLE_MINTS: dict[str, tuple[str, int]] = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": ("USDC", 6),
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": ("USDT", 6),
+}
 SMART_PERF_FILE = os.path.join(BASE_DIR, ".smart_signal_perf.json")
 
 # ── v2 Smart Money constants ────────────────────────────────────────────────
@@ -558,34 +570,6 @@ DEFAULT_SMART_WALLETS: dict = {
     "Gx5dx4YEt7PLKYU62i1UWdxjNr3rmH4CAFGfVLLb2PJ4": {"label": "SOL-VC-Wallet-1", "network": "sol"},
     "AGNHGKiuZwrxMPDmpJsLyp3HtYDJCB2Cg5kxFLRFjhSs": {"label": "SOL-Sniper-Alpha", "network": "sol"},
 }
-
-
-async def _dexscreener_token_info(
-    client: httpx.AsyncClient, contract_address: str
-) -> dict:
-    """Fetch token price and info from Dexscreener (free, no key)."""
-    if not contract_address:
-        return {}
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}"
-        resp = await client.get(url)
-        data = _safe_httpx_json(resp)
-        if not isinstance(data, dict):
-            return {}
-        pairs = data.get("pairs") or []
-        if pairs:
-            p = pairs[0]
-            return {
-                "price_usd": float(p.get("priceUsd") or 0),
-                "token_name": (p.get("baseToken") or {}).get("name", ""),
-                "token_symbol": (p.get("baseToken") or {}).get("symbol", ""),
-                "volume_24h": float((p.get("volume") or {}).get("h24") or 0),
-                "liquidity_usd": float((p.get("liquidity") or {}).get("usd") or 0),
-                "dex": p.get("dexId", ""),
-            }
-    except Exception as e:
-        logger.debug("dexscreener %s: %s", contract_address[:10], e)
-    return {}
 
 
 class SmartMoneyTracker:
@@ -733,41 +717,16 @@ class SmartMoneyTracker:
         self._save_perf()
 
     async def _evaluate_pending_signals(self):
-        """Check signals that are >24h old and record price performance."""
+        """Close perf rows without HTTP exit quotes (radar policy: no REST/Dex price polling)."""
         now = time.time()
         updated = False
-        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
-        async with httpx.AsyncClient(
-            timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
-        ) as http:
-            for rec in self._perf_records:
-                if rec.get("result") is not None:
-                    continue
-                if now < rec.get("check_at", now + 1):
-                    continue
-                contract = rec.get("contract_address", "")
-                if not contract:
-                    rec["result"] = "no_price"
-                    updated = True
-                    continue
-                try:
-                    info = await _dexscreener_token_info(http, contract)
-                    current_price = info.get("price_usd", 0)
-                    entry_price = rec.get("entry_price", 0)
-                    if current_price and entry_price:
-                        pnl_pct = (current_price - entry_price) / entry_price * 100
-                        rec["exit_price"] = current_price
-                        rec["pnl_pct"] = round(pnl_pct, 2)
-                        rec["result"] = True if pnl_pct > 0 else False
-                        updated = True
-                        logger.info(
-                            "SmartMoney perf: %s %s entry=%.6f exit=%.6f pnl=%.1f%%",
-                            rec.get("address_label", "?"), rec.get("token", "?"),
-                            entry_price, current_price, pnl_pct,
-                        )
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.debug("evaluate_pending: %s", e)
+        for rec in self._perf_records:
+            if rec.get("result") is not None:
+                continue
+            if now < rec.get("check_at", now + 1):
+                continue
+            rec["result"] = "no_price"
+            updated = True
         if updated:
             self._save_perf()
 
@@ -846,33 +805,6 @@ class SmartMoneyTracker:
         if time.time() - self._last_cache_save >= SMART_CACHE_SAVE_INTERVAL:
             self._save_cache()
 
-    # ── v2: Cached Dexscreener lookup ────────────────────────────────────
-
-    async def _cached_token_info(
-        self, client: httpx.AsyncClient, contract_address: str
-    ) -> dict:
-        """Dexscreener lookup with 5-min TTL cache."""
-        if not contract_address:
-            return {}
-        cached = self._token_price_cache.get(contract_address)
-        if cached and time.time() - cached.get("ts", 0) < 300:
-            return cached.get("info", {})
-        info = await _dexscreener_token_info(client, contract_address)
-        if info:
-            # Cap token price cache to prevent unbounded growth
-            if len(self._token_price_cache) > 500:
-                # Evict oldest entries
-                sorted_keys = sorted(
-                    self._token_price_cache.keys(),
-                    key=lambda k: self._token_price_cache[k].get("ts", 0),
-                )
-                for k in sorted_keys[:200]:
-                    del self._token_price_cache[k]
-            self._token_price_cache[contract_address] = {
-                "info": info, "ts": time.time(),
-            }
-        return info
-
     # ── v2: Wallet scoring system ────────────────────────────────────────
 
     def _get_wallet_score(self, address: str) -> int:
@@ -905,7 +837,7 @@ class SmartMoneyTracker:
             meta["pending_outcomes"] = pending[-50:]
 
     async def _resolve_pending_outcomes(self):
-        """Check pending outcomes that are past their check_at time."""
+        """Drop matured pending outcome rows (no HTTP/Dex exit quotes; WS-only radar)."""
         now = time.time()
         updated = False
         for address, meta in self._wallets.items():
@@ -915,40 +847,12 @@ class SmartMoneyTracker:
                 if now < p.get("check_at", now + 1):
                     still_pending.append(p)
                     continue
-                # Time to evaluate
-                contract = p.get("contract", "")
-                entry_price = p.get("entry_price", 0)
-                if not contract or not entry_price:
-                    continue
-                try:
-                    headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
-                    async with httpx.AsyncClient(
-                        timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
-                    ) as http:
-                        info = await self._cached_token_info(http, contract)
-                    current_price = info.get("price_usd", 0)
-                    if current_price and entry_price:
-                        pnl_pct = (current_price - entry_price) / entry_price * 100
-                        is_win = pnl_pct >= OUTCOME_WIN_PCT
-                        meta["total_trades"] = meta.get("total_trades", 0) + 1
-                        if is_win:
-                            meta["win_trades"] = meta.get("win_trades", 0) + 1
-                        # Recalculate score
-                        total = meta["total_trades"]
-                        wins = meta.get("win_trades", 0)
-                        meta["score"] = int((wins / total) * 100) if total > 0 else 50
-                        meta["score"] = max(0, min(100, meta["score"]))
-                        meta["last_score_update"] = now
-                        updated = True
-                        logger.info(
-                            "Wallet score updated: %s score=%d (W%d/T%d) pnl=%.1f%%",
-                            meta.get("label", address[:8]), meta["score"], wins, total, pnl_pct
-                        )
-                        # Also update discovery follow-up if applicable
-                        await self._update_discovery_follow_results(contract, current_price)
-                except Exception as e:
-                    logger.debug("resolve_outcome %s: %s", address[:8], e)
-                    still_pending.append(p)  # retry later
+                updated = True
+                logger.debug(
+                    "resolve_outcome dropped (no HTTP quote): %s %s",
+                    address[:8],
+                    str(p.get("contract", ""))[:12],
+                )
             meta["pending_outcomes"] = still_pending
         if updated:
             self._save_wallets()
@@ -1134,24 +1038,9 @@ class SmartMoneyTracker:
                     except Exception:
                         pass
 
-    async def _check_all_discoveries(self):
-        """Periodically check price for all tracked discoveries."""
-        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
-        async with httpx.AsyncClient(
-            timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
-        ) as http:
-            for contract, disc in list(self._new_token_discoveries.items()):
-                if len(disc.get("checkpoints", {})) >= len(DISCOVERY_CHECKPOINTS):
-                    continue  # all checkpoints done
-                try:
-                    info = await self._cached_token_info(http, contract)
-                    if info.get("price_usd"):
-                        await self._update_discovery_follow_results(
-                            contract, info["price_usd"]
-                        )
-                except Exception as e:
-                    logger.debug("discovery check %s: %s", contract[:10], e)
-                await asyncio.sleep(0.5)
+    async def _check_all_discoveries(self) -> None:
+        """Discovery follow-ups previously used HTTP quotes; disabled under WS-only radar policy."""
+        return
 
     # ── v2: Helius API integration ───────────────────────────────────────
 
@@ -1332,11 +1221,7 @@ class SmartMoneyTracker:
         await self._check_consensus(contract, token)
         await self._handle_new_token_discovery(contract, token, address, entry_price)
 
-        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
-        async with httpx.AsyncClient(
-            timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
-        ) as client:
-            prices = await _get_prices(client)
+        prices = await _get_prices(None)
         is_whale = False
         if sig.get("network") == "sol":
             sol_price = prices.get("SOL", 150)
@@ -1355,13 +1240,14 @@ class SmartMoneyTracker:
 
     async def _classify_erc20_buy(
         self,
-        client: httpx.AsyncClient,
         tx: dict,
         address: str,
         label: str,
         network: str,
         prices: dict,
     ) -> Optional[dict]:
+        """Large stablecoin receive only — no HTTP token pricing."""
+        _ = prices
         try:
             token_symbol = tx.get("tokenSymbol", "UNKNOWN")
             token_name = tx.get("tokenName", token_symbol)
@@ -1369,23 +1255,10 @@ class SmartMoneyTracker:
             decimals = max(0, min(int(tx.get("tokenDecimal", 18) or 18), 18))
             token_amount = int(tx.get("value") or "0") / (10 ** decimals)
 
-            amount_usd = 0.0
-            current_price = 0.0
-
-            if token_symbol in _STABLECOINS:
-                amount_usd = token_amount
-                current_price = 1.0
-            elif contract_addr:
-                info = await self._cached_token_info(client, contract_addr)
-                if info.get("price_usd"):
-                    current_price = info["price_usd"]
-                    amount_usd = token_amount * current_price
-                    token_name = info.get("token_name") or token_name
-                    token_symbol = info.get("token_symbol") or token_symbol
-                else:
-                    return None
-            else:
+            if token_symbol not in _STABLECOINS:
                 return None
+            amount_usd = token_amount
+            current_price = 1.0
 
             if amount_usd < SMART_MIN_BUY_USD:
                 return None
@@ -1412,12 +1285,12 @@ class SmartMoneyTracker:
 
     async def _classify_sol_buy(
         self,
-        client: httpx.AsyncClient,
         tx: dict,
         address: str,
         label: str,
         prices: dict,
     ) -> Optional[dict]:
+        """SOL native or USDC/USDT mint receive — no HTTP pricing."""
         try:
             dst = (
                 tx.get("dst") or tx.get("toAddress") or tx.get("destinationOwner") or ""
@@ -1438,19 +1311,18 @@ class SmartMoneyTracker:
             amount_usd = 0.0
             current_price = 0.0
 
-            sol_price = prices.get("SOL", 150)
+            sol_price = float(prices.get("SOL", 150) or 150)
 
-            if token_address:
-                info = await self._cached_token_info(client, token_address)
-                if info.get("price_usd"):
-                    current_price = info["price_usd"]
-                    amount_usd = token_amount * current_price
-                    token_name = info.get("token_name") or token_name
-                    token_symbol = info.get("token_symbol") or token_symbol
-                else:
-                    return None
+            st = _SOL_STABLE_MINTS.get(token_address)
+            if st:
+                sym, dec = st
+                token_amount = abs(int(change_amount)) / (10 ** dec)
+                token_symbol = sym
+                token_name = sym
+                current_price = 1.0
+                amount_usd = token_amount
             elif str(token_symbol).upper() == "SOL":
-                current_price = float(sol_price)
+                current_price = sol_price
                 amount_usd = token_amount * current_price
             else:
                 return None

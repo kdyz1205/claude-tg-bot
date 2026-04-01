@@ -24,10 +24,15 @@
   ],
   "template_code": "from skills.sk_smart_money_decoder import decode_smart_money_panel\n# text = await decode_smart_money_panel(addr)",
   "files_modified": [],
-  "files_created": ["skills/sk_smart_money_decoder.py"],
+  "files_created": [
+    "skills/sk_smart_money_decoder.py"
+  ],
   "config_location": "ETHPLORER_API_KEY optional",
   "created_at": "2026-03-31T00:00:00",
   "source": "phase5_skill_pack",
   "score": 80,
-  "usage_count": 0
+  "usage_count": 0,
+  "use_count": 1,
+  "last_used": "2026-03-31T23:14:24.051505",
+  "avg_score_when_used": 0.92
 }

@@ -124,8 +124,8 @@
         "集中度"
       ],
       "task_type": "analysis",
-      "use_count": 0,
-      "avg_score": null
+      "use_count": 1,
+      "avg_score": 0.92
     },
     {
       "id": "sk_rug_pull_detector",
@@ -186,5 +186,5 @@
       "avg_score": null
     }
   ],
-  "last_rebuilt": "2026-03-31T12:00:00"
+  "last_rebuilt": "2026-03-31T23:14:24.056834"
 }

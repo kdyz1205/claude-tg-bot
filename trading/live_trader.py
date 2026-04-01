@@ -1,9 +1,8 @@
 """
 Canonical live trader: re-exports the repository root ``live_trader.py``.
 
-Delta-neutral hedge uses ``asyncio.gather`` (DEX ∥ OKX); OKX live orders in
-``trading/okx_executor`` release the asyncio lock during REST. Verified
-``emergency_flatten_short_verified`` handles limping hedge legs.
+Delta-neutral: root ``live_trader`` uses ``asyncio.gather(buy, short, return_exceptions=True)``
+and ``okx_executor.limping_fuse_flatten_short`` for immediate naked-short rescue after failed DEX leg.
 """
 
 from __future__ import annotations

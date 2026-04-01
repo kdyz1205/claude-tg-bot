@@ -3,6 +3,9 @@ Live Trader Module — Jupiter V6 swaps with strict risk controls.
 
 Executes real trades on Solana via Jupiter DEX aggregator.
 All transactions go through secure_wallet.py (swap-only signing).
+
+Delta-neutral: ``asyncio.gather(DEX buy, OKX short, return_exceptions=True)`` (single-shot legs)
+plus **immediate limping-leg fuse** — market-unwind the surviving leg; see ``limping_fuse_flatten_short``.
 """
 
 import os, json, logging, time, asyncio
@@ -65,9 +68,11 @@ DEFAULT_LIVE_CONFIG = {
     "neural_hedge_symbol": "SOLUSDT",
     "neural_dex_mint": "",
     "neural_poll_sec": 45,
+    # Deprecated: delta-neutral uses single-shot parallel gather + immediate limping fuse (no leg retries).
     "hedge_leg_retry_count": 8,
     "hedge_leg_retry_delay_sec": 0.35,
     "dex_leg_retry_count": 3,
+    "limping_fuse_verify_rounds": 8,
     # Polymarket：Gamma/CLOB 概率差扫描 + CLOB 处决（默认关闭）
     "poly_enabled": False,
     "poly_oracle_interval_sec": 3600,
@@ -666,7 +671,7 @@ def format_live_status() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 12 — Delta-neutral: concurrent legs + legged recovery + locks
+# PHASE 12 — Delta-neutral: gather parallel legs + immediate limping fuse
 # ══════════════════════════════════════════════════════════════════════════════
 
 _mint_delta_locks: dict[str, asyncio.Lock] = {}
@@ -707,13 +712,14 @@ async def _run_delta_neutral_with_recovery(
     signal_data: Optional[dict],
 ) -> dict:
     """
-    Atomic-style entry: ``asyncio.gather(DEX buy ∥ OKX short)`` (true overlap).
-    OKX live path releases executor lock during REST so the DEX leg is not blocked.
+    **Parallel entry only** — no linear “hedge after DEX” sequencing.
 
-    Leg-risk (one side filled, one failed):
-    - DEX ok / hedge fail → serial hedge retries; then Jupiter unwind + alert.
-    - Hedge ok / DEX fail → DEX retries; then ``emergency_flatten_short_verified``
-      (multi-round close + exchange poll + reduce-only) in parallel with alert.
+    ``asyncio.gather(DEX buy, OKX short, return_exceptions=True)`` schedules both legs in the
+    same event-loop tick (single-shot ``open_position`` / ``buy_token``, no retry loops inside).
+
+    **Limping-leg fuse:** if exactly one leg succeeds, **immediately** market-unwind the other
+    (Jupiter sell for DEX spot; ``limping_fuse_flatten_short`` = exchange reduce-only first,
+    then verified flatten). No multi-second retry windows before rescue.
     """
     from self_monitor import trigger_alert
 
@@ -723,139 +729,131 @@ async def _run_delta_neutral_with_recovery(
     usd = max(1.0, float(amount_sol) * float(sol_p))
     sig = signal_data or {}
 
-    h_retries = max(1, int(cfg.get("hedge_leg_retry_count", 8)))
-    h_delay = float(cfg.get("hedge_leg_retry_delay_sec", 0.35))
-    d_retries = max(1, int(cfg.get("dex_leg_retry_count", 3)))
-
     async def _dex_leg() -> Any:
         return await buy_token(mint, amount_sol, symbol, signal_data=sig)
 
     async def _hedge_leg() -> Any:
-        return await execu.open_position_with_retry(hedge_symbol, "short", usd)
+        # Single market attempt — paired with DEX in one gather (not open_position_with_retry).
+        return await execu.open_position(hedge_symbol, "short", usd)
 
-    # Same-tick start: tasks are scheduled together, then awaited in one gather.
-    dex_t = asyncio.create_task(_dex_leg(), name="delta_neutral_dex")
-    hed_t = asyncio.create_task(_hedge_leg(), name="delta_neutral_hedge")
+    async def _parallel_entry() -> tuple[Any, Any]:
+        return await asyncio.gather(
+            _dex_leg(),
+            _hedge_leg(),
+            return_exceptions=True,
+        )
+
+    entry_task = asyncio.create_task(_parallel_entry(), name="delta_neutral_gather")
     try:
         from trading.hard_risk_kill import register_trading_task
 
-        register_trading_task(dex_t)
-        register_trading_task(hed_t)
+        register_trading_task(entry_task)
     except Exception:
         pass
-    dex_r, hed_r = await asyncio.gather(dex_t, hed_t, return_exceptions=True)
+
+    raw = await entry_task
+    dex_r, hed_r = raw[0], raw[1]
+
     if isinstance(dex_r, BaseException):
         logger.error("DEX leg raised: %s", dex_r, exc_info=True)
         dex_r = None
     if isinstance(hed_r, BaseException):
+        logger.error("Hedge leg raised: %s", hed_r, exc_info=True)
         hed_r = {"ok": False, "reason": str(hed_r)}
 
     dex_ok = _dex_leg_success(dex_r)
     hedge_ok = _hedge_leg_success(hed_r)
 
-    # ── Retry hedge only (naked long risk) ─────────────────────────────
+    # ── Limping fuse: DEX filled, hedge dead → immediate Jupiter market unwind ──
     if dex_ok and not hedge_ok:
-        for i in range(h_retries):
-            await asyncio.sleep(h_delay)
-            logger.warning(
-                "Hedge retry %s/%s after DEX fill mint=%s",
-                i + 1,
-                h_retries,
-                mint[:8],
+        pid = dex_r.get("id") if isinstance(dex_r, dict) else None
+        logger.critical(
+            "LIMPING_FUSE naked-long risk mint=%s hedge=%s — immediate DEX market unwind",
+            mint[:12],
+            hedge_symbol,
+        )
+        alert_long = trigger_alert(
+            "NAKED_LONG_RISK",
+            f"DEX filled but OKX short failed mint={mint[:12]}… "
+            f"Immediate market flatten (Jupiter→SOL). hedge_err={hed_r!r}",
+            severity="critical",
+        )
+        if pid:
+            ga0 = await asyncio.gather(
+                alert_long,
+                sell_token(pid, "limping_fuse_hedge_failed"),
+                return_exceptions=True,
             )
-            hed_r = await execu.open_position_with_retry(
-                hedge_symbol, "short", usd, max_retries=3
-            )
-            if _hedge_leg_success(hed_r):
-                hedge_ok = True
-                break
-        if dex_ok and not hedge_ok:
-            pid = dex_r.get("id") if isinstance(dex_r, dict) else None
-            alert_long = trigger_alert(
-                "NAKED_LONG_RISK",
-                f"DEX filled but OKX short failed after {h_retries} retries mint={mint}. "
-                f"Emergency market flatten (Jupiter→SOL).",
-                severity="critical",
-            )
-            if pid:
-                ga0 = await asyncio.gather(
-                    alert_long,
-                    sell_token(pid, "emergency_hedge_failed"),
-                    return_exceptions=True,
-                )
-                if isinstance(ga0[0], BaseException):
-                    logger.error("trigger_alert naked long: %s", ga0[0], exc_info=True)
-                flat_r = None
-                if not isinstance(ga0[1], BaseException):
-                    flat_r = ga0[1]
-                else:
-                    logger.error("first emergency sell: %s", ga0[1], exc_info=True)
-                for _e in range(4):
-                    if flat_r:
-                        break
-                    await asyncio.sleep(0.5 * (_e + 1))
-                    flat_r = await sell_token(pid, "emergency_hedge_failed")
-                if not flat_r:
-                    await trigger_alert(
-                        "EMERGENCY_DEX_UNWIND_FAILED",
-                        f"Could not market-close DEX spot position_id={pid} mint={mint[:12]}",
-                        severity="critical",
-                    )
-            else:
-                await alert_long
-            return {
-                "ok": False,
-                "reason": "naked_long_rolled_back",
-                "dex": dex_r,
-                "hedge": hed_r,
-                "notional_usd": usd,
-            }
-
-    # ── Retry DEX only (naked short on perp) ───────────────────────────
-    if hedge_ok and not dex_ok:
-        for j in range(d_retries):
-            await asyncio.sleep(h_delay)
-            logger.warning(
-                "DEX buy retry %s/%s hedge already on %s",
-                j + 1,
-                d_retries,
-                hedge_symbol,
-            )
-            dex_r = await buy_token(mint, amount_sol, symbol, signal_data=sig)
-            if _dex_leg_success(dex_r):
-                dex_ok = True
-                break
-        if hedge_ok and not dex_ok:
-            alert_coro = trigger_alert(
-                "NAKED_SHORT_RISK",
-                f"OKX short on {hedge_symbol} but DEX buy failed after {d_retries} tries. "
-                f"Emergency verified flatten running.",
-                severity="critical",
-            )
-            flat_coro = execu.emergency_flatten_short_verified(
-                hedge_symbol, reason="emergency_dex_failed", max_rounds=8
-            )
-            ga = await asyncio.gather(alert_coro, flat_coro, return_exceptions=True)
-            flat = ga[1] if len(ga) > 1 else {"ok": False, "reason": "gather_short"}
-            if isinstance(flat, BaseException):
-                logger.error("emergency_flatten_short_verified raised: %s", flat, exc_info=True)
-                flat = {"ok": False, "reason": str(flat), "verified": False}
-            if isinstance(ga[0], BaseException):
-                logger.error("trigger_alert raised: %s", ga[0], exc_info=True)
-            if not (isinstance(flat, dict) and flat.get("verified")):
+            if isinstance(ga0[0], BaseException):
+                logger.error("trigger_alert naked long: %s", ga0[0], exc_info=True)
+            flat_r = None if isinstance(ga0[1], BaseException) else ga0[1]
+            if isinstance(ga0[1], BaseException):
+                logger.error("limping fuse sell: %s", ga0[1], exc_info=True)
+            for attempt in range(5):
+                if flat_r:
+                    break
+                await asyncio.sleep(0.12 * (attempt + 1))
+                flat_r = await sell_token(pid, "limping_fuse_hedge_failed")
+            if not flat_r:
                 await trigger_alert(
-                    "OKX_UNWIND_UNVERIFIED",
-                    f"Hedge {hedge_symbol} may still be open on exchange after rollback: {flat!r}",
+                    "EMERGENCY_DEX_UNWIND_FAILED",
+                    f"Could not market-close DEX position_id={pid} mint={mint[:12]}",
                     severity="critical",
                 )
-            return {
-                "ok": False,
-                "reason": "naked_short_flattened",
-                "dex": dex_r,
-                "hedge": hed_r,
-                "flatten": flat,
-                "notional_usd": usd,
-            }
+        else:
+            try:
+                await alert_long
+            except Exception as e:
+                logger.error("trigger_alert: %s", e, exc_info=True)
+        return {
+            "ok": False,
+            "reason": "naked_long_rolled_back",
+            "dex": dex_r,
+            "hedge": hed_r,
+            "notional_usd": usd,
+            "fuse": "dex_unwind",
+        }
+
+    # ── Limping fuse: hedge on exchange, DEX dead → immediate OKX market reduce + verify ──
+    if hedge_ok and not dex_ok:
+        logger.critical(
+            "LIMPING_FUSE naked-short risk hedge=%s mint=%s — immediate OKX fuse flatten",
+            hedge_symbol,
+            mint[:12],
+        )
+        alert_coro = trigger_alert(
+            "NAKED_SHORT_RISK",
+            f"OKX short on {hedge_symbol} but DEX buy failed mint={mint[:12]}… "
+            f"Immediate market fuse + verified flatten. dex_err={dex_r!r}",
+            severity="critical",
+        )
+        flat_coro = execu.limping_fuse_flatten_short(
+            hedge_symbol,
+            reason="limping_fuse_dex_failed",
+            max_verify_rounds=int(cfg.get("limping_fuse_verify_rounds", 8)),
+        )
+        ga = await asyncio.gather(alert_coro, flat_coro, return_exceptions=True)
+        flat = ga[1] if len(ga) > 1 else {"ok": False, "reason": "gather_short"}
+        if isinstance(flat, BaseException):
+            logger.error("limping_fuse_flatten_short raised: %s", flat, exc_info=True)
+            flat = {"ok": False, "reason": str(flat), "verified": False}
+        if isinstance(ga[0], BaseException):
+            logger.error("trigger_alert raised: %s", ga[0], exc_info=True)
+        if not (isinstance(flat, dict) and flat.get("verified")):
+            await trigger_alert(
+                "OKX_UNWIND_UNVERIFIED",
+                f"Hedge {hedge_symbol} may still be open after limping fuse: {flat!r}",
+                severity="critical",
+            )
+        return {
+            "ok": False,
+            "reason": "naked_short_flattened",
+            "dex": dex_r,
+            "hedge": hed_r,
+            "flatten": flat,
+            "notional_usd": usd,
+            "fuse": "okx_limping_fuse",
+        }
 
     if dex_ok and hedge_ok:
         return {

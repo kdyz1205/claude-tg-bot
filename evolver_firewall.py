@@ -2,7 +2,8 @@
 Shared safety gates for infinite_evolver + smart_evolver:
   1) AST parse + static denylist (syntax / obvious escape & system calls)
   2) Backtest subprocess timeout (env EVOLVER_BACKTEST_TIMEOUT, default 30s)
-  3) Daily generation caps (env EVOLVER_MAX_DAILY_GENERATIONS, default 5)
+  3) Asyncio fuse for heavy work (env EVOLVER_HEAVY_ASYNC_TIMEOUT, default 30s) — see get_heavy_async_timeout_sec
+  4) Daily generation caps (env EVOLVER_MAX_DAILY_GENERATIONS, default 5)
 """
 
 from __future__ import annotations
@@ -27,6 +28,19 @@ def get_backtest_timeout_sec() -> int:
     except ValueError:
         v = 30
     return max(5, min(v, 600))
+
+
+def get_heavy_async_timeout_sec() -> float:
+    """Ceiling for ``asyncio.wait_for`` around evolver CPU / subprocess work.
+
+    Prevents AI-generated dead loops from stalling the Telegram bot event loop.
+    Default 30s; override with ``EVOLVER_HEAVY_ASYNC_TIMEOUT`` (5–120).
+    """
+    try:
+        v = float(os.environ.get("EVOLVER_HEAVY_ASYNC_TIMEOUT", "30"))
+    except ValueError:
+        v = 30.0
+    return float(max(5.0, min(v, 120.0)))
 
 
 def get_max_daily_generations() -> int:
