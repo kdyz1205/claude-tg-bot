@@ -25,6 +25,11 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# HTTP: reuse one client per scan wave to reduce connection churn and timeout risk.
+_HTTP_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
+_HTTP_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
+_SCAN_CONCURRENCY = asyncio.Semaphore(6)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SIGNALS_FILE = os.path.join(BASE_DIR, ".whale_signals.json")
 ADDRESSES_FILE = os.path.join(BASE_DIR, ".whale_addresses.json")
@@ -93,7 +98,7 @@ _PRICE_CACHE_TTL = 300  # 5 min
 _MAX_PRICE_CACHE_ENTRIES = 200
 
 
-async def _get_prices() -> dict:
+async def _get_prices(client: httpx.AsyncClient) -> dict:
     """Fetch ETH/BNB/SOL spot prices from CoinGecko (free, no key)."""
     now = time.time()
     if _PRICE_CACHE.get("_ts", 0) + _PRICE_CACHE_TTL > now:
@@ -101,29 +106,38 @@ async def _get_prices() -> dict:
     try:
         url = "https://api.coingecko.com/api/v3/simple/price"
         params = {"ids": "ethereum,binancecoin,solana", "vs_currencies": "usd"}
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
         # Cap price cache size
         if len(_PRICE_CACHE) > _MAX_PRICE_CACHE_ENTRIES:
             _PRICE_CACHE.clear()
         _PRICE_CACHE.update({
-            "ETH": data.get("ethereum", {}).get("usd", 3000),
-            "BNB": data.get("binancecoin", {}).get("usd", 400),
-            "SOL": data.get("solana", {}).get("usd", 150),
+            "ETH": float(data.get("ethereum", {}).get("usd", 3000) or 3000),
+            "BNB": float(data.get("binancecoin", {}).get("usd", 400) or 400),
+            "SOL": float(data.get("solana", {}).get("usd", 150) or 150),
             "_ts": now,
         })
     except Exception as e:
         logger.debug("_get_prices failed: %s", e)
         if "ETH" not in _PRICE_CACHE:
-            _PRICE_CACHE.update({"ETH": 3000, "BNB": 400, "SOL": 150, "_ts": 0})
+            _PRICE_CACHE.update({"ETH": 3000.0, "BNB": 400.0, "SOL": 150.0, "_ts": 0})
     return _PRICE_CACHE
 
 
 # ── Blockchain API calls ──────────────────────────────────────────────────────
 
-async def _etherscan_txlist(address: str, api_key: str, base_url: str) -> list:
+def _etherscan_result_rows(data: dict) -> list:
+    """Etherscan/BSCScan often returns result=str on rate limit; only accept list rows."""
+    res = data.get("result")
+    if not isinstance(res, list):
+        return []
+    return res
+
+
+async def _etherscan_txlist(
+    client: httpx.AsyncClient, address: str, api_key: str, base_url: str
+) -> list:
     params = {
         "module": "account", "action": "txlist",
         "address": address, "sort": "desc", "offset": 20, "page": 1,
@@ -131,19 +145,21 @@ async def _etherscan_txlist(address: str, api_key: str, base_url: str) -> list:
     if api_key:
         params["apikey"] = api_key
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(base_url, params=params)
-            data = resp.json()
+        resp = await client.get(base_url, params=params)
+        data = resp.json()
         if data.get("status") == "1":
             min_ts = int(time.time()) - LOOKBACK_SECONDS
-            return [tx for tx in data.get("result", [])
-                    if int(tx.get("timeStamp") or 0) >= min_ts]
+            rows = _etherscan_result_rows(data)
+            return [tx for tx in rows
+                    if isinstance(tx, dict) and int(tx.get("timeStamp") or 0) >= min_ts]
     except Exception as e:
         logger.debug("txlist %s: %s", address[:8], e)
     return []
 
 
-async def _etherscan_tokentx(address: str, api_key: str, base_url: str) -> list:
+async def _etherscan_tokentx(
+    client: httpx.AsyncClient, address: str, api_key: str, base_url: str
+) -> list:
     params = {
         "module": "account", "action": "tokentx",
         "address": address, "sort": "desc", "offset": 20, "page": 1,
@@ -151,29 +167,31 @@ async def _etherscan_tokentx(address: str, api_key: str, base_url: str) -> list:
     if api_key:
         params["apikey"] = api_key
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(base_url, params=params)
-            data = resp.json()
+        resp = await client.get(base_url, params=params)
+        data = resp.json()
         if data.get("status") == "1":
             min_ts = int(time.time()) - LOOKBACK_SECONDS
-            return [tx for tx in data.get("result", [])
-                    if int(tx.get("timeStamp") or 0) >= min_ts]
+            rows = _etherscan_result_rows(data)
+            return [tx for tx in rows
+                    if isinstance(tx, dict) and int(tx.get("timeStamp") or 0) >= min_ts]
     except Exception as e:
         logger.debug("tokentx %s: %s", address[:8], e)
     return []
 
 
-async def _solscan_txs(address: str) -> list:
+async def _solscan_txs(client: httpx.AsyncClient, address: str) -> list:
     try:
         url = "https://public-api.solscan.io/account/transactions"
         params = {"account": address, "limit": 20}
         headers = {"accept": "application/json"}
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, params=params, headers=headers)
-            if resp.status_code == 200:
-                min_ts = int(time.time()) - LOOKBACK_SECONDS
-                return [tx for tx in resp.json()
-                        if tx.get("blockTime", 0) >= min_ts]
+        resp = await client.get(url, params=params, headers=headers)
+        if resp.status_code == 200:
+            body = resp.json()
+            if not isinstance(body, list):
+                return []
+            min_ts = int(time.time()) - LOOKBACK_SECONDS
+            return [tx for tx in body
+                    if isinstance(tx, dict) and tx.get("blockTime", 0) >= min_ts]
     except Exception as e:
         logger.debug("solscan %s: %s", address[:8], e)
     return []
@@ -413,17 +431,34 @@ class OnchainTracker:
     # ── Scanning ──────────────────────────────────────────────────────────
 
     async def _scan_all(self):
-        prices = await _get_prices()
-        new_signals = []
-        for address, meta in list(self._addresses.items()):
-            try:
-                sigs = await self._scan_address(address, meta, prices)
-                new_signals.extend(sigs)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.debug("scan_address %s error: %s", address[:8], e)
-            await asyncio.sleep(1)  # rate-limit buffer
+        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/onchain_tracker"}
+        async with httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
+        ) as client:
+            prices = await _get_prices(client)
+            new_signals = []
+
+            async def _one(addr: str, meta: dict) -> list:
+                async with _SCAN_CONCURRENCY:
+                    try:
+                        return await self._scan_address(client, addr, meta, prices)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.debug("scan_address %s error: %s", addr[:8], e)
+                        return []
+
+            pairs = list(self._addresses.items())
+            batch_results = await asyncio.gather(
+                *[_one(a, m) for a, m in pairs],
+                return_exceptions=True,
+            )
+            for r in batch_results:
+                if isinstance(r, list):
+                    new_signals.extend(r)
+                elif isinstance(r, Exception):
+                    logger.debug("scan batch error: %s", r)
+            await asyncio.sleep(0.3)
 
         if new_signals:
             # Dedup by tx_hash to avoid recording same transaction twice
