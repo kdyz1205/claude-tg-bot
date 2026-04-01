@@ -3,7 +3,9 @@ claude_agent.py — Harness Agent: HTTP LLM（aiohttp）+ 多窗口编排 + 项�
 
 主对话路径走 ``llm_http_client.complete_turn``（Anthropic / OpenAI / Ollama），
 日 Token 预算与模型降级见 ``tracker.quota`` / ``config.LLM_DAILY_TOKEN_BUDGET``。
-不再启动本地 ``claude`` CLI 子进程。
+
+**无子进程**：本模块不包含 ``subprocess.Popen`` / ``claude`` CLI 调用；策略类 JSON 请用
+``llm_strategy_json``（默认 ``timeout=30``，失败返回 ``confidence=0`` 安全结构）。
 """
 import asyncio
 import json
@@ -14,6 +16,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 import config
 import llm_http_client
 import harness_learn
@@ -804,7 +807,7 @@ async def _run_queued_tasks(chat_id: int, context) -> None:
                 _running_tasks[chat_id] = {"task_id": tid, "text": text[:100], "start_time": time.time()}
                 await _send_response(chat_id, f"📨 排队任务 #{tid}{queue_note}...", context)
                 try:
-                    success = await _process_with_claude_cli(text, chat_id, context)
+                    success = await _process_with_llm(text, chat_id, context)
                     if not success:
                         web_ok = await _fallback_to_web_ai(text, chat_id, context)
                         if not web_ok:
@@ -824,7 +827,7 @@ async def _run_queued_tasks(chat_id: int, context) -> None:
 
 # ─── HTTP LLM Runner (aiohttp: Ollama / Anthropic / OpenAI via llm_http_client) ─
 
-async def _run_claude_cli(
+async def _run_llm_turn(
     user_message: str, chat_id: int, context,
     timeout: int = None,
 ) -> tuple[str, str | None, list, str]:
@@ -1272,7 +1275,7 @@ async def _self_heal_inner(user_message: str, chat_id: int, context, error: Exce
         _save_sessions()
         await _send_response(chat_id, "🔧 会话异常，已重置。重新处理...", context)
         try:
-            response, sid, _, _ = await _run_claude_cli(user_message, chat_id, context)
+            response, sid, _, _ = await _run_llm_turn(user_message, chat_id, context)
             if sid:
                 _set_session(chat_id, sid)
                 _save_sessions()
@@ -1321,7 +1324,7 @@ async def _self_heal_inner(user_message: str, chat_id: int, context, error: Exce
             f'{{"diagnosis": "一句话原因", "fix": "建议的修复", "can_retry": true/false, "retry_action": "clear_session/restart/none"}}'
         )
 
-        diag_result = await _run_claude_raw(
+        diag_result = await _run_llm_raw(
             prompt=diag_prompt,
             model="claude-haiku-4-5-20251001",
             timeout=15,
@@ -1347,7 +1350,7 @@ async def _self_heal_inner(user_message: str, chat_id: int, context, error: Exce
 
             # Retry
             try:
-                response, sid, _, _ = await _run_claude_cli(user_message, chat_id, context)
+                response, sid, _, _ = await _run_llm_turn(user_message, chat_id, context)
                 if sid:
                     _set_session(chat_id, sid)
                     _save_sessions()
@@ -1440,22 +1443,17 @@ def _log_self_heal(error: str, diagnosis: dict, success: bool):
 
 # ─── Main Processing Logic ────────────────────────────────────────────────────
 
-async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> bool:
-    """Process message using Claude Code CLI. Returns True on success."""
-    # Check rate limit before calling CLI — silently wait with exponential backoff
-    # User preference: don't crash, don't report errors, wait transparently
+async def _process_with_llm(user_message: str, chat_id: int, context) -> bool:
+    """Process message via HTTP LLM (aiohttp). Returns True on success."""
+    # Check rate limit before calling LLM — silently wait with exponential backoff
     if is_rate_limited():
         wait_s = max(1, int(_rate_limited_until - time.time()) + 1)
-        logger.info(f"Chat {chat_id}: CLI rate limited, waiting {wait_s}s silently")
-        # Show brief transparent wait message (not an error — user stays informed)
+        logger.info(f"Chat {chat_id}: LLM rate limited, waiting {wait_s}s silently")
         await _send_response(chat_id, f"⏳ 等待{wait_s}s后继续...", context)
-        # Actually wait for the rate limit to expire, then process normally
-        await asyncio.sleep(min(wait_s, 300))  # Cap at 5 minutes
-        # After waiting, fall through to normal processing below
-
+        await asyncio.sleep(min(wait_s, 300))
     try:
         _start_time = time.time()
-        response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
+        response, new_session_id, matched_skill_ids, tool_output_text = await _run_llm_turn(user_message, chat_id, context)
 
         # Session recovery: if response indicates session error, retry without resume
         _cli_retried = False
@@ -1471,13 +1469,13 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
             _claude_sessions.pop(chat_id, None)
             _session_timestamps.pop(chat_id, None)
             _save_sessions()
-            response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
+            response, new_session_id, matched_skill_ids, tool_output_text = await _run_llm_turn(user_message, chat_id, context)
             _cli_retried = True
 
-        # Auth error: session already cleared in _run_claude_cli, retry fresh immediately
+        # Auth error: session already cleared in _run_llm_turn, retry fresh immediately
         if response == "__AUTH_ERROR__" and not _cli_retried:
             logger.warning(f"Chat {chat_id}: CLI auth error, retrying fresh (no resume)")
-            response, new_session_id, matched_skill_ids, tool_output_text = await _run_claude_cli(user_message, chat_id, context)
+            response, new_session_id, matched_skill_ids, tool_output_text = await _run_llm_turn(user_message, chat_id, context)
             if response == "__AUTH_ERROR__":
                 logger.error(f"Chat {chat_id}: CLI auth error persists after retry")
                 _self_monitor.record_service_failure("cli", "auth_error")
@@ -2039,7 +2037,7 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs) ->
                     if idx > 0:
                         await _send_response(chat_id, f"▶ 任务 {idx+1}/{len(intents)}：{intent[:60]}...", context)
                     _update_chat_context(chat_id, intent)
-                    success = await _process_with_claude_cli(intent, chat_id, context)
+                    success = await _process_with_llm(intent, chat_id, context)
                     if not success and getattr(config, "NEVER_DIE_MODE", True):
                         if await _fallback_to_api_providers(intent, chat_id, context, image_data=image_data):
                             success = True
@@ -2075,7 +2073,7 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs) ->
                     logger.warning(f"Chat {chat_id}: pipeline failed ({e}), falling back to CLI")
 
             # Primary path: Claude CLI with session persistence
-            success = await _process_with_claude_cli(user_message, chat_id, context)
+            success = await _process_with_llm(user_message, chat_id, context)
             if success:
                 # Proactive suggestion after successful single-intent response
                 # (We don't have the response text here, but we can use context)
@@ -2200,7 +2198,7 @@ async def _auto_compile_check(response: str, tool_output_text: str, chat_id: int
         )
         try:
             fix_resp, fix_sid, _, _ = await asyncio.wait_for(
-                _run_claude_cli(fix_prompt, -(abs(chat_id) + 1000000), context, timeout=120),
+                _run_llm_turn(fix_prompt, -(abs(chat_id) + 1000000), context, timeout=120),
                 timeout=130,
             )
             # Verify fix worked
@@ -2310,12 +2308,12 @@ async def _process_with_pipeline(user_message: str, chat_id: int, context):
         # Fallback to direct CLI
         logger.info(f"Chat {chat_id}: pipeline failed, falling back to direct CLI")
         await _send_response(chat_id, f"⚠️ 多Agent管线出错，切换到直接模式...", context)
-        success = await _process_with_claude_cli(user_message, chat_id, context)
+        success = await _process_with_llm(user_message, chat_id, context)
         if not success:
             await _send_response(chat_id, "⚠️ 也失败了，请重试。", context)
 
 
-async def _run_claude_cli_direct(
+async def _run_llm_stateless_training(
     prompt: str,
     model: str = "claude-sonnet-4-6",
     timeout: int = 120,
@@ -2337,22 +2335,26 @@ async def _run_claude_cli_direct(
     return (text or "Done.").strip(), None
 
 
-async def _run_claude_raw(
+async def _run_llm_raw(
     prompt: str,
     model: str = "claude-haiku-4-5-20251001",
     timeout: int = 30,
 ) -> str:
-    """Stateless HTTP LLM for judge/meta tasks (full instruction in user message)."""
-    text, err = await llm_http_client.complete_stateless(
-        system_prompt="Follow the user message exactly. Output only what is requested, no preamble.",
-        user_text=(prompt or "")[:120_000],
-        model_hint=model,
-        timeout_sec=float(timeout),
-        state_key=-302,
-    )
-    if err:
+    """Stateless HTTP LLM for judge/meta tasks; never raises."""
+    try:
+        text, err = await llm_http_client.complete_stateless(
+            system_prompt="Follow the user message exactly. Output only what is requested, no preamble.",
+            user_text=(prompt or "")[:120_000],
+            model_hint=model,
+            timeout_sec=float(timeout),
+            state_key=-302,
+        )
+        if err:
+            return ""
+        return (text or "").strip()[:2000]
+    except Exception as e:
+        logger.debug("_run_llm_raw failed: %s", e, exc_info=True)
         return ""
-    return (text or "").strip()[:2000]
 
 
 async def _repair_trade_json_via_haiku(round_idx: int, bad_snippet: str) -> str:
@@ -2428,3 +2430,35 @@ def create_project_session(name: str, project_dir: str, model: str = "claude-son
         logger.warning("SessionManager not available")
         return None
     return _session_mgr.create(name, project_dir, model)
+
+
+async def llm_strategy_json(
+    user_prompt: str,
+    *,
+    system_prompt: str | None = None,
+    model_hint: str | None = None,
+    timeout_sec: float = 30.0,
+) -> dict[str, Any]:
+    """
+    One-shot strategy / scoring call over HTTP (aiohttp). ``timeout_sec`` default 30.
+    Malformed JSON, timeouts, or transport errors → ``confidence=0``, ``ok=False``; never raises.
+    """
+    sp = system_prompt or (
+        "You are a disciplined trading assistant. Output exactly one JSON object with keys: "
+        "action (string), confidence (number from 0 to 1), reason (string). "
+        "No markdown code fences, no text outside the JSON object."
+    )
+    return await llm_http_client.complete_strategy_json(
+        system_prompt=sp,
+        user_text=user_prompt,
+        model_hint=model_hint or getattr(config, "TASK_TIER_FAST_CLAUDE", None),
+        timeout_sec=timeout_sec,
+        state_key=-922,
+    )
+
+
+# Legacy names — still HTTP/aiohttp only (no Claude CLI subprocess).
+_run_claude_cli = _run_llm_turn
+_process_with_claude_cli = _process_with_llm
+_run_claude_cli_direct = _run_llm_stateless_training
+_run_claude_raw = _run_llm_raw

@@ -8068,33 +8068,55 @@ def _startup_health_check():
     return issues
 
 
-def main():
-    if not config.TELEGRAM_BOT_TOKEN or config.TELEGRAM_BOT_TOKEN == "your_token_here":
-        print("ERROR: Set TELEGRAM_BOT_TOKEN in .env")
-        return
-    if config.AUTHORIZED_USER_ID is None:
-        print("NOTE: AUTHORIZED_USER_ID not set. Send any message to get your ID.")
+async def run_polling_lifecycle(app, on_system_ready=None):
+    """Run Telegram polling on the current asyncio loop."""
+    from telegram.error import TelegramError
 
-    _startup_health_check()
-    _acquire_pid_lock()
-
-    # Seed skill library with evolution knowledge on first run
+    stop_evt = asyncio.Event()
     try:
-        import skill_library
-        seeded = skill_library.seed_evolution_skills()
-        if seeded:
-            logger.info(f"Skill library seeded with {seeded} evolution skills")
-    except Exception as _se:
-        logger.warning(f"Skill seed failed: {_se}")
+        await app.initialize()
+        if app.post_init:
+            await app.post_init(app)
+        if not app.updater:
+            raise RuntimeError("Application has no Updater")
 
-    # Start web dashboard on port 8080
-    if _dashboard_available:
+        def error_callback(exc: TelegramError) -> None:
+            app.create_task(app.process_error(error=exc, update=None))
+
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            error_callback=error_callback,
+        )
+        await app.start()
+        if on_system_ready:
+            on_system_ready()
+        await stop_evt.wait()
+    except asyncio.CancelledError:
+        raise
+    finally:
         try:
-            _dashboard.start_dashboard(port=8080)
-            print("Dashboard started at http://localhost:8080")
-        except Exception as _de:
-            logger.warning(f"Dashboard start failed: {_de}")
+            if app.updater and getattr(app.updater, "running", False):
+                await app.updater.stop()
+        except Exception:
+            logger.debug("updater.stop failed", exc_info=True)
+        try:
+            if app.running:
+                await app.stop()
+                if app.post_stop:
+                    await app.post_stop(app)
+        except Exception:
+            logger.debug("application.stop failed", exc_info=True)
+        try:
+            if getattr(app, "_initialized", False):
+                await app.shutdown()
+                if app.post_shutdown:
+                    await app.post_shutdown(app)
+        except Exception:
+            logger.debug("shutdown failed", exc_info=True)
 
+
+def create_application():
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
 
     # Global error handler
@@ -8972,40 +8994,46 @@ def main():
         logger.info("Post-shutdown cleanup complete")
 
     app.post_shutdown = post_shutdown
+    return app
 
-    print(f"Bot started! Mode: {'CLI (Plan tokens)' if config.BRIDGE_MODE else 'API'}")
-    print("Press Ctrl+C to stop.")
+
+async def async_main(on_system_ready=None):
+    if not config.TELEGRAM_BOT_TOKEN or config.TELEGRAM_BOT_TOKEN == "your_token_here":
+        print("ERROR: Set TELEGRAM_BOT_TOKEN in .env")
+        return
+    if config.AUTHORIZED_USER_ID is None:
+        print("NOTE: AUTHORIZED_USER_ID not set. Send any message to get your ID.")
+
+    _startup_health_check()
+    _acquire_pid_lock()
     try:
+        # Seed skill library with evolution knowledge on first run
         try:
-            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-        except KeyboardInterrupt:
-            raise
-        except SystemExit as se:
-            _code = getattr(se, "code", se)
-            if _code not in (0, None):
-                tb = traceback.format_exc()
-                print(tb, flush=True)
-                logger.critical("Phoenix: SystemExit from run_polling code=%s", _code)
-                _phoenix_notify_telegram_sync(
-                    "🛟 Phoenix: SystemExit — 5s 后由 run.py 重启子进程",
-                    f"code={_code}\n\n{tb}"[:3800],
-                )
-                _release_pid_lock()
-                time.sleep(5)
-                os._exit(int(_code) if isinstance(_code, int) else 1)
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(tb, flush=True)
-            logger.critical("Phoenix: run_polling crashed: %s", e, exc_info=True)
-            _phoenix_notify_telegram_sync(
-                "🛟 Phoenix: run_polling 崩溃 — 5s 后由 run.py 重启子进程",
-                f"{type(e).__name__}: {e}\n\n{tb}"[:3800],
-            )
-            _release_pid_lock()
-            time.sleep(5)
-            os._exit(1)
+            import skill_library
+            seeded = skill_library.seed_evolution_skills()
+            if seeded:
+                logger.info(f"Skill library seeded with {seeded} evolution skills")
+        except Exception as _se:
+            logger.warning(f"Skill seed failed: {_se}")
+
+        # Start web dashboard on port 8080
+        if _dashboard_available:
+            try:
+                _dashboard.start_dashboard(port=8080)
+                print("Dashboard started at http://localhost:8080")
+            except Exception as _de:
+                logger.warning(f"Dashboard start failed: {_de}")
+
+        app = create_application()
+        await run_polling_lifecycle(app, on_system_ready=on_system_ready)
+    except KeyboardInterrupt:
+        raise
     finally:
         _release_pid_lock()
+
+
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

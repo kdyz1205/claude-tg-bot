@@ -75,27 +75,31 @@ TradeJsonReaskFn = Callable[[int, str], Awaitable[str]]
 
 async def reask_trade_json_via_http(round_idx: int, previous_output: str) -> str:
     """
-    Ask the configured HTTP LLM to emit a single trade JSON object (bounded timeout, semaphore in client).
+    Ask the configured HTTP LLM to emit a single trade JSON object.
+    Fixed 30s budget; aiohttp only — no subprocess. Never raises.
     """
-    reminder = TRADE_JSON_REMINDERS[round_idx % len(TRADE_JSON_REMINDERS)]
-    import config as _cfg
+    try:
+        reminder = TRADE_JSON_REMINDERS[round_idx % len(TRADE_JSON_REMINDERS)]
+        import config as _cfg
 
-    import llm_http_client
+        import llm_http_client
 
-    user = (
-        f"{reminder}\n\n"
-        "先前输出无法通过交易 JSON 校验。请只输出一个对象，键为 action, pair, amount, price。\n\n"
-        f"{str(previous_output)[:3800]}"
-    )
-    timeout = float(getattr(_cfg, "API_REQUEST_TIMEOUT_SEC", 60))
-    text, err = await llm_http_client.complete_stateless(
-        system_prompt="Reply with a single JSON object only. Keys: action, pair, amount, price. No markdown.",
-        user_text=user,
-        model_hint=getattr(_cfg, "TASK_TIER_FAST_CLAUDE", None),
-        timeout_sec=min(90.0, max(15.0, timeout)),
-        state_key=-450 - (round_idx % 40),
-    )
-    return (text or err or "").strip()
+        user = (
+            f"{reminder}\n\n"
+            "先前输出无法通过交易 JSON 校验。请只输出一个对象，键为 action, pair, amount, price。\n\n"
+            f"{str(previous_output)[:3800]}"
+        )
+        text, err = await llm_http_client.complete_stateless(
+            system_prompt="Reply with a single JSON object only. Keys: action, pair, amount, price. No markdown.",
+            user_text=user,
+            model_hint=getattr(_cfg, "TASK_TIER_FAST_CLAUDE", None),
+            timeout_sec=30.0,
+            state_key=-450 - (round_idx % 40),
+        )
+        return (text or err or "").strip()
+    except Exception as e:
+        logger.warning("reask_trade_json_via_http failed: %s", e)
+        return ""
 
 
 class TradeDirectiveModel(BaseModel):

@@ -1,25 +1,17 @@
 """
-Compatibility facade: web metrics live in ``web_dashboard``; Telegram inline panel
-templates live in ``gateway.tg_panel``. Importing ``dashboard`` stays stable for ``bot.py``.
+Compatibility facade for the web dashboard.
 
-TG 面板数据面：持仓等数值由 ``trading.portfolio_snapshot`` 进程内缓存（可选 Redis 镜像，
-见 ``get_snapshot_for_gateway``）；不要在 ``dashboard`` 里做链上/交易所计算。
+- **Web**: metrics and Flask app live in ``web_dashboard``.
+- **Telegram gateway panel**: keyboards and Markdown templates live in ``gateway.tg_front``
+  (wired by ``gateway.telegram_bot``). This module does **not** re-export PTB UI helpers.
+
+Importing ``dashboard`` remains stable for ``bot.py`` (``start_dashboard``, ``get_stats_text``, …).
 """
 
 from __future__ import annotations
 
-from gateway.tg_panel import (
-    GW_CB,
-    tg_gw_build_back_keyboard,
-    tg_gw_build_main_keyboard,
-    tg_gw_build_positions_keyboard,
-    tg_gw_escape_v2,
-    tg_gw_mode_label,
-    tg_gw_render_callback_pending_text,
-    tg_gw_render_home_text,
-    tg_gw_render_positions_text,
-    tg_gw_render_strategy_text,
-)
+from dataclasses import dataclass
+
 from web_dashboard import (
     _flask_available,
     app,
@@ -28,17 +20,20 @@ from web_dashboard import (
     start_dashboard,
 )
 
+
+@dataclass(frozen=True)
+class GatewayPanelConfig:
+    """Pure data: inline panel callback prefix (must match ``gateway.tg_front.GW_CB``)."""
+
+    callback_prefix: str = "gw"
+
+
+# Single source of truth for the prefix string is ``gateway.tg_front.GW_CB``; kept here for data-only imports.
+GW_CB = GatewayPanelConfig.callback_prefix
+
 __all__ = [
+    "GatewayPanelConfig",
     "GW_CB",
-    "tg_gw_build_back_keyboard",
-    "tg_gw_build_main_keyboard",
-    "tg_gw_build_positions_keyboard",
-    "tg_gw_escape_v2",
-    "tg_gw_mode_label",
-    "tg_gw_render_callback_pending_text",
-    "tg_gw_render_home_text",
-    "tg_gw_render_positions_text",
-    "tg_gw_render_strategy_text",
     "record_message",
     "start_dashboard",
     "get_stats_text",

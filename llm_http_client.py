@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 import aiohttp
@@ -367,3 +368,105 @@ async def complete_stateless(
     )
     await clear_history(state_key)
     return text, err
+
+
+_JSON_FENCE = re.compile(r"```json\s*([\s\S]*?)```", re.I)
+
+
+def extract_json_object_from_llm_text(raw: str | None) -> dict[str, Any] | None:
+    """First JSON object from fenced block or brace scan; never raises."""
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw)
+    m = _JSON_FENCE.search(s)
+    if m:
+        try:
+            obj = json.loads(m.group(1).strip())
+            if isinstance(obj, dict):
+                return obj
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    decoder = json.JSONDecoder()
+    start = 0
+    while True:
+        i = s.find("{", start)
+        if i < 0:
+            break
+        try:
+            obj, _ = decoder.raw_decode(s, i)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        start = i + 1
+    return None
+
+
+def strategy_json_safe_default(*, reason: str = "llm_unavailable", detail: str | None = None) -> dict[str, Any]:
+    """Default strategy / signal payload when LLM fails — never execute on this alone."""
+    out: dict[str, Any] = {
+        "ok": False,
+        "action": "hold",
+        "confidence": 0.0,
+        "reason": reason[:200],
+        "raw": None,
+    }
+    if detail:
+        out["detail"] = detail[:500]
+    return out
+
+
+async def complete_strategy_json(
+    *,
+    system_prompt: str,
+    user_text: str,
+    model_hint: str | None = None,
+    timeout_sec: float = 30.0,
+    state_key: int = -911,
+) -> dict[str, Any]:
+    """
+    One-shot LLM call expecting a single JSON object (strategy / scoring).
+    Hard cap ``timeout_sec`` default 30s; malformed JSON or network errors → safe dict, never raises.
+    """
+    try:
+        t_sec = max(5.0, min(120.0, float(timeout_sec)))
+    except (TypeError, ValueError):
+        t_sec = 30.0
+
+    try:
+        text, err = await complete_stateless(
+            system_prompt=(system_prompt or "Reply with one JSON object only.")[:120_000],
+            user_text=(user_text or "")[:120_000],
+            model_hint=model_hint,
+            timeout_sec=t_sec,
+            state_key=state_key,
+        )
+    except asyncio.TimeoutError:
+        return strategy_json_safe_default(reason="timeout")
+    except Exception as e:
+        logger.exception("complete_strategy_json transport: %s", e)
+        return strategy_json_safe_default(reason="exception", detail=str(e)[:300])
+
+    if err:
+        return strategy_json_safe_default(reason="http_error", detail=err[:500])
+
+    parsed = extract_json_object_from_llm_text(text)
+    if not parsed:
+        return strategy_json_safe_default(reason="parse_error", detail=(text or "")[:200])
+
+    try:
+        conf = float(parsed.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+
+    action = str(parsed.get("action", "hold") or "hold")[:64]
+    why = str(parsed.get("reason", "") or "")[:500]
+
+    return {
+        "ok": True,
+        "action": action,
+        "confidence": conf,
+        "reason": why,
+        "raw": parsed,
+    }
