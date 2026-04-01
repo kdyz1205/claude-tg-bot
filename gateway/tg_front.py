@@ -119,6 +119,29 @@ def _hedge_section_plain(snap: dict, open_live: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _okx_net_usd_plain(snap: dict) -> tuple[str, float]:
+    """Label line + numeric USD (0 if unknown). OKX row only — no wallet fallback."""
+    ox = snap.get("okx") or {}
+    if not ox.get("ok"):
+        return "— （未接入 API 或未返回）", 0.0
+    v = float(ox.get("total_equity_usd", 0) or 0)
+    if v <= 0:
+        return "$0.00（权益为 0 或未同步）", 0.0
+    return f"${v:,.2f}", v
+
+
+def _chain_net_plain(snap: dict) -> tuple[str, float]:
+    w = snap.get("wallet") or {}
+    sp = float(snap.get("sol_price") or 0)
+    if not w.get("ok"):
+        return "— （链上钱包未配置或未读）", 0.0
+    sb = float(w.get("sol_bal", 0) or 0)
+    if sp > 0:
+        usd = sb * sp
+        return f"${usd:,.2f}（≈ {sb:.4f} SOL）", usd
+    return f"{sb:.4f} SOL（暂无 SOL/USD 价）", 0.0
+
+
 def render_dashboard_plain_text(
     mode: str,
     snap: dict,
@@ -131,19 +154,17 @@ def render_dashboard_plain_text(
     err = (snap.get("last_error") or "").strip()
     health = "🟢 运行正常" if active and not err else ("🔴 异常" if err else "⚪ 引擎未启动")
 
-    ox = snap.get("okx") or {}
-    eq = float(ox.get("total_equity_usd", 0) or 0)
-    if eq <= 0:
-        sol_p0 = float(snap.get("sol_price") or 0)
-        w = snap.get("wallet") or {}
-        sol_b = float(w.get("sol_bal", 0) or 0)
-        eq = sol_b * sol_p0 if sol_p0 > 0 else 0.0
+    okx_line, _ = _okx_net_usd_plain(snap)
+    chain_line, _ = _chain_net_plain(snap)
 
     daily_sol = float(live_stats.get("daily_pnl_sol", 0) or 0)
     sol_p = float(snap.get("sol_price") or 0)
     daily_usd = daily_sol * sol_p if sol_p > 0 else daily_sol
+    _, ox_v = _okx_net_usd_plain(snap)
+    _, ch_v = _chain_net_plain(snap)
+    ref = ox_v + ch_v
     start_bal = float(live_stats.get("starting_balance", 0) or 0)
-    denom_usd = start_bal * sol_p if (start_bal > 0 and sol_p > 0) else (eq if eq > 0 else 1.0)
+    denom_usd = start_bal * sol_p if (start_bal > 0 and sol_p > 0) else (ref if ref > 0 else 1.0)
     pct = (daily_usd / denom_usd * 100.0) if denom_usd else 0.0
     d_sign = "+" if daily_usd >= 0 else ""
     p_sign = "+" if pct >= 0 else ""
@@ -160,7 +181,8 @@ def render_dashboard_plain_text(
     body = (
         f"🤖 奇点量化终端 | [{health}]\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 总资产净值: ${eq:,.2f}\n"
+        f"OKX 净资产: {okx_line}\n"
+        f"链上净资产: {chain_line}\n"
         f"📈 今日盈亏: {d_sign}${abs(daily_usd):.2f} ({emoji_pnl} {p_sign}{abs(pct):.1f}%)\n"
         f"模式: {mode_note}\n\n"
         f"{_hedge_section_plain(snap, open_live)}\n"
@@ -187,23 +209,21 @@ def render_dashboard_text(
     health_e = e(health)
 
     ox = snap.get("okx") or {}
-    eq = float(ox.get("total_equity_usd", 0) or 0)
-    if eq <= 0:
-        sol_p = float(snap.get("sol_price") or 0)
-        w = snap.get("wallet") or {}
-        sol_b = float(w.get("sol_bal", 0) or 0)
-        eq = sol_b * sol_p if sol_p > 0 else 0.0
+    okx_plain, ox_usd = _okx_net_usd_plain(snap)
+    chain_plain, ch_usd = _chain_net_plain(snap)
+    okx_line_e = e(okx_plain)
+    chain_line_e = e(chain_plain)
 
     daily_sol = float(live_stats.get("daily_pnl_sol", 0) or 0)
     sol_p = float(snap.get("sol_price") or 0)
     daily_usd = daily_sol * sol_p if sol_p > 0 else daily_sol
+    ref_usd = float(ox_usd) + float(ch_usd)
     start_bal = float(live_stats.get("starting_balance", 0) or 0)
-    denom_usd = start_bal * sol_p if (start_bal > 0 and sol_p > 0) else (eq if eq > 0 else 1.0)
+    denom_usd = start_bal * sol_p if (start_bal > 0 and sol_p > 0) else (ref_usd if ref_usd > 0 else 1.0)
     pct = (daily_usd / denom_usd * 100.0) if denom_usd else 0.0
     d_sign = "\\+" if daily_usd >= 0 else ""
     p_sign = "\\+" if pct >= 0 else ""
     emoji_pnl = "🟢" if daily_usd >= 0 else "🔴"
-    eq_v = _num_v2(eq, ",.2f")
     du_v = _num_v2(abs(daily_usd), ".2f")
     pct_v = _num_v2(abs(pct), ".1f")
 
@@ -214,13 +234,22 @@ def render_dashboard_text(
     except Exception:
         open_live = []
 
+    wallet_hint = ""
+    if m == "live" and not (snap.get("wallet") or {}).get("ok"):
+        wallet_hint = f"\n_{e('链上未就绪时可先 /wallet_setup；快照来自内存缓存。')}_\n"
+
     mode_note = e("实盘" if m == "live" else "模拟")
+    ox_age = bool(ox.get("ok"))
+    cache_note = e(
+        f"快照: OKX={'OK' if ox_age else '—'} · 内存缓存 {_num_v2(float(snap.get('age_sec') or 0), '.0f')}s 前"
+    )
     body = (
         f"🤖 *奇点量化终端* \\| \\[{health_e}\\]\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 *总资产净值:* \\${eq_v}\n"
-        f"📈 *今日盈亏:* {d_sign}\\${du_v} \\({emoji_pnl} {p_sign}{pct_v}%\\)\n"
-        f"_{e('模式')}: {mode_note}_\n\n"
+        f"🏦 *{e('OKX 净资产')}:* {okx_line_e}\n"
+        f"🔗 *{e('链上净资产')}:* {chain_line_e}\n"
+        f"📈 *{e('今日盈亏')}:* {d_sign}\\${du_v} \\({emoji_pnl} {p_sign}{pct_v}%\\)\n"
+        f"_{e('模式')}: {mode_note}_ · _{cache_note}_{wallet_hint}\n"
         f"{_hedge_section_v2(snap, open_live)}\n"
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
@@ -275,29 +304,198 @@ def render_status_brief_text(
 def build_dashboard_keyboard(sched_active: bool) -> InlineKeyboardMarkup | None:
     if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
         return None
-    row_engine = [
-        InlineKeyboardButton(
-            "▶️ 启动全自动引擎",
-            callback_data=f"{GW_CB}:engine_start",
-        ),
-        InlineKeyboardButton(
-            "⏹ 紧急停止并平仓",
-            callback_data=f"{GW_CB}:engine_stop",
-        ),
-    ]
-    row_ops = [
-        InlineKeyboardButton("🔄 刷新资产", callback_data=f"{GW_CB}:refresh"),
-        InlineKeyboardButton("⚙️ 风控设置", callback_data=f"{GW_CB}:risk"),
-    ]
-    return InlineKeyboardMarkup([row_engine, row_ops])
+    _ = sched_active  # 保留签名；引擎状态在文案中已体现
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🚀 启动全引擎",
+                    callback_data=f"{GW_CB}:engine_start",
+                ),
+                InlineKeyboardButton(
+                    "🛑 停止全引擎",
+                    callback_data=f"{GW_CB}:engine_stop",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "⚡ 极速手动交易",
+                    callback_data=f"{GW_CB}:manual_hub",
+                ),
+                InlineKeyboardButton(
+                    "🛡️ 风险控制设置",
+                    callback_data=f"{GW_CB}:risk",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔍 遍历全平台同步",
+                    callback_data=f"{GW_CB}:full_sync",
+                ),
+            ],
+        ]
+    )
+
+
+def build_manual_hub_keyboard() -> InlineKeyboardMarkup | None:
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🏦 OKX 研发中枢",
+                    callback_data=f"{GW_CB}:manual_okx",
+                ),
+                InlineKeyboardButton(
+                    "🔗 链上狙击中心",
+                    callback_data=f"{GW_CB}:manual_onchain",
+                ),
+            ],
+            [InlineKeyboardButton("↩️ 返回主看板", callback_data=f"{GW_CB}:dash")],
+        ]
+    )
+
+
+def render_manual_hub_text() -> str:
+    e = escape_v2
+    return (
+        f"⚡ *{e('极速手动交易')}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_{e('二选一进入子面板；OKX 侧重策略研发，链上侧重 DEX 狙击。')}_"
+    )
+
+
+def render_okx_lab_text() -> str:
+    e = escape_v2
+    return (
+        f"🏦 *{e('OKX 策略研发中枢')}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_{e('此处不提供手动买卖；用于算法进化、训练与因子工程。')}_\n\n"
+        f"· *{e('自动进化')}:* {e('InfiniteEvolver 周期 sweep')}\n"
+        f"· *{e('模型训练')}:* {e('auto_train 提示词/评测闭环')}\n"
+        f"· *{e('因子挖掘')}:* {e('FACTOR_FORGE 造物主写 sk_ 技能')}\n"
+        f"· *{e('Alpha 状态')}:* {e('本机 skills 与任务一瞥')}_"
+    )
+
+
+def build_okx_lab_keyboard() -> InlineKeyboardMarkup | None:
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🧬 开启自动进化",
+                    callback_data=f"{GW_CB}:lab:evolve",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🧠 启动模型训练",
+                    callback_data=f"{GW_CB}:lab:train",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🧪 因子挖掘 (Factor Forge)",
+                    callback_data=f"{GW_CB}:lab:factor",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Alpha 状态看板",
+                    callback_data=f"{GW_CB}:lab:alpha",
+                ),
+            ],
+            [InlineKeyboardButton("↩️ 上一层", callback_data=f"{GW_CB}:manual_hub")],
+            [InlineKeyboardButton("↩️ 返回主看板", callback_data=f"{GW_CB}:dash")],
+        ]
+    )
+
+
+def render_onchain_hub_text() -> str:
+    e = escape_v2
+    return (
+        f"🔗 *{e('链上狙击中心')}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_{e('DEX 手动买卖、持仓与 CA 粘贴在本机器人请使用命令 /trade（与主交易面板同源）。')}_\n\n"
+        f"*{e('操作')}:* {e('在会话中发送')} `/trade`"
+    )
+
+
+def build_onchain_hub_keyboard() -> InlineKeyboardMarkup | None:
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("↩️ 返回主看板", callback_data=f"{GW_CB}:dash")],
+            [
+                InlineKeyboardButton(
+                    "↩️ 上一层",
+                    callback_data=f"{GW_CB}:manual_hub",
+                ),
+            ],
+        ]
+    )
 
 
 def build_risk_keyboard(mode: str) -> InlineKeyboardMarkup | None:
+    return build_risk_settings_keyboard(mode)
+
+
+def build_back_keyboard() -> InlineKeyboardMarkup | None:
+    return build_risk_keyboard("paper")
+
+
+def render_risk_settings_text(mode: str, cfg: dict) -> str:
+    e = escape_v2
+    m = (mode or "paper").lower()
+    mts = cfg.get("max_trade_sol")
+    mts_s = "null" if mts is None else f"{float(mts):.4f}"
+    lines = [
+        f"🛡️ *{e('风险控制')}* \\(_{e('模式')}: {e('实盘' if m == 'live' else '模拟')}_\\)",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"1\\. *MaxTradeSize* \\(`max\\_trade\\_pct`\\): `{float(cfg.get('max_trade_pct', 0) or 0):.1f}`% {e('单笔相对权益上限')}",
+        f"2\\. *MaxTradeSOL* \\(`max\\_trade\\_sol`\\): `{mts_s}` {e('SOL 硬顶，null=仅按百分比')}",
+        f"3\\. *MaxPosition* \\(`max\\_positions`\\): `{int(cfg.get('max_positions', 0) or 0)}` {e('最大并发仓位')}",
+        f"4\\. *DailyLossLimit* \\(`daily\\_loss\\_limit\\_pct`\\): `{float(cfg.get('daily_loss_limit_pct', 0) or 0):.1f}`%",
+        f"5\\. *StopLoss* \\(`stop\\_loss\\_pct`\\): `{float(cfg.get('stop_loss_pct', 0) or 0):.1f}`%",
+        f"6\\. *TakeProfit* \\(`take\\_profit\\_pct`\\): `{float(cfg.get('take_profit_pct', 0) or 0):.1f}`%",
+        f"7\\. *PairVolatilityThreshold* \\(`max\\_slippage\\_bps`\\): `{int(cfg.get('max_slippage_bps', 0) or 0)}` bps",
+        f"8\\. *MinLiquidity* \\(`min\\_liquidity\\_usd`\\): `{float(cfg.get('min_liquidity_usd', 0) or 0):,.0f}` USD",
+        f"9\\. *neural\\_execution:* `{'on' if cfg.get('neural_execution_enabled') else 'off'}`",
+        "",
+        "_" + e("点下方 ✏️ 回复数字即可热更新；无需改代码。") + "_",
+    ]
+    return "\n".join(lines)
+
+
+def build_risk_settings_keyboard(mode: str) -> InlineKeyboardMarkup | None:
+    """风控页：每键 ✏️ 调整 + 模式切换 + 返回看板。"""
     if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
         return None
     m = (mode or "paper").lower()
+    re = f"{GW_CB}:risk_edit"
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton("✏️ MaxTrade%", callback_data=f"{re}:max_trade_pct"),
+                InlineKeyboardButton("✏️ MaxTradeSOL", callback_data=f"{re}:max_trade_sol"),
+            ],
+            [
+                InlineKeyboardButton("✏️ MaxPos", callback_data=f"{re}:max_positions"),
+                InlineKeyboardButton("✏️ DailyLoss", callback_data=f"{re}:daily_loss_limit_pct"),
+            ],
+            [
+                InlineKeyboardButton("✏️ SL%", callback_data=f"{re}:stop_loss_pct"),
+                InlineKeyboardButton("✏️ TP%", callback_data=f"{re}:take_profit_pct"),
+            ],
+            [
+                InlineKeyboardButton("✏️ Slip bps", callback_data=f"{re}:max_slippage_bps"),
+                InlineKeyboardButton("✏️ MinLiq", callback_data=f"{re}:min_liquidity_usd"),
+            ],
             [
                 InlineKeyboardButton(
                     f"{'✓ ' if m != 'live' else ''}🔵 模拟盘",
@@ -308,32 +506,15 @@ def build_risk_keyboard(mode: str) -> InlineKeyboardMarkup | None:
                     callback_data=f"{GW_CB}:mode:live",
                 ),
             ],
-            [InlineKeyboardButton("⬅️ 返回看板", callback_data=f"{GW_CB}:dash")],
+            [
+                InlineKeyboardButton(
+                    "❌ 取消数值编辑",
+                    callback_data=f"{GW_CB}:risk_cancel",
+                ),
+            ],
+            [InlineKeyboardButton("↩️ 返回主看板", callback_data=f"{GW_CB}:dash")],
         ]
     )
-
-
-def build_back_keyboard() -> InlineKeyboardMarkup | None:
-    return build_risk_keyboard("paper")
-
-
-def render_risk_settings_text(mode: str, cfg: dict) -> str:
-    e = escape_v2
-    m = (mode or "paper").lower()
-    lines = [
-        f"⚙️ *风控设置* \\(_{e('模式')}: {e('实盘' if m == 'live' else '模拟')}_\\)",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        "",
-        f"· max\\_trade\\_pct: `{float(cfg.get('max_trade_pct', 0) or 0):.1f}`",
-        f"· max\\_positions: `{int(cfg.get('max_positions', 0) or 0)}`",
-        f"· daily\\_loss\\_limit\\_pct: `{float(cfg.get('daily_loss_limit_pct', 0) or 0):.1f}`",
-        f"· stop\\_loss\\_pct: `{float(cfg.get('stop_loss_pct', 0) or 0):.1f}`",
-        f"· take\\_profit\\_pct: `{float(cfg.get('take_profit_pct', 0) or 0):.1f}`",
-        f"· neural\\_execution: `{'on' if cfg.get('neural_execution_enabled') else 'off'}`",
-        "",
-        "_" + e("修改 _live_config.json 或通过策略模块调整；此处仅展示当前文件值。") + "_",
-    ]
-    return "\n".join(lines)
 
 
 # ─── Legacy names (imports / harness) ─────────────────────────────────────────
@@ -351,7 +532,7 @@ def render_home_text(mode: str) -> str:
     except ImportError:
         live_trader = None  # type: ignore[misc, assignment]
 
-    snap = portfolio_snapshot.get_snapshot_for_gateway()
+    snap = portfolio_snapshot.get_latest_cache()
     st = trade_scheduler.read_scheduler_state()
     stats = live_trader.get_live_stats() if live_trader else {}
     return render_dashboard_text(mode, snap, st, stats)

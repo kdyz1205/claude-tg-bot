@@ -120,6 +120,8 @@ except ImportError:
     _trade_scheduler = None
     _live_available = False
 
+_td_okx_evolver = None  # infinite_evolver.InfiniteEvolver — /trade 面板 OKX 研发中枢
+
 try:
     from trading import OKXExecutor, StrategyBrain
     _okx_brain: StrategyBrain | None = None
@@ -3084,19 +3086,22 @@ def _build_dashboard_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("\U0001f4dd Paper", callback_data="td_paper_menu"),
             InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="td_settings"),
         ],
-        # Row 3: OKX Market
+        # Row 3–4: OKX 策略研发中枢（非手动柜台）
         [
-            InlineKeyboardButton("\U0001f525 OKX Hot", callback_data="td_okx_hot"),
-            InlineKeyboardButton("\U0001f4b2 Funding", callback_data="td_okx_funding"),
-            InlineKeyboardButton("\U0001f4c9 Gainers", callback_data="td_okx_movers"),
+            InlineKeyboardButton("\U0001f9ec 进化", callback_data="td_okx_evolve"),
+            InlineKeyboardButton("\U0001f9e0 训练", callback_data="td_okx_train"),
         ],
-        # Row 4: Signals
+        [
+            InlineKeyboardButton("\U0001f9ea 因子", callback_data="td_okx_factor"),
+            InlineKeyboardButton("\U0001f4ca 技能面", callback_data="td_okx_alpha"),
+        ],
+        # Row 5: Signals
         [
             InlineKeyboardButton("\U0001f50d Alpha", callback_data="td_alpha"),
             InlineKeyboardButton("\U0001f517 Onchain", callback_data="td_onchain"),
             InlineKeyboardButton("\U0001f40b Whales", callback_data="td_whales"),
         ],
-        # Row 5: On-chain wallet + Live + Refresh
+        # Row 6: On-chain wallet + Live + Refresh
         [
             InlineKeyboardButton("\U0001f4bc Wallet", callback_data="td_wallet"),
             InlineKeyboardButton("\U0001f680 Live" if not (_live_available and _trade_scheduler_instance and _trade_scheduler_instance.running) else "\u23f8 Live Stop", callback_data="td_live_toggle"),
@@ -4539,6 +4544,124 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
     await query.answer()
     data = query.data or ""
     chat_id = query.message.chat_id if query.message else query.from_user.id
+
+    # ── OKX 策略研发中枢（与网关面板一致：非手动买卖） ──
+    if data == "td_okx_evolve":
+        global _td_okx_evolver
+        try:
+            from infinite_evolver import InfiniteEvolver
+        except Exception as e:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=f"❌ InfiniteEvolver 不可用：{e!s}"[:4096]
+                )
+            except Exception:
+                pass
+            return
+
+        async def _ev_send(msg: str) -> None:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=(msg or "")[:4096])
+            except Exception:
+                pass
+
+        if _td_okx_evolver is not None and getattr(_td_okx_evolver, "_running", False):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text="ℹ️ InfiniteEvolver 已在运行。")
+            except Exception:
+                pass
+            return
+        _td_okx_evolver = InfiniteEvolver(send_func=_ev_send)
+        _td_okx_evolver.start()
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text="🧬 已启动 InfiniteEvolver 后台循环。"
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "td_okx_train":
+        try:
+            import auto_train
+        except Exception as e:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=f"❌ auto_train 不可用：{e!s}"[:4096]
+                )
+            except Exception:
+                pass
+            return
+
+        async def _ts(t: str) -> None:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=t[:4096])
+            except Exception:
+                pass
+
+        asyncio.create_task(
+            auto_train.run_training(
+                "code_edit", _ts, max_tasks=4, loops=1, _internal=False
+            )
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text="🧠 已排队 auto_train（code_edit）。"
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "td_okx_factor":
+        try:
+            from pipeline.tg_dev_bridge import process_dev_task
+        except Exception as e:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=f"❌ 造物桥接不可用：{e!s}"[:4096]
+                )
+            except Exception:
+                pass
+            return
+
+        asyncio.create_task(
+            process_dev_task(
+                bot=context.bot,
+                chat_id=chat_id,
+                prompt=(
+                    "挖掘稳健量化因子：多周期动量 + 波动过滤；"
+                    "输出单一 BaseSkill（sk_），含 buy/sell 置信度。"
+                ),
+                sub_intent="FACTOR_FORGE",
+            )
+        )
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="🧪 Factor Forge 已排队。")
+        except Exception:
+            pass
+        return
+
+    if data == "td_okx_alpha":
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent
+        sk_dir = root / "skills"
+        n = len(list(sk_dir.glob("sk_*.py"))) if sk_dir.is_dir() else 0
+        ev_on = _td_okx_evolver is not None and getattr(
+            _td_okx_evolver, "_running", False
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"📊 Alpha / 技能面\n"
+                    f"· skills/sk_*.py：{n} 个\n"
+                    f"· Evolver：{'🟢 运行中' if ev_on else '⚪ 未启动'}\n"
+                )[:4096],
+            )
+        except Exception:
+            pass
+        return
 
     # ── Refresh Dashboard ──
     if data == "td_refresh":

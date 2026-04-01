@@ -2,8 +2,9 @@
 Telegram Gateway — PTB：极简全自动看板。
 
 - 主入口：`/start`（MarkdownV2 + ``gw:*`` 回调）；交易类斜杠委托 ``bot.py`` 同名处理器。
-- UI 只读内存/文件缓存：`portfolio_snapshot.get_snapshot_for_gateway`、
-  ``trade_scheduler.read_scheduler_state``、``live_trader.get_live_stats``；不在回调协程里
+- UI 只读内存/文件缓存：快路径用 ``portfolio_snapshot.get_latest_cache()``（零网络）；
+  其它用 ``get_snapshot_for_gateway``、``trade_scheduler.read_scheduler_state``、
+  ``live_trader.get_live_stats``；不在回调协程里
   ``await`` 链上或 OKX 实时拉取。重刷新通过后台 ``asyncio.create_task(refresh_once)`` 触发。
 - 引擎启停：`TradeScheduler`（live/paper 由 ``USER_MODE`` 决定）；紧急停止后调用
   ``hard_risk_kill.hard_kill`` 尝试 OKX 全平。
@@ -36,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from telegram import Update
+from telegram import ForceReply, Update
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
@@ -55,10 +56,16 @@ from pipeline.tg_dev_bridge import (
 from gateway.tg_front import (
     GW_CB,
     build_dashboard_keyboard,
+    build_manual_hub_keyboard,
+    build_okx_lab_keyboard,
+    build_onchain_hub_keyboard,
     build_risk_keyboard,
     escape_v2,
     render_dashboard_plain_text,
     render_dashboard_text,
+    render_manual_hub_text,
+    render_okx_lab_text,
+    render_onchain_hub_text,
     render_risk_settings_text,
 )
 from gateway.gateway_lifecycle import (
@@ -74,6 +81,22 @@ from gateway.handlers.router import (
 from tracker.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
+
+_GW_RISK_PENDING_KEY = "_gw_risk_pending"
+_GW_EVOLVER = None  # infinite_evolver.InfiniteEvolver | None
+
+_RISK_EDIT_KEYS: frozenset[str] = frozenset(
+    {
+        "max_trade_pct",
+        "max_trade_sol",
+        "max_positions",
+        "daily_loss_limit_pct",
+        "stop_loss_pct",
+        "take_profit_pct",
+        "max_slippage_bps",
+        "min_liquidity_usd",
+    }
+)
 
 
 def _load_gateway_env() -> None:
@@ -132,6 +155,7 @@ FAST_COMMANDS: dict[str, tuple[str, ...]] = {
         "监控",
         "面板",
         "看板",
+        "主控",
         "/portfolio",
         "/status",
         "/panel",
@@ -231,6 +255,8 @@ def _allowed_user_ids() -> set[int]:
 
 _ALLOWED = _allowed_user_ids()
 
+_GW_PORTFOLIO_BG_TASK = "_gw_portfolio_snapshot_loop"
+
 
 def _gw_schedule(application: Application, coro) -> None:
     application.create_task(coro, name="gw_bg")
@@ -244,9 +270,33 @@ async def _gw_post_init(application: Application) -> None:
     await sync_slash_command_menu(application.bot)
     await start_auto_research_background(application)
 
+    # 与主 bot.py 一致：网关独立进程也要拉 OKX + 链上快照，否则 /start 永远看到默认 $0
+    try:
+        from trading import portfolio_snapshot
+
+        await portfolio_snapshot.refresh_once()
+        if _GW_PORTFOLIO_BG_TASK not in application.bot_data:
+            application.bot_data[_GW_PORTFOLIO_BG_TASK] = application.create_task(
+                portfolio_snapshot.run_background_loop(10.0),
+                name="gw_portfolio_snapshot_loop",
+            )
+        logger.info("Gateway: portfolio_snapshot initial refresh + 10s background loop started")
+    except Exception as e:
+        logger.warning("Gateway: portfolio_snapshot loop not started: %s", e)
+
 
 async def _gw_post_shutdown(application: Application) -> None:
     await cancel_auto_research_background(application)
+
+    t = application.bot_data.pop(_GW_PORTFOLIO_BG_TASK, None)
+    if t is not None and not t.done():
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("gw portfolio loop join", exc_info=True)
 
     try:
         from pipeline.god_orchestrator import stop_autonomous_engine
@@ -275,6 +325,200 @@ def _is_authorized(user_id: int) -> bool:
     return int(user_id) in _ALLOWED
 
 
+def _gw_risk_pending_map(application: Application) -> dict[int, str]:
+    return application.bot_data.setdefault(_GW_RISK_PENDING_KEY, {})  # type: ignore[return-value]
+
+
+def _risk_param_label(key: str) -> str:
+    return {
+        "max_trade_pct": "MaxTradeSize (%)",
+        "max_trade_sol": "MaxTradeSOL",
+        "max_positions": "MaxPosition",
+        "daily_loss_limit_pct": "DailyLossLimit (%)",
+        "stop_loss_pct": "StopLoss (%)",
+        "take_profit_pct": "TakeProfit (%)",
+        "max_slippage_bps": "PairVolatility / 滑点 (bps)",
+        "min_liquidity_usd": "MinLiquidity (USD)",
+    }.get(key, key)
+
+
+def _format_cfg_value(cfg: dict, key: str) -> str:
+    v = cfg.get(key)
+    if key == "max_trade_sol" and v is None:
+        return "null（仅按百分比）"
+    return repr(v)
+
+
+def _coerce_risk_value(key: str, raw: str) -> tuple[bool, Any, str]:
+    t = raw.strip().replace(",", "")
+    low = t.lower()
+    if key == "max_trade_sol":
+        if low in ("", "none", "null", "-", "无", "清空", "nil"):
+            return True, None, ""
+        try:
+            v = float(t)
+            if v <= 0:
+                return False, None, "SOL 硬顶须 > 0，或回复 none 清空"
+            return True, round(v, 6), ""
+        except ValueError:
+            return False, None, "需要数字或 none"
+
+    if key == "max_slippage_bps":
+        try:
+            v = int(float(t))
+            if v < 1 or v > 5000:
+                return False, None, "bps 建议 1–5000"
+            return True, v, ""
+        except ValueError:
+            return False, None, "需要整数 bps"
+
+    if key == "max_positions":
+        try:
+            v = int(float(t))
+            if v < 1 or v > 100:
+                return False, None, "并发仓位 1–100"
+            return True, v, ""
+        except ValueError:
+            return False, None, "需要整数"
+
+    try:
+        v = float(t)
+    except ValueError:
+        return False, None, "需要数字"
+
+    if key == "max_trade_pct" and not (0 < v <= 200):
+        return False, None, "max_trade_pct 建议 (0, 200]"
+    if key in ("daily_loss_limit_pct", "stop_loss_pct", "take_profit_pct") and not (0 < v <= 100):
+        return False, None, "百分比建议 (0, 100]"
+    if key == "min_liquidity_usd" and v < 0:
+        return False, None, "不能为负"
+
+    if key == "min_liquidity_usd":
+        return True, float(v), ""
+    return True, float(v), ""
+
+
+async def _try_consume_risk_edit_reply(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    if not update.effective_user or not update.message:
+        return False
+    uid = int(update.effective_user.id)
+    mp = _gw_risk_pending_map(context.application)
+    key = mp.get(uid)
+    if not key:
+        return False
+
+    text = (update.message.text or "").strip()
+    ok, val, err = _coerce_risk_value(key, text)
+    if not ok:
+        try:
+            await update.message.reply_text(
+                f"❌ {err}\n仍等待 `{key}`；可前往风控页或发送正确数值。"
+                [:4096]
+            )
+        except Exception:
+            pass
+        return True
+
+    import live_trader
+
+    cfg = live_trader._load_config()
+    cfg[key] = val
+    live_trader._save_config(cfg)
+    mp.pop(uid, None)
+    try:
+        await update.message.reply_text(
+            f"✅ 参数已热更新：`{key}` → `{val}`\n（已写入 _live_config.json）"[:4096]
+        )
+    except Exception:
+        pass
+    return True
+
+
+async def _run_gw_lab_action(
+    application: Application,
+    bot,
+    chat_id: int,
+    sub: str,
+) -> None:
+    global _GW_EVOLVER
+
+    async def _notify(msg: str) -> None:
+        try:
+            await bot.send_message(chat_id=chat_id, text=(msg or "")[:4096])
+        except Exception:
+            logger.debug("gw lab notify failed", exc_info=True)
+
+    if sub == "evolve":
+        try:
+            from infinite_evolver import InfiniteEvolver
+        except Exception as e:
+            await _notify(f"❌ 无法加载 InfiniteEvolver：{e!s}")
+            return
+
+        if _GW_EVOLVER is not None and getattr(_GW_EVOLVER, "_running", False):
+            await _notify("ℹ️ 自动进化已在运行中。")
+            return
+
+        _GW_EVOLVER = InfiniteEvolver(send_func=_notify)
+        _GW_EVOLVER.start()
+        await _notify("🧬 已启动 InfiniteEvolver 后台循环（默认 30min/次 sweep）。")
+        return
+
+    if sub == "train":
+        try:
+            import auto_train
+        except Exception as e:
+            await _notify(f"❌ 无法加载 auto_train：{e!s}")
+            return
+
+        async def send_status(t: str) -> None:
+            await _notify(t)
+
+        async def _train_job():
+            await auto_train.run_training(
+                "code_edit", send_status, max_tasks=4, loops=1, _internal=False
+            )
+
+        _gw_schedule(application, _train_job())
+        await _notify("🧠 已排队 auto_train（code_edit，短轮次），请留意后续消息。")
+        return
+
+    if sub == "factor":
+        await _notify("🧪 Factor Forge 已排队（FACTOR_FORGE 造物主）…")
+
+        async def _factor_job():
+            await process_dev_task(
+                bot=bot,
+                chat_id=chat_id,
+                prompt=(
+                    "挖掘稳健量化因子：多周期动量 + 波动过滤 + 成交量确认；"
+                    "输出单一 BaseSkill（sk_ 前缀），含 buy_confidence / sell_confidence。"
+                ),
+                sub_intent="FACTOR_FORGE",
+            )
+
+        _gw_schedule(application, _factor_job())
+        return
+
+    if sub == "alpha":
+        root = Path(__file__).resolve().parent.parent
+        sk_dir = root / "skills"
+        n = len(list(sk_dir.glob("sk_*.py"))) if sk_dir.is_dir() else 0
+        ev_on = (
+            _GW_EVOLVER is not None and getattr(_GW_EVOLVER, "_running", False)
+        )
+        await _notify(
+            f"📊 Alpha 状态\n"
+            f"· 本地 skills/sk_*.py：{n} 个\n"
+            f"· InfiniteEvolver：{'🟢 运行中' if ev_on else '⚪ 未启动'}\n"
+        )
+        return
+
+    await _notify(f"❌ 未知实验室指令：{sub!r}")
+
+
 def _parse_gw_callback(data: str) -> tuple[str, str] | None:
     if not data or not data.startswith(f"{GW_CB}:"):
         return None
@@ -287,6 +531,20 @@ def _parse_gw_callback(data: str) -> tuple[str, str] | None:
         return ("engine_stop", "")
     if rest == "refresh":
         return ("refresh", "")
+    if rest == "full_sync":
+        return ("full_sync", "")
+    if rest == "risk_cancel":
+        return ("risk_cancel", "")
+    if rest == "manual_hub":
+        return ("manual_hub", "")
+    if rest == "manual_okx":
+        return ("manual_okx", "")
+    if rest == "manual_onchain":
+        return ("manual_onchain", "")
+    if rest.startswith("risk_edit:"):
+        return ("risk_edit", rest[10:])
+    if rest.startswith("lab:"):
+        return ("lab", rest[4:])
     if rest == "risk":
         return ("risk", "")
     if rest.startswith("mode:"):
@@ -331,6 +589,20 @@ def _dashboard_sync() -> tuple[dict, dict, dict]:
     return snap, st, stats
 
 
+def _dashboard_sync_fast_path() -> tuple[dict, dict, dict]:
+    """Fast path / Pepe: in-memory portfolio cache only — **no** ``refresh_once``, **no** Redis."""
+    from trading import portfolio_snapshot
+
+    import trade_scheduler
+
+    import live_trader
+
+    snap = portfolio_snapshot.get_latest_cache()
+    st = trade_scheduler.read_scheduler_state()
+    stats = live_trader.get_live_stats()
+    return snap, st, stats
+
+
 async def _dispatch_fast_action(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -359,7 +631,8 @@ async def _dispatch_fast_action(
     if action not in ("refresh_dashboard", "dashboard"):
         return
 
-    snap, st, stats = _dashboard_sync()
+    # 持仓/余额/面板：只读内存热缓存；刷新类仅后台排队 refresh，仍立即用旧缓存渲染（零等待）
+    snap, st, stats = _dashboard_sync_fast_path()
     try:
         from gateway.tg_front import build_dashboard_keyboard, render_dashboard_text
 
@@ -379,7 +652,7 @@ async def _dispatch_fast_action(
 
 
 async def _edit_main_dashboard(bot, chat_id: int, message_id: int) -> None:
-    snap, st, stats = _dashboard_sync()
+    snap, st, stats = _dashboard_sync_fast_path()
     await _safe_edit_markdown(
         bot,
         chat_id,
@@ -484,6 +757,80 @@ async def _gw_panel_work(
         if action == "dash":
             await _edit_main_dashboard(bot, chat_id, message_id)
             return
+        if action == "manual_hub":
+            await _safe_edit_markdown(
+                bot,
+                chat_id,
+                message_id,
+                render_manual_hub_text(),
+                build_manual_hub_keyboard(),
+            )
+            return
+        if action == "manual_okx":
+            await _safe_edit_markdown(
+                bot,
+                chat_id,
+                message_id,
+                render_okx_lab_text(),
+                build_okx_lab_keyboard(),
+            )
+            return
+        if action == "manual_onchain":
+            await _safe_edit_markdown(
+                bot,
+                chat_id,
+                message_id,
+                render_onchain_hub_text(),
+                build_onchain_hub_keyboard(),
+            )
+            return
+        if action == "full_sync":
+            try:
+                from trading import portfolio_snapshot
+
+                asyncio.create_task(portfolio_snapshot.refresh_once())
+            except Exception:
+                logger.exception("full_sync enqueue")
+            await _edit_main_dashboard(bot, chat_id, message_id)
+            return
+        if action == "risk_cancel":
+            _gw_risk_pending_map(application).pop(uid, None)
+            try:
+                await bot.send_message(chat_id=chat_id, text="❎ 已取消参数编辑。"[:4096])
+            except Exception:
+                pass
+            await _edit_main_dashboard(bot, chat_id, message_id)
+            return
+        if action == "risk_edit":
+            if arg not in _RISK_EDIT_KEYS:
+                await _edit_main_dashboard(bot, chat_id, message_id)
+                return
+            import live_trader
+
+            cfg = live_trader._load_config()
+            cur = _format_cfg_value(cfg, arg)
+            _gw_risk_pending_map(application)[uid] = arg
+            label = _risk_param_label(arg)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✏️ 调整 {label}（`{arg}`）\n"
+                        f"当前值：{cur}\n"
+                        "请直接回复一条消息，内容为纯数值。"
+                        "\n· max_trade_sol 可回复 none 清空硬顶"
+                    )[:4096],
+                    reply_markup=ForceReply(
+                        selective=True,
+                        input_field_placeholder="输入数值",
+                    ),
+                )
+            except Exception:
+                logger.exception("risk_edit force_reply")
+            return
+        if action == "lab":
+            await _run_gw_lab_action(application, bot, chat_id, arg)
+            return
         if action == "mode":
             USER_MODE = _normalize_mode(arg)
             asyncio.create_task(_persist_user_mode(application, uid, USER_MODE))
@@ -523,7 +870,7 @@ async def _gw_panel_work(
         logger.exception("gateway panel work: %s", e)
         try:
             err_body = escape_v2(f"❌ 面板更新失败：{e!s}")
-            snap, st, stats = _dashboard_sync()
+            snap, st, stats = _dashboard_sync_fast_path()
             await _safe_edit_markdown(
                 bot,
                 chat_id,
@@ -581,7 +928,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mark_gateway_user_activity()
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
-    snap, st, stats = _dashboard_sync()
+    snap, st, stats = _dashboard_sync_fast_path()
     text = render_dashboard_text(USER_MODE, snap, st, stats)
     plain = render_dashboard_plain_text(USER_MODE, snap, st, stats)
     kb = build_dashboard_keyboard(bool(st.get("active")))
@@ -645,6 +992,11 @@ async def _jarvis_semantic_route(
         return
     text = (update.message.text or "").strip()
     if not text:
+        return
+
+    # 看板 / 主控：整句命中即走快路径，禁止进入意图分类或 LLM
+    if text in ("看板", "主控"):
+        await _dispatch_fast_action(update, context, uid=uid, action="dashboard")
         return
 
     fa = _resolve_fast_action(text)
@@ -849,6 +1201,8 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     mark_gateway_user_activity()
     text = (update.message.text or "").strip()
     if not text:
+        return
+    if await _try_consume_risk_edit_reply(update, context):
         return
     await _jarvis_semantic_route(update, context, uid=uid)
 

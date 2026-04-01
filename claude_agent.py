@@ -859,13 +859,15 @@ async def _jarvis_gateway_cli_chat_impl(
         f"{usr_t[:200_000]}"
     )
 
+    stream_on = (os.environ.get("JARVIS_CHAT_STREAM_JSON") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
     try:
-        if (os.environ.get("JARVIS_CHAT_STREAM_JSON") or "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
+        if stream_on:
             r_text, err_tail, sid_new = await async_claude_code_prompt_stream_json(
                 combined,
                 cwd=BOT_PROJECT_DIR,
@@ -874,13 +876,31 @@ async def _jarvis_gateway_cli_chat_impl(
                 wall_cap_sec=cap,
             )
         else:
-            r_text, err_tail, sid_new = await async_claude_code_prompt(
-                combined,
-                cwd=BOT_PROJECT_DIR,
-                resume=resume,
-                timeout_sec=cap,
-                wall_cap_sec=cap,
-            )
+            from claude_cli_tunnel import PersistentClaudePipe, pipe_worker_enabled
+
+            used_pipe = False
+            if pipe_worker_enabled():
+                try:
+                    r_text, err_tail, sid_new = await PersistentClaudePipe.instance().request_turn(
+                        combined=combined,
+                        resume=resume,
+                        timeout_sec=cap,
+                        wall_cap_sec=cap,
+                    )
+                    used_pipe = True
+                except Exception as e:
+                    logger.warning(
+                        "jarvis_gateway: PersistentClaudePipe failed, inline subprocess: %s",
+                        e,
+                    )
+            if not used_pipe:
+                r_text, err_tail, sid_new = await async_claude_code_prompt(
+                    combined,
+                    cwd=BOT_PROJECT_DIR,
+                    resume=resume,
+                    timeout_sec=cap,
+                    wall_cap_sec=cap,
+                )
     except asyncio.TimeoutError:
         logger.warning("jarvis_gateway_cli_chat asyncio.TimeoutError chat_id=%s", chat_id)
         return "", "timeout"

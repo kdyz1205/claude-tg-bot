@@ -116,6 +116,24 @@ class TestLLMHallucinationFilter:
         )
         assert d is not None
 
+    @pytest.mark.asyncio
+    async def test_ten_sol_point_zero_one_micro_trades_stress(self, no_alert):
+        """Regression: ten consecutive 0.01 SOL notional-style directives must all sanitize."""
+        from dispatcher.llm_filter import LLMHallucinationFilter
+
+        for i in range(10):
+            d = await LLMHallucinationFilter.sanitize_trade_directive(
+                {
+                    "action": "BUY",
+                    "pair": "SOL/USDT",
+                    "amount": 0.01,
+                    "price": 150.0,
+                }
+            )
+            assert d is not None, f"iteration {i}"
+            assert d["pair"] == "SOL/USDT"
+            assert d["amount"] == pytest.approx(0.01)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EvolveSandbox

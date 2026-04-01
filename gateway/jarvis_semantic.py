@@ -6,15 +6,12 @@ messages that would otherwise be CHAT (small JSON classification call).
 
 v2: broader quant / 造物 routing, secondary spec detector, ``reasoning`` on every path.
 
-CHAT 对话经 ``claude_cli_tunnel.PersistentClaudeCLI`` 的 **chat 队列** 调用
-``claude_agent.jarvis_gateway_cli_chat``（内部仍为 ``claude -p`` + ``--resume``；与造物 dev 任务双轨，chat 优先）。
-AUTO_DEV / 造物走 ``pipeline.cli_bridge.run_claude_dev_prompt`` 的 **dev 队列**（默认 ``CLAUDE_CLI_TUNNEL_DEV=1``）。
-关闭隧道：``CLAUDE_CLI_TUNNEL_CHAT=0`` / ``CLAUDE_CLI_TUNNEL_DEV=0``。
-流式 NDJSON（额度恢复后便于 TG 逐段编辑）：``JARVIS_CHAT_STREAM_JSON=1``（``--output-format stream-json`` + ``--verbose``）；
-可选 ``CLAUDE_STREAM_INCLUDE_PARTIAL=1`` 打开 ``--include-partial-messages``。
-可选 ``JARVIS_CHAT_TIMEOUT_SEC``（秒，默认参考 ``config.API_REQUEST_TIMEOUT_SEC``，上限 600）。
-CLI 报额度耗尽时经 ``trigger_alert`` 推送告警，并由 ``browser_agents``（默认 Kimi → DeepSeek）
-走浏览器影子通道兜底（``JARVIS_SHADOW_PLATFORMS`` / ``JARVIS_BROWSER_CDP_URL``）。
+CHAT 经 ``PersistentClaudeCLI`` **chat 队列** → ``jarvis_gateway_cli_chat``。
+默认 ``CLAUDE_CLI_PIPE_WORKER=1``：子进程 ``python -m claude_tunnel_worker`` 常驻，stdin/stdout JSONL 投递每轮
+``claude -p``（仍为 Claude Code 官方非交互模型；子进程内串行）。``JARVIS_CHAT_STREAM_JSON=1`` 时走父进程流式，不经 pipe。
+造物 dev 走 **dev 队列**；关闭隧道：``CLAUDE_CLI_TUNNEL_CHAT=0``。
+``JARVIS_SHADOW_FIRST_BYTE_SEC``（默认 3）：主 CLI 未按时完成则与 Kimi/DeepSeek 影子 **竞速**，先出正文者回复。
+CDP 未监听时直接提示运行 ``chrome --remote-debugging-port=9222``（见 ``_JARVIS_SHADOW_CDP_MSG``）。
 """
 
 from __future__ import annotations
@@ -24,6 +21,8 @@ import json
 import logging
 import os
 import re
+import socket
+from urllib.parse import urlparse
 from collections import defaultdict
 from typing import Any
 
@@ -440,8 +439,11 @@ _JARVIS_CHAT_ERR_CLI = "未检测到本机 `claude` 可执行文件。请安装 
 _JARVIS_CHAT_ERR_TIMEOUT = "本地 CLI 响应超时。请稍后重试或检查本机负载与订阅状态。"
 _JARVIS_QUOTA_SHADOW_OK = "长官，订阅额度已干爆，已为您切换至 Kimi/DeepSeek 临时大脑。"
 _JARVIS_QUOTA_SHADOW_FAIL = (
-    "长官，订阅额度已干爆，影子部队（Kimi/DeepSeek 浏览器通道）未能接通；"
-    "请在本机登录 kimi.moonshot.cn / chat.deepseek.com，并配置 JARVIS_BROWSER_CDP_URL（推荐）或 JARVIS_BROWSER_USER_DATA_DIR。"
+    "长官，订阅额度已干爆，影子部队（Kimi/DeepSeek）未能接通；"
+    "请在本机浏览器登录对应站点，并配置 JARVIS_BROWSER_CDP_URL 或 JARVIS_BROWSER_USER_DATA_DIR。"
+)
+_JARVIS_SHADOW_CDP_MSG = (
+    "长官，影子部队缺少 CDP 权限，请运行 chrome --remote-debugging-port=9222"
 )
 
 # 与 agents.sessions 的 8_000_000+ 虚拟 id 错开，按 Telegram uid 稳定映射多轮记忆
@@ -451,6 +453,47 @@ _JARVIS_GW_CHAT_MOD = 89_000_000
 
 def _jarvis_gateway_chat_id(uid: int) -> int:
     return _JARVIS_GW_CHAT_BASE + (abs(int(uid)) % _JARVIS_GW_CHAT_MOD)
+
+
+def _parse_cdp_host_port(cdp_url: str) -> tuple[str, int] | None:
+    raw = (cdp_url or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw.lstrip("/")
+    u = urlparse(raw)
+    host = u.hostname
+    port = u.port
+    if not host:
+        return None
+    if port is None:
+        port = 9222
+    return host, int(port)
+
+
+async def _cdp_tcp_open(host: str, port: int, *, timeout: float = 0.4) -> bool:
+    def _go() -> bool:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    return await asyncio.to_thread(_go)
+
+
+def _is_cdp_refused(exc: BaseException) -> bool:
+    low = str(exc).lower()
+    return "econnrefused" in low or "connection refused" in low or (
+        "refused" in low and "connect" in low
+    )
 
 
 def _jarvis_shadow_browser_config():
@@ -485,10 +528,11 @@ def _jarvis_shadow_browser_config():
 
 async def _browser_shadow_reply(system_prompt: str, user_text: str) -> tuple[str, str]:
     """
-    CLI 额度耗尽后的备份通道：按 ``JARVIS_SHADOW_PLATFORMS`` 顺序尝试浏览器 Agent（模拟点击 + 抓取回复）。
+    浏览器影子通道：按 ``JARVIS_SHADOW_PLATFORMS`` 尝试 Kimi/DeepSeek（Playwright）。
 
     Returns:
-        ``(reply, platform_key)`` 成功时 platform_key 为小写平台名；失败为 ``("", "")``.
+        ``(reply, platform_key)`` 成功时 platform_key 为小写平台名；
+        失败 ``("", "")`` 或 ``("", "cdp_denied")``（CDP 未开）。
     """
     from browser_agents import get_browser_agent
 
@@ -498,6 +542,15 @@ async def _browser_shadow_reply(system_prompt: str, user_text: str) -> tuple[str
         platforms = ["kimi", "deepseek"]
 
     cfg = _jarvis_shadow_browser_config()
+    cdp = (cfg.cdp_url or "").strip()
+    if cdp:
+        hp = _parse_cdp_host_port(cdp)
+        if hp:
+            host, port = hp
+            if not await _cdp_tcp_open(host, port):
+                logger.warning("jarvis shadow: CDP port closed %s:%s", host, port)
+                return "", "cdp_denied"
+
     combined = (
         f"{(system_prompt or '')[:12_000]}\n\n--- 长官指令 ---\n\n{(user_text or '')[:80_000]}"
     )
@@ -514,6 +567,9 @@ async def _browser_shadow_reply(system_prompt: str, user_text: str) -> tuple[str
         try:
             result = await agent.execute(combined)
         except Exception as e:
+            if cdp and _is_cdp_refused(e):
+                logger.warning("jarvis shadow CDP refused platform=%s: %s", plat, e)
+                return "", "cdp_denied"
             logger.warning("jarvis shadow execute %r: %s", plat, e)
             continue
         out = (result.output or "").strip()
@@ -544,36 +600,14 @@ def _jarvis_chat_timeout_sec() -> float:
         return 120.0
 
 
-async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
-    """
-    网关 CHAT 意图：本地 ``claude -p`` 一轮（per-uid 合成 chat_id + CLI ``--resume`` 记忆）。
-
-    成功: (reply_text, "")
-    失败: ("", user_message) — 按场景给出订阅 / CLI 提示；细节写日志。
-    """
-    t = (text or "").strip()
-    if not t:
-        return "", ""
-
-    import claude_agent
-
-    chat_id = _jarvis_gateway_chat_id(uid)
-    timeout_sec = _jarvis_chat_timeout_sec()
-
-    try:
-        reply, diag = await claude_agent.jarvis_gateway_cli_chat(
-            _JARVIS_CHAT_SYSTEM,
-            t[:120_000],
-            chat_id=chat_id,
-            timeout_sec=timeout_sec,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("jarvis chat_reply asyncio.TimeoutError uid=%s", uid)
-        return "", _JARVIS_CHAT_ERR_TIMEOUT
-    except Exception as e:
-        logger.exception("jarvis chat_reply transport uid=%s: %s", uid, e)
-        return "", _JARVIS_CHAT_ERR_USER
-
+async def _jarvis_apply_cli_outcome(
+    reply: str,
+    diag: str,
+    *,
+    uid: int,
+    chat_id: int,
+    t: str,
+) -> tuple[str, str]:
     if diag == "quota_exhausted":
         logger.warning("jarvis chat_reply CLI quota exhausted uid=%s chat_id=%s", uid, chat_id)
         shadow, plat = await _browser_shadow_reply(_JARVIS_CHAT_SYSTEM, t)
@@ -583,6 +617,8 @@ async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
             else:
                 intro = f"长官，订阅额度已干爆，已为您切换至 {plat} 临时网页通道。"
             return f"{intro}\n\n{shadow}", ""
+        if plat == "cdp_denied":
+            return "", _JARVIS_SHADOW_CDP_MSG
         return "", _JARVIS_QUOTA_SHADOW_FAIL
 
     if diag == "auth":
@@ -610,5 +646,106 @@ async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
     if not out:
         logger.warning("jarvis chat_reply empty assistant uid=%s chat_id=%s", uid, chat_id)
         return "", _JARVIS_CHAT_ERR_USER
-
     return out, ""
+
+
+async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
+    """
+    网关 CHAT：主 CLI 与影子浏览器竞速；CLI 超过 ``JARVIS_SHADOW_FIRST_BYTE_SEC``（默认 3s）
+    仍未结束时并发启动影子，**先完成且非空**者胜出，降低「已读不回」。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+
+    import claude_agent
+
+    chat_id = _jarvis_gateway_chat_id(uid)
+    timeout_sec = _jarvis_chat_timeout_sec()
+
+    try:
+        early = float((os.environ.get("JARVIS_SHADOW_FIRST_BYTE_SEC") or "3").strip() or "3")
+    except (TypeError, ValueError):
+        early = 3.0
+    early = max(0.5, min(60.0, early))
+
+    async def _cli() -> tuple[str, str]:
+        return await claude_agent.jarvis_gateway_cli_chat(
+            _JARVIS_CHAT_SYSTEM,
+            t[:120_000],
+            chat_id=chat_id,
+            timeout_sec=timeout_sec,
+        )
+
+    t_cli = asyncio.create_task(_cli())
+    await asyncio.wait({t_cli}, timeout=early)
+
+    if t_cli.done():
+        try:
+            reply, diag = t_cli.result()
+        except asyncio.CancelledError:
+            return "", _JARVIS_CHAT_ERR_USER
+        except Exception as e:
+            logger.exception("jarvis chat_reply cli uid=%s: %s", uid, e)
+            return "", _JARVIS_CHAT_ERR_USER
+        return await _jarvis_apply_cli_outcome(reply, diag, uid=uid, chat_id=chat_id, t=t)
+
+    t_shadow = asyncio.create_task(_browser_shadow_reply(_JARVIS_CHAT_SYSTEM, t))
+    done, _pending = await asyncio.wait(
+        {t_cli, t_shadow}, return_when=asyncio.FIRST_COMPLETED
+    )
+    winner = next(iter(done))
+
+    if winner is t_shadow:
+        try:
+            shadow, plat_tag = t_shadow.result()
+        except Exception as e:
+            logger.exception("jarvis shadow race: %s", e)
+            shadow, plat_tag = "", ""
+        if plat_tag == "cdp_denied":
+            t_cli.cancel()
+            try:
+                await t_cli
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            return "", _JARVIS_SHADOW_CDP_MSG
+        if (shadow or "").strip():
+            t_cli.cancel()
+            try:
+                await t_cli
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            if plat_tag in ("kimi", "moonshot", "deepseek"):
+                intro = "长官，主通道 Pending，影子部队先行抢答（Kimi/DeepSeek）。"
+            elif plat_tag:
+                intro = f"长官，主通道 Pending，{plat_tag} 先行抢答。"
+            else:
+                intro = "长官，影子部队先行抢答。"
+            return f"{intro}\n\n{shadow.strip()}", ""
+        try:
+            reply, diag = await t_cli
+        except asyncio.CancelledError:
+            return "", _JARVIS_CHAT_ERR_USER
+        except Exception as e:
+            logger.exception("jarvis chat_reply cli uid=%s: %s", uid, e)
+            return "", _JARVIS_CHAT_ERR_USER
+        return await _jarvis_apply_cli_outcome(reply, diag, uid=uid, chat_id=chat_id, t=t)
+
+    if not t_shadow.done():
+        t_shadow.cancel()
+    try:
+        await t_shadow
+    except asyncio.CancelledError:
+        pass
+    try:
+        reply, diag = t_cli.result()
+    except asyncio.CancelledError:
+        return "", _JARVIS_CHAT_ERR_USER
+    except Exception as e:
+        logger.exception("jarvis chat_reply cli uid=%s: %s", uid, e)
+        return "", _JARVIS_CHAT_ERR_USER
+    return await _jarvis_apply_cli_outcome(reply, diag, uid=uid, chat_id=chat_id, t=t)

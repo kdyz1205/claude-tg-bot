@@ -131,6 +131,15 @@ def try_snapshot_from_redis() -> dict[str, Any] | None:
         return None
 
 
+def get_latest_cache() -> dict[str, Any]:
+    """
+    Strict **in-process** hot snapshot only: deepcopy of RAM cache, no Redis, no refresh.
+
+    Use for Telegram fast-path (持仓/余额) where sub-100ms response is required.
+    """
+    return get_snapshot()
+
+
 def get_snapshot_for_gateway() -> dict[str, Any]:
     """TG panel: prefer Redis mirror when ``GATEWAY_PANEL_READ_REDIS=1``, else in-process cache."""
     if (os.getenv("GATEWAY_PANEL_READ_REDIS") or "").strip().lower() in ("1", "true", "yes"):
