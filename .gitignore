@@ -46,6 +46,7 @@ test_screenshot.jpg
 *.ps1
 
 # Runtime state files (bot generates these)
+_boot_ui_startup_prompt.sent
 _paper_trades.json
 _pro_strategy_perf.json
 _dex_positions.json

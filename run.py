@@ -4,8 +4,10 @@ run.py — Auto-restart wrapper + Supervisor (last-line defense against total ex
 Usage: python run.py
 - Inner loop: restarts bot.py subprocess on crash; hot-reload on core .py changes
 - Outer Supervisor: while True + except Exception — logs, Telegram alert (background
-  thread), exponential backoff, then re-enters run — avoids run.py itself taking down
+  thread), backoff from 5s capped at 300s, then re-enters run — avoids run.py itself taking down
   the whole watchdog
+- bot.py Phoenix: fatal run_polling errors call os._exit after TG + 5s so this wrapper
+  restarts a fresh subprocess (avoids duplicate post_init / TG spam in one process)
 - Bot stderr is appended to _bot_subprocess_stderr.log for post-mortem / TG snippets
 - Rapid child crashes: no longer exit the supervisor; long backoff + admin alert + reset
 - PID file + lockfile still prevent multiple run.py instances
@@ -592,7 +594,7 @@ def supervisor_main() -> None:
     Outermost guard: catches bugs in run.py itself (not just bot.py subprocess).
     Never exits on generic Exception — logs, Telegram, backoff, retry.
     """
-    backoff = 8
+    backoff = 5
     while True:
         try:
             main()

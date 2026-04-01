@@ -10,6 +10,7 @@ import os
 import sys
 import signal
 import time
+import traceback
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -263,6 +264,36 @@ def _track_task(bot_data: dict, task: asyncio.Task) -> None:
         bot_data.get("_background_tasks", set()).discard(t)
     task.add_done_callback(_on_done)
 
+
+def _phoenix_notify_telegram_sync(title: str, body: str) -> None:
+    """HTTP send without importing telegram.ext (works when polling layer is broken)."""
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    token = getattr(config, "TELEGRAM_BOT_TOKEN", None) or ""
+    chat_id = getattr(config, "AUTHORIZED_USER_ID", None)
+    if not token or chat_id is None:
+        return
+    text = f"{title}\n\n{body}"[:4000]
+    payload = json.dumps({"chat_id": int(chat_id), "text": text}).encode("utf-8")
+
+    def _send() -> None:
+        try:
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=25)
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 AVAILABLE_MODELS = {
     "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-6",
@@ -355,6 +386,31 @@ async def _safe_send(bot, chat_id, text, **kwargs):
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
+# Persist across post_init / process: Phoenix same-process run_polling retries used to
+# re-run post_init and flood TG. Marker suppresses duplicate auto-prompts.
+_BOOT_UI_AUTO_PROMPT_MARKER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "_boot_ui_startup_prompt.sent",
+)
+
+
+def _boot_ui_startup_already_notified() -> bool:
+    if (os.getenv("FORCE_BOOT_UI_PROMPT") or "").strip().lower() in ("1", "true", "yes"):
+        return False
+    try:
+        return os.path.isfile(_BOOT_UI_AUTO_PROMPT_MARKER)
+    except OSError:
+        return False
+
+
+def _boot_ui_startup_mark_sent() -> None:
+    try:
+        with open(_BOOT_UI_AUTO_PROMPT_MARKER, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except OSError:
+        pass
+
+
 def _boot_ui_keyboard() -> InlineKeyboardMarkup:
     """Startup / restart: choose chain dashboard emphasis (live vs paper UI mode)."""
     return InlineKeyboardMarkup(
@@ -379,6 +435,7 @@ async def handle_boot_ui_callback(update: Update, context: ContextTypes.DEFAULT_
     data = query.data or ""
     if data == "boot_ui_live":
         _ui_session_store.set_telegram_panel_mode(uid, "live")
+        _boot_ui_startup_mark_sent()
         await query.answer("已设为实盘视图", show_alert=False)
         try:
             await query.edit_message_text(
@@ -397,6 +454,7 @@ async def handle_boot_ui_callback(update: Update, context: ContextTypes.DEFAULT_
         return
     if data == "boot_ui_paper":
         _ui_session_store.set_telegram_panel_mode(uid, "paper")
+        _boot_ui_startup_mark_sent()
         await query.answer("已设为 Paper/模拟视图", show_alert=False)
         try:
             await query.edit_message_text(
@@ -6682,13 +6740,15 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif subcmd == "summary" and len(args) >= 2:
             text = " ".join(args[1:])
-            memory_engine.add_summary(text, source="manual")
+            memory_engine.add_summary(text, source="manual", persist=False)
+            await memory_engine.save_async()
             await update.message.reply_text("✅ Summary saved.")
 
         elif subcmd == "set" and len(args) >= 3:
             key = args[1]
             value = " ".join(args[2:])
-            memory_engine.update_profile(key, value)
+            memory_engine.update_profile(key, value, persist=False)
+            await memory_engine.save_async()
             await update.message.reply_text(f"✅ Profile updated: {key} = {value}")
 
         elif subcmd == "stats":
@@ -8229,8 +8289,13 @@ def main():
         except Exception as e:
             logger.error(f"Failed to set bot commands: {e}")
 
-        # One-time prompt after process start: choose live vs paper UI for /chain
-        if config.AUTHORIZED_USER_ID is not None and not application.bot_data.get("_boot_ui_prompt_sent"):
+        # One-time auto prompt (disk marker + bot_data — survives Phoenix retries in same process)
+        if _boot_ui_startup_already_notified():
+            application.bot_data["_boot_ui_prompt_sent"] = True
+        if (
+            config.AUTHORIZED_USER_ID is not None
+            and not application.bot_data.get("_boot_ui_prompt_sent")
+        ):
             try:
                 await application.bot.send_message(
                     chat_id=config.AUTHORIZED_USER_ID,
@@ -8245,6 +8310,7 @@ def main():
                     reply_markup=_boot_ui_keyboard(),
                 )
                 application.bot_data["_boot_ui_prompt_sent"] = True
+                _boot_ui_startup_mark_sent()
                 logger.info("Boot UI mode prompt sent to authorized user")
             except Exception as e:
                 logger.warning("Boot UI prompt failed: %s", e)
@@ -8259,6 +8325,32 @@ def main():
             logger.info("Portfolio snapshot background loop started (10s)")
         except Exception as e:
             logger.warning("Portfolio snapshot loop not started: %s", e)
+
+        # OKX live ↔ ledger + DEX chain refresh (default 15 min)
+        try:
+            from trading import reconciliation_daemon as _reco_mod
+
+            _reco_interval = float(os.getenv("RECONCILE_INTERVAL_SEC") or "900")
+
+            async def _reco_notify(text: str):
+                if config.AUTHORIZED_USER_ID is None:
+                    return
+                try:
+                    await application.bot.send_message(
+                        chat_id=config.AUTHORIZED_USER_ID,
+                        text=text[:4096],
+                    )
+                except Exception:
+                    pass
+
+            _reco_task = asyncio.create_task(
+                _reco_mod.run_reconciliation_loop(_reco_interval, notify=_reco_notify),
+                name="reconciliation_daemon",
+            )
+            _track_task(application.bot_data, _reco_task)
+            logger.info("Reconciliation daemon started (interval=%.0fs)", _reco_interval)
+        except Exception as e:
+            logger.warning("Reconciliation daemon not started: %s", e)
 
         # Boot Vital Signs lifecycle tracking
         try:
@@ -8884,7 +8976,34 @@ def main():
     print(f"Bot started! Mode: {'CLI (Plan tokens)' if config.BRIDGE_MODE else 'API'}")
     print("Press Ctrl+C to stop.")
     try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        try:
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        except KeyboardInterrupt:
+            raise
+        except SystemExit as se:
+            _code = getattr(se, "code", se)
+            if _code not in (0, None):
+                tb = traceback.format_exc()
+                print(tb, flush=True)
+                logger.critical("Phoenix: SystemExit from run_polling code=%s", _code)
+                _phoenix_notify_telegram_sync(
+                    "🛟 Phoenix: SystemExit — 5s 后由 run.py 重启子进程",
+                    f"code={_code}\n\n{tb}"[:3800],
+                )
+                _release_pid_lock()
+                time.sleep(5)
+                os._exit(int(_code) if isinstance(_code, int) else 1)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(tb, flush=True)
+            logger.critical("Phoenix: run_polling crashed: %s", e, exc_info=True)
+            _phoenix_notify_telegram_sync(
+                "🛟 Phoenix: run_polling 崩溃 — 5s 后由 run.py 重启子进程",
+                f"{type(e).__name__}: {e}\n\n{tb}"[:3800],
+            )
+            _release_pid_lock()
+            time.sleep(5)
+            os._exit(1)
     finally:
         _release_pid_lock()
 
