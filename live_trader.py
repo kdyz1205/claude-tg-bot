@@ -7,7 +7,7 @@ All transactions go through secure_wallet.py (swap-only signing).
 
 import os, json, logging, time, asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -730,12 +730,23 @@ async def _run_delta_neutral_with_recovery(
         if dex_ok and not hedge_ok:
             await trigger_alert(
                 "NAKED_LONG_RISK",
-                f"DEX filled but OKX short failed after {h_retries} retries mint={mint}. Emergency selling spot.",
+                f"DEX filled but OKX short failed after {h_retries} retries mint={mint}. Emergency market flatten (Jupiter→SOL).",
                 severity="critical",
             )
             pid = dex_r.get("id") if isinstance(dex_r, dict) else None
             if pid:
-                await sell_token(pid, "emergency_hedge_failed")
+                flat_r = None
+                for _e in range(5):
+                    flat_r = await sell_token(pid, "emergency_hedge_failed")
+                    if flat_r:
+                        break
+                    await asyncio.sleep(0.5 * (_e + 1))
+                if not flat_r:
+                    await trigger_alert(
+                        "EMERGENCY_DEX_UNWIND_FAILED",
+                        f"Could not market-close DEX spot position_id={pid} mint={mint[:12]}",
+                        severity="critical",
+                    )
             return {
                 "ok": False,
                 "reason": "naked_long_rolled_back",
@@ -765,7 +776,6 @@ async def _run_delta_neutral_with_recovery(
                 severity="critical",
             )
             flat = await execu.close_position(hedge_symbol, reason="emergency_dex_failed")
-            await execu.aclose()
             return {
                 "ok": False,
                 "reason": "naked_short_flattened",
@@ -850,6 +860,38 @@ def get_live_execution_gateway() -> LiveExecutionGateway:
     if _live_execution_gateway is None:
         _live_execution_gateway = LiveExecutionGateway()
     return _live_execution_gateway
+
+
+async def strategy_brain_signal_listener_loop(
+    send_func=None,
+    stop_event: Optional[asyncio.Event] = None,
+) -> None:
+    """
+    Dedicated asyncio task: polls StrategyBrain ``live_predict`` on a tensor window.
+    When confidence ≥ configured threshold (default 85%) and action is ``long``,
+    fires ``asyncio.gather``-style atomic hedge via ``execute_delta_neutral_buy``
+    (DEX Jupiter buy ∥ OKX perp short), with legged recovery inside that path.
+    """
+    ev = stop_event or asyncio.Event()
+    while not ev.is_set():
+        cfg = _load_config()
+        if not cfg.get("neural_execution_enabled"):
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        try:
+            await _neural_delta_neutral_once(send_func)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("strategy_brain_signal_listener_loop tick failed")
+        poll = max(5.0, float(cfg.get("neural_poll_sec", 45)))
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=poll)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def _neural_delta_neutral_once(send_func=None) -> None:
@@ -1112,8 +1154,9 @@ class LiveTrader:
         self._task: Optional[asyncio.Task] = None
         self._last_pos_check = 0.0
         self._last_sig_scan = 0.0
-        self._last_neural_ts = 0.0
         self._last_poly_oracle_ts = 0.0
+        self._brain_stop: Optional[asyncio.Event] = None
+        self._brain_task: Optional[asyncio.Task] = None
 
     async def start(self):
         if self._running:
@@ -1135,11 +1178,28 @@ class LiveTrader:
         self._last_pos_check = 0.0
         self._last_sig_scan = 0.0
         self._last_poly_oracle_ts = 0.0
+        self._brain_stop = asyncio.Event()
+        self._brain_stop.clear()
         self._task = asyncio.create_task(self._loop())
+        # Always run listener: when neural_execution_enabled is off it idles cheaply;
+        # toggling config does not require LiveTrader restart.
+        self._brain_task = asyncio.create_task(
+            strategy_brain_signal_listener_loop(self._send, self._brain_stop)
+        )
         logger.info("LiveTrader started")
 
     async def stop(self):
         self._running = False
+        if self._brain_stop is not None:
+            self._brain_stop.set()
+        if self._brain_task:
+            self._brain_task.cancel()
+            try:
+                await self._brain_task
+            except asyncio.CancelledError:
+                pass
+            self._brain_task = None
+        self._brain_stop = None
         if self._task:
             self._task.cancel()
             self._task = None
@@ -1279,14 +1339,7 @@ class LiveTrader:
                 now = time.time()
                 ci = max(10.0, float(cfg.get("check_interval", 30)))
                 si = max(60.0, float(cfg.get("scan_interval", 300)))
-                n_int = max(20.0, float(cfg.get("neural_poll_sec", 45)))
                 poly_int = max(300.0, float(cfg.get("poly_oracle_interval_sec", 3600)))
-
-                if cfg.get("neural_execution_enabled") and (
-                    self._last_neural_ts == 0 or (now - self._last_neural_ts) >= n_int
-                ):
-                    self._last_neural_ts = time.time()
-                    await _neural_delta_neutral_once(self._send)
 
                 if cfg.get("poly_enabled") and (
                     self._last_poly_oracle_ts == 0
@@ -1307,11 +1360,10 @@ class LiveTrader:
                 now = time.time()
                 next_p = self._last_pos_check + ci
                 next_s = self._last_sig_scan + si
-                next_n = self._last_neural_ts + n_int if cfg.get("neural_execution_enabled") else 1e18
                 next_poly = (
                     self._last_poly_oracle_ts + poly_int if cfg.get("poly_enabled") else 1e18
                 )
-                wait = min(next_p, next_s, next_n, next_poly) - now
+                wait = min(next_p, next_s, next_poly) - now
                 wait = max(1.0, min(wait, 120.0))
                 await asyncio.sleep(wait)
 

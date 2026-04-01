@@ -355,29 +355,78 @@ async def _safe_send(bot, chat_id, text, **kwargs):
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
+def _boot_ui_keyboard() -> InlineKeyboardMarkup:
+    """Startup / restart: choose chain dashboard emphasis (live vs paper UI mode)."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔴 实盘视图", callback_data="boot_ui_live"),
+                InlineKeyboardButton("📝 Paper/模拟视图", callback_data="boot_ui_paper"),
+            ],
+        ]
+    )
+
+
+async def handle_boot_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Persist telegram panel mode from startup buttons."""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    if not _is_authorized(query.from_user.id):
+        await query.answer("⛔ Unauthorized", show_alert=True)
+        return
+    uid = query.from_user.id
+    data = query.data or ""
+    if data == "boot_ui_live":
+        _ui_session_store.set_telegram_panel_mode(uid, "live")
+        await query.answer("已设为实盘视图", show_alert=False)
+        try:
+            await query.edit_message_text(
+                "✅ 已选择 **实盘视图**\n\n"
+                "/chain 将强调调度与 Live 段；上方「真实持仓聚合」仍含 OKX+钱包+DEX。\n"
+                "可随时在 /chain 里点 [模拟盘]/[实盘] 再切换。",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    "✅ 已选择实盘视图。发 /chain 打开面板。"
+                )
+            except Exception:
+                pass
+        return
+    if data == "boot_ui_paper":
+        _ui_session_store.set_telegram_panel_mode(uid, "paper")
+        await query.answer("已设为 Paper/模拟视图", show_alert=False)
+        try:
+            await query.edit_message_text(
+                "✅ 已选择 **Paper/模拟视图**\n\n"
+                "/chain 会突出 paper 分段；真实快照仍在面板上方。\n"
+                "可随时在 /chain 里切换。",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    "✅ 已选择 Paper/模拟视图。发 /chain 打开面板。"
+                )
+            except Exception:
+                pass
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     try:
         await update.message.reply_text(
             "🤖 Remote Controller v3.0\n\n"
-            "我是你的远程电脑控制器。\n"
-            "直接告诉我要做什么，我来操作。\n\n"
-            "📋 /panel - Command panel (all commands)\n\n"
-            "Quick commands:\n"
-            "/status - 状态 + 系统健康\n"
-            "/health - 详细健康检查\n"
-            "/screenshot - 截图\n"
-            "/model - 切换模型\n"
-            "/score - Agent表现评分\n"
-            "/portfolio - 持仓\n"
-            "/signal - 信号\n"
-            "/risk - 风险指标\n"
-            "/kill - 终止卡住的任务\n"
-            "/tasks - 查看任务队列\n"
-            "/cancel - 取消排队任务\n"
-            "/q - 快捷操作面板\n"
-            "/help - 帮助"
+            "我是你的远程电脑控制器。\n\n"
+            "👇 请先点选链上面板默认视图（每次 /start 可重选）：\n"
+            "· 实盘 = 强调调度 / Live 段\n"
+            "· Paper = 强调模拟仓分段\n"
+            "（OKX+钱包+DEX 真实聚合在 /chain 里始终显示）\n\n"
+            "常用: /chain /portfolio /strategy /panel /help",
+            reply_markup=_boot_ui_keyboard(),
         )
     except Exception as e:
         logger.error(f"Start command error: {e}", exc_info=True)
@@ -614,15 +663,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(
             "🤖 Bot 功能一览\n\n"
+            "  /start — 欢迎 + 选择实盘/Paper 面板视图\n\n"
             "🔗 链上交易 (Solana DEX):\n"
-            "  /chain — 链上面板 (持仓/买卖/PnL)\n"
+            "  /chain — 链上面板（含 OKX+DEX+钱包 真实快照）\n"
+            "  /portfolio — 同上聚合持仓（MarkdownV2 长文）\n"
+            "  /strategy — 策略总控（实盘/模拟/奇点/停止）\n"
             "  /buy <CA> [金额] — 买入代币\n"
             "  /sell <CA> [%] — 卖出代币\n"
-            "  /positions — 查看持仓\n"
+            "  /positions — dex 跟踪仓\n"
             "  /pnl — 链上PnL统计\n"
             "  /wallet_setup — 设置钱包\n"
             "  /paper — 模拟交易\n"
-            "  /live start|stop — 链上实盘\n\n"
+            "  /live start|stop — 链上实盘调度\n\n"
             "🚀 OKX 永续合约:\n"
             "  /okx_trade start|stop|live|paper\n"
             "  /okx — OKX行情 | /okx BTC\n"
@@ -638,9 +690,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  \"价格 BTC\" — 行情\n"
             "  \"大盘\" — 市场概览\n"
             "  \"扫描\" — Alpha信号\n"
-            "  \"持仓\" — 看仓位\n"
+            "  \"持仓\" — 真实聚合持仓（同 /portfolio）\n"
             "  \"链上\" — 链上面板\n"
-            "  粘贴CA → 自动弹买入卡片\n\n"
+            "  粘贴 Solana CA → 狙击卡片（现货/防夹）\n\n"
             "直接说就行，不用客气。"
         )
     except Exception as e:
@@ -1143,7 +1195,7 @@ async def bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Panel category definitions: (callback_prefix, label, commands)
 PANEL_CATEGORIES = [
     ("panel_ai",      "🤖 AI Controls",  [("ask", "提问"), ("model", "模型"), ("reset", "重置"), ("status", "状态")]),
-    ("panel_trading", "📊 Trading",       [("trade", "交易面板"), ("okx_market", "OKX行情"), ("signal", "信号"), ("portfolio", "持仓"), ("risk", "风险"), ("funding", "资金"), ("okx_top30", "OKX Top30"), ("token_analyze", "Token分析"), ("okx_backtest", "OKX回测"), ("session_ctrl", "会话控制")]),
+    ("panel_trading", "📊 Trading",       [("trade", "交易面板"), ("okx_market", "OKX行情"), ("signal", "信号"), ("portfolio", "实盘持仓"), ("risk", "风险"), ("funding", "资金"), ("okx_top30", "OKX Top30"), ("token_analyze", "Token分析"), ("okx_backtest", "OKX回测"), ("session_ctrl", "会话控制")]),
     ("panel_pc",      "🖥️ PC Control",   [("screenshot", "截图"), ("click", "点击"), ("type", "输入"), ("window", "窗口")]),
     ("panel_web",     "🌐 Web",           [("browse", "浏览"), ("search", "搜索"), ("scrape", "抓取")]),
     ("panel_system",  "🔧 System",        [("health", "健康"), ("memory", "内存"), ("evolve", "进化"), ("scan", "扫描")]),
@@ -1671,8 +1723,18 @@ async def _send_profit_report(context, chat_id):
 
 
 async def _send_portfolio(context, chat_id):
-    """Show trading portfolio / positions."""
-    lines = ["💼 Portfolio\n"]
+    """OKX + 钱包 + DEX 聚合持仓；失败时读旧 .bot_portfolio.json。"""
+    try:
+        import portfolio_manager as _pm
+
+        text = await _pm.get_live_portfolio_summary(refresh=True)
+        await context.bot.send_message(
+            chat_id=chat_id, text=text[:4096], parse_mode="MarkdownV2"
+        )
+        return
+    except Exception:
+        pass
+    lines = ["💼 Portfolio (legacy file)\n"]
     try:
         portfolio_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_portfolio.json")
         if os.path.exists(portfolio_file) and os.path.getsize(portfolio_file) < 5 * 1024 * 1024:
@@ -1689,8 +1751,7 @@ async def _send_portfolio(context, chat_id):
             if "total_value" in data:
                 lines.append(f"\nTotal value: ${float(data.get('total_value', 0)):,.2f}")
         else:
-            lines.append("No portfolio data.")
-            lines.append("Ask me to check your exchange positions.")
+            lines.append("无本地 portfolio 文件。请用 /chain 或 /portfolio 拉取真实快照。")
     except Exception as e:
         lines.append(f"Error: {str(e)[:200]}")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4096])
@@ -2388,7 +2449,7 @@ def _find_full_address(prefix: str):
 
 
 async def handle_token_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detect pasted Solana token address and show token card with buy buttons."""
+    """Detect pasted Solana mint and show sniper card (DEX + optional OKX hedge)."""
     if not update.message or not update.message.text:
         return
     if not _dex_available:
@@ -2401,7 +2462,7 @@ async def handle_token_address(update: Update, context: ContextTypes.DEFAULT_TYP
     if not re.match(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$', text):
         return
 
-    await update.message.reply_text("🔍 Looking up token...")
+    await update.message.reply_text("🔍 正在拉取代币与流动性…")
 
     info = await _dex.lookup_token(text)
     if not info:
@@ -2410,12 +2471,39 @@ async def handle_token_address(update: Update, context: ContextTypes.DEFAULT_TYP
 
     _cache_address(text)
     card = _dex.format_token_card(info)
+    liq = info.get("liquidity") or info.get("liquidity_usd") or 0
+    mcap = info.get("market_cap") or info.get("mcap") or 0
+    if liq:
+        card += f"\n💧 流动性(参考): ${float(liq):,.0f}"
+    if mcap:
+        card += f"\n📊 市值(参考): ${float(mcap):,.0f}"
+
+    if _live_available and _live_trader:
+        try:
+            ok_v, reason_v = await asyncio.wait_for(
+                _live_trader._validate_token(text, _live_trader._load_config()),
+                timeout=12.0,
+            )
+            card += "\n🛡 引擎体检: " + ("通过" if ok_v else f"未通过 ({reason_v[:80]})")
+        except Exception:
+            card += "\n🛡 引擎体检: 跳过"
+
+    uid = update.effective_user.id if update.effective_user else 0
+    hedge_on = _sniper_hedge_pref.get(uid, False)
+    card += f"\n\n🎯 狙击预备页 · 防夹(OKX对冲): {'开' if hedge_on else '关'}"
 
     # Check if we already have a position
     existing = _dex.get_position_by_address(text)
 
     settings = _dex.get_settings()
     buy_amounts = settings.get("buy_buttons", [0.1, 0.3, 0.5, 1.0])
+
+    hedge_row = [
+        InlineKeyboardButton(f"🛡{amt}", callback_data=f"snp_h_{text[:20]}_{amt}")
+        for amt in buy_amounts[:4]
+    ]
+    toggle_lbl = "🛡 防夹: 关→开" if not hedge_on else "🛡 防夹: 开→关"
+    toggle_row = [InlineKeyboardButton(toggle_lbl, callback_data="snp_t")]
 
     if existing:
         # Show sell buttons for existing position
@@ -2428,26 +2516,136 @@ async def handle_token_address(update: Update, context: ContextTypes.DEFAULT_TYP
                 InlineKeyboardButton("Sell 50%", callback_data=f"dex_sell_{text[:20]}_50"),
                 InlineKeyboardButton("Sell 100%", callback_data=f"dex_sell_{text[:20]}_100"),
             ],
-            [
-                InlineKeyboardButton(f"Buy {buy_amounts[0]} SOL", callback_data=f"dex_buy_{text[:20]}_{buy_amounts[0]}"),
-                InlineKeyboardButton(f"Buy {buy_amounts[-1]} SOL", callback_data=f"dex_buy_{text[:20]}_{buy_amounts[-1]}"),
-            ],
+            [InlineKeyboardButton(f"现货 {buy_amounts[0]} SOL", callback_data=f"dex_buy_{text[:20]}_{buy_amounts[0]}"),
+             InlineKeyboardButton(f"现货 {buy_amounts[-1]} SOL", callback_data=f"dex_buy_{text[:20]}_{buy_amounts[-1]}")],
+            hedge_row,
+            toggle_row,
             [
                 InlineKeyboardButton("📊 Detail", callback_data=f"dex_detail_{text[:20]}"),
                 InlineKeyboardButton("🔄 Refresh", callback_data=f"dex_refresh_{text[:20]}"),
             ],
         ]
     else:
-        # Show buy buttons for new token
         keyboard = [
-            [InlineKeyboardButton(f"{amt} SOL", callback_data=f"dex_buy_{text[:20]}_{amt}") for amt in buy_amounts],
+            [InlineKeyboardButton(f"现货 {amt} SOL", callback_data=f"dex_buy_{text[:20]}_{amt}") for amt in buy_amounts],
+            hedge_row,
+            toggle_row,
             [
                 InlineKeyboardButton("🔄 Refresh", callback_data=f"dex_refresh_{text[:20]}"),
-                InlineKeyboardButton("📊 Chart", url=info.get("pair_url", "")),
+                InlineKeyboardButton("📊 Chart", url=info.get("pair_url", "") or "https://dexscreener.com"),
             ],
         ]
 
     await _safe_reply(update.message, card, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_sniper_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle hedge preference + OKX/DEX atomic buy (live_trader gateway)."""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    if not _is_authorized(query.from_user.id):
+        await query.answer("⛔ Unauthorized", show_alert=True)
+        return
+    data = query.data or ""
+
+    if data == "snp_t":
+        uid = query.from_user.id
+        _sniper_hedge_pref[uid] = not _sniper_hedge_pref.get(uid, False)
+        st = "开" if _sniper_hedge_pref[uid] else "关"
+        await query.answer(f"防夹保护(OKX对冲): {st}", show_alert=True)
+        return
+
+    if not data.startswith("snp_h_"):
+        return
+
+    await query.answer()
+    if not _live_available or not _live_trader:
+        try:
+            await query.edit_message_text("❌ live_trader 不可用，请用现货按钮。")
+        except Exception:
+            pass
+        return
+
+    payload = data[6:]
+    sep = payload.rfind("_")
+    if sep <= 0:
+        try:
+            await query.edit_message_text("❌ 无效回调")
+        except Exception:
+            pass
+        return
+    addr_prefix = payload[:sep]
+    amt_s = payload[sep + 1 :]
+    try:
+        amount = float(amt_s)
+    except ValueError:
+        try:
+            await query.edit_message_text("❌ 金额无效")
+        except Exception:
+            pass
+        return
+
+    full_addr = _find_full_address(addr_prefix)
+    if not full_addr:
+        try:
+            await query.edit_message_text("❌ 地址过期，请重新粘贴 CA。")
+        except Exception:
+            pass
+        return
+
+    cfg = _live_trader._load_config()
+    if not cfg.get("enabled"):
+        try:
+            await query.edit_message_text(
+                "❌ 实盘引擎未开启：请在 _live_config.json 设置 enabled=true，并配置钱包/OKX。"
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        from trading.okx_executor import OKXExecutor
+
+        if not OKXExecutor().has_api_keys():
+            try:
+                await query.edit_message_text("❌ 未配置 OKX API，无法对冲。请用现货买入或配置密钥。")
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
+
+    info = None
+    if _dex_available and _dex:
+        info = await _dex.lookup_token(full_addr)
+    sym = (info.get("symbol") if info else None) or full_addr[:8]
+    hedge_sym = str(cfg.get("neural_hedge_symbol") or "SOLUSDT")
+
+    try:
+        await query.edit_message_text(f"⏳ 执行防夹对冲中… {amount} SOL · {sym}")
+    except Exception:
+        pass
+
+    gw = _live_trader.get_live_execution_gateway()
+    r = await gw.execute_atomic_hedge(full_addr, amount, sym, hedge_sym, signal_data=None)
+    if r.get("ok"):
+        dex_p = r.get("dex") or {}
+        hed_p = r.get("hedge") or {}
+        msg = (
+            f"✅ 防夹对冲完成\n{dex_p.get('tx_signature', '')[:16]}…\n"
+            f"OKX: {hedge_sym} short · notion ${r.get('notional_usd', 0):,.0f}"
+        )
+    else:
+        msg = f"❌ 对冲失败: {r.get('reason', r)}"
+
+    try:
+        await query.edit_message_text(str(msg)[:4096])
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=query.from_user.id, text=str(msg)[:4096])
+        except Exception:
+            pass
 
 
 async def handle_dex_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3028,9 +3226,10 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
     age_s = float(ps.get("age_sec", 0) or 0)
     snap_note = f"{age_s:.0f}s前" if ps.get("updated_at") else "未就绪"
     if ui_mode == "live":
-        L.append(f"🎚 界面: ✅[实盘] · 资产快照 {snap_note}")
+        L.append(f"🎚 界面: ✅[实盘] · 快照 {snap_note}")
     else:
-        L.append(f"🎚 界面: ✅[模拟盘] · 资产快照 {snap_note}")
+        L.append(f"🎚 界面: ✅[模拟盘] · 快照 {snap_note}")
+    L.append("💡 下方「真实持仓聚合」= OKX+钱包+DEX 轮询，与 [模拟] 纸面仓无关")
     if not ps.get("updated_at"):
         L.append("⏳ 后台正在首次同步链上/OKX/DEX…（约10–15s）")
     err_ps = (ps.get("last_error") or "").strip()
@@ -3038,44 +3237,15 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
         L.append(f"⚠ 同步: {err_ps[:120]}")
     L.append("")
 
-    if ui_mode == "live" and ps.get("updated_at"):
-        ox = ps.get("okx") or {}
-        dx = ps.get("dex") or {}
-        sp = float(ps.get("sol_price") or 0)
-        dex_usd = float(dx.get("total_value_sol") or 0) * sp if sp > 0 else 0.0
-        okx_eq = float(ox.get("total_equity_usd") or 0)
-        if ox.get("has_keys") or dex_positions:
-            L.append("━━ 全息持仓（实盘 · 读缓存）━━")
-            L.append(
-                f"💵 总资金(估): OKX ${okx_eq:,.2f} + DEX ~${dex_usd:,.0f} "
-                f"≈ ${okx_eq + dex_usd:,.0f}"
-            )
-        if ox.get("has_keys") and ox.get("ok"):
-            L.append(f"   OKX 可用 USDT: {float(ox.get('usdt_available') or 0):,.2f}")
-            for row in (ox.get("positions") or [])[:8]:
-                inst = row.get("instId") or "?"
-                nu = float(row.get("notionalUsd") or 0)
-                upl = float(row.get("upl") or 0)
-                L.append(f"   📈 {inst} 名义${nu:,.0f}  浮盈 {upl:+.2f} USDT")
+    if ps.get("updated_at"):
+        try:
+            import portfolio_manager as _pm
+
+            L.append("━━ 📡 真实持仓聚合（OKX · 钱包 · DEX）━━")
+            L.append(_pm.format_portfolio_plain(ps))
             L.append("")
-        elif ox.get("has_keys") and not ox.get("ok"):
-            L.append(f"   OKX: {str(ox.get('error') or '未取到余额')[:80]}")
-            L.append("")
-        if dex_positions:
-            L.append(
-                f"📌 DEX 持仓 {len(dex_positions)}  "
-                f"· 市值 ~{float(dx.get('total_value_sol') or 0):.3f} SOL"
-            )
-            for p in sorted(
-                dex_positions,
-                key=lambda x: float(x.get("amount_sol", 0) or 0),
-                reverse=True,
-            )[:6]:
-                sym = (p.get("symbol") or p.get("name") or "?")[:12]
-                amt = float(p.get("amount_sol", 0) or 0)
-                pnl = float(p.get("pnl_pct", 0) or 0)
-                L.append(f"   · {sym} 数量 {amt:.4f} SOL  盈亏 {pnl:+.1f}%")
-            L.append("")
+        except Exception:
+            pass
 
     if is_live:
         st0 = sched_state.get("start_time") or 0
@@ -3132,7 +3302,7 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
         if dex_positions:
             total_sol = sum(p.get("amount_sol", 0) or 0 for p in dex_positions)
             total_usd = total_sol * sol_price if sol_price > 0 else 0
-            L.append(f"📌 DEX面板跟踪 ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
+            L.append(f"📌 dex_trader 跟踪 [DEX] ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
             for p in sorted(dex_positions, key=lambda x: x.get("amount_sol", 0) or 0, reverse=True)[:6]:
                 name = p.get("name") or p.get("symbol", "?")
                 sym = p.get("symbol", "?")
@@ -3144,7 +3314,7 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
                 )
             L.append("")
         else:
-            L.append("📌 DEX面板跟踪: 无")
+            L.append("📌 dex_trader 跟踪 [DEX]: 无")
             L.append("")
 
         if paper_on or paper_closed > 0:
@@ -3200,7 +3370,7 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
         if dex_positions:
             total_sol = sum(p.get("amount_sol", 0) or 0 for p in dex_positions)
             total_usd = total_sol * sol_price if sol_price > 0 else 0
-            L.append(f"📌 DEX面板跟踪 ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
+            L.append(f"📌 dex_trader 跟踪 [DEX] ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
             for p in sorted(dex_positions, key=lambda x: x.get("amount_sol", 0) or 0, reverse=True)[:8]:
                 name = p.get("name") or p.get("symbol", "?")
                 sym = p.get("symbol", "?")
@@ -3212,11 +3382,11 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
                 )
             L.append("")
         else:
-            L.append("📌 DEX面板跟踪: 无")
+            L.append("📌 dex_trader 跟踪 [DEX]: 无")
             L.append("")
 
         if paper_trades_open:
-            L.append(f"📝 模拟持仓 ({len(paper_trades_open)})")
+            L.append(f"📝 paper_trader 模拟仓 [模拟] ({len(paper_trades_open)})")
             for t in sorted(paper_trades_open, key=lambda x: x.get("position_sol", 0) or 0, reverse=True)[:8]:
                 name = t.get("name", "")
                 sym = t.get("symbol", "?")
@@ -3261,19 +3431,10 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
             f"SL{s.get('default_sl_pct', -30)} {mev}"
         )
 
-    if ui_mode == "live" and ps.get("updated_at"):
-        try:
-            import portfolio_manager as _pm
-
-            L.append("")
-            L.append(_pm.format_portfolio_plain(ps))
-        except Exception:
-            pass
-
     L.append("━━━━━━━━━━━━━━━━━━━━━━━")
     if is_live:
         L.append("📡 简报=详情 | 🔄 刷新=同步链上 | 约30分钟推送简报")
-    L.append("粘贴CA→买入 | /buy | /sell")
+    L.append("🔄 刷新=重拉快照 | /portfolio 聚合持仓 | 粘贴CA→买入 | /buy /sell")
     result = "\n".join(L)
     _chain_cache["dashboard_text"] = result
     _chain_cache["dashboard_ts"] = time.time()
@@ -3347,6 +3508,21 @@ async def chain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_reply(update.message, text, reply_markup=kb)
 
 
+async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Strategy control panel — same actions as 🧠 策略总控 in /chain."""
+    if not update.message:
+        return
+    hdr = (
+        "🧠 策略总控\n\n"
+        "▶️ 高频：Solana 实盘调度 + LiveTrader\n"
+        "▶️ 低频：TradeScheduler paper（ProStrategy）\n"
+        "▶️ 奇点：singularity_engine 守护（约 1h 周期）\n\n"
+        "⏹ 停止：取消奇点后台任务并停止 TradeScheduler。\n\n"
+        "也可在 /chain 面板内点「🧠 策略总控」。"
+    )
+    await _safe_reply(update.message, hdr, reply_markup=_build_strategy_control_keyboard())
+
+
 async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all on-chain dashboard inline button presses (ch_* callbacks)."""
     global _live_trader_instance, _trade_scheduler_instance
@@ -3398,6 +3574,9 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "ch_strat_live":
         await query.answer()
         ok, msg = await _chain_start_live_scheduler(context, chat_id)
+        if ok:
+            _ui_session_store.set_telegram_panel_mode(uid_cb, "live")
+            msg = msg + "\n\n界面已切到 ✅[实盘]，返回主面板可看到完整布局。"
         try:
             await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[back_btn]]))
         except Exception:
@@ -4204,7 +4383,8 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
             if not _trade_scheduler_instance:
                 _trade_scheduler_instance = _trade_scheduler.TradeScheduler(send_func=_ch_live_send)
             await _trade_scheduler_instance.start(mode="live")
-            msg = "🚀 实盘交易已启动!"
+            _ui_session_store.set_telegram_panel_mode(uid_cb, "live")
+            msg = "🚀 实盘交易已启动! 界面已切到 ✅[实盘]（刷新主面板可看完整快照）"
         try:
             await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[back_btn]]))
         except Exception:
@@ -7039,6 +7219,14 @@ async def _try_trading_intent(text: str, lower: str, chat_id: int, update, conte
 
     # ── Status shortcut: "持仓" / "仓位" / "positions" ──
     if lower in ("持仓", "仓位", "positions", "pos", "看看持仓"):
+        try:
+            import portfolio_manager as _pm
+
+            txt = await _pm.get_live_portfolio_summary(refresh=True)
+            await _safe_reply(update.message, txt, parse_mode="MarkdownV2")
+            return True
+        except Exception:
+            pass
         # Show OKX brain positions first
         if _okx_trading_available and _okx_brain is not None:
             pos_dict = _okx_brain.executor.state.positions
@@ -7921,6 +8109,7 @@ def main():
     app.add_handler(CommandHandler("trade", trade_dashboard_command, filters=auth_filter))
     app.add_handler(CommandHandler("t", trade_dashboard_command, filters=auth_filter))
     app.add_handler(CommandHandler("chain", chain_command, filters=auth_filter))
+    app.add_handler(CommandHandler("strategy", strategy_command, filters=auth_filter))
     app.add_handler(CommandHandler("arb", arb_command, filters=auth_filter))
     app.add_handler(CommandHandler("okx", okx_command, filters=auth_filter))
     app.add_handler(CommandHandler("okx_account", okx_account_command, filters=auth_filter))
@@ -7967,8 +8156,10 @@ def main():
 
     # Callbacks — panel first, then DEX trading, then session control, then quick actions, then safety confirmations
     app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
+    app.add_handler(CallbackQueryHandler(handle_boot_ui_callback, pattern="^boot_ui_"))
     app.add_handler(CallbackQueryHandler(handle_chain_callback, pattern="^ch_"))
     app.add_handler(CallbackQueryHandler(handle_trade_dashboard_callback, pattern="^td_"))
+    app.add_handler(CallbackQueryHandler(handle_sniper_callback, pattern="^snp_"))
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern="^dex_"))
     app.add_handler(CallbackQueryHandler(handle_session_control_callback, pattern="^sc_"))
     app.add_handler(CallbackQueryHandler(handle_quick_action_callback, pattern="^qa_"))
@@ -8046,9 +8237,13 @@ def main():
         # Register commands FIRST (before any background tasks that might fail)
         try:
             await application.bot.set_my_commands([
-                ("chain", "🔗 链上交易面板 (Solana DEX)"),
+                ("chain", "🔗 链上交易 (真实快照+买卖)"),
+                ("portfolio", "💼 OKX+钱包+DEX 持仓"),
+                ("strategy", "🧠 策略总控 (实盘/模拟/奇点)"),
                 ("okx_trade", "🚀 OKX 策略 (start/stop/live)"),
                 ("trade", "💹 综合交易面板"),
+                ("live", "🔴 实盘 start|stop|status"),
+                ("wallet_setup", "🔐 配置 Solana 钱包"),
                 ("alpha", "🔍 Alpha 扫描"),
                 ("evolution", "🧬 进化引擎状态"),
                 ("okx", "📊 OKX 行情"),
@@ -8059,6 +8254,26 @@ def main():
             logger.info("Bot commands registered with Telegram")
         except Exception as e:
             logger.error(f"Failed to set bot commands: {e}")
+
+        # One-time prompt after process start: choose live vs paper UI for /chain
+        if config.AUTHORIZED_USER_ID is not None and not application.bot_data.get("_boot_ui_prompt_sent"):
+            try:
+                await application.bot.send_message(
+                    chat_id=config.AUTHORIZED_USER_ID,
+                    text=(
+                        "🤖 Bot 已启动（进程重启）。\n\n"
+                        "请先选择链上面板默认视图：\n"
+                        "· 🔴 实盘 — 强调调度/Live\n"
+                        "· 📝 Paper — 强调模拟分段\n"
+                        "真实 OKX/钱包/DEX 快照在 /chain 内始终可见。\n\n"
+                        "也可随时发 /start 重新选择。"
+                    ),
+                    reply_markup=_boot_ui_keyboard(),
+                )
+                application.bot_data["_boot_ui_prompt_sent"] = True
+                logger.info("Boot UI mode prompt sent to authorized user")
+            except Exception as e:
+                logger.warning("Boot UI prompt failed: %s", e)
 
         try:
             from trading.portfolio_snapshot import refresh_once as _pf_once

@@ -13,6 +13,7 @@ Env:   TELEGRAM_BOT_TOKEN (required)
        GATEWAY_UI=panel|terminal   (default: panel)
        GATEWAY_TELEGRAM_USER_IDS="123,456" optional allow-list (empty = any user)
        TERMINAL_REDIS_URL or REDIS_URL optional session mirror for terminal mode
+       TG_DEV_TIMEOUT_SEC optional seconds for `/dev` Claude CLI (default: 600)
 """
 
 from __future__ import annotations
@@ -174,6 +175,51 @@ async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_start(update, context)
 
 
+_DEV_CMD = re.compile(r"^/dev(?:@\w+)?\s*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run local `claude -p` from repo root; report git status when finished."""
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_authorized(uid):
+        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
+        return
+    raw = (update.message.text or "").strip()
+    m = _DEV_CMD.match(raw)
+    prompt = (m.group(1) if m else "").strip()
+    if not prompt:
+        await update.message.reply_text("用法：`/dev <你的开发需求>`")
+        return
+
+    await update.message.reply_text(
+        "🚀 收到架构师指令，本地 Claude CLI 开发进程已唤醒，正在后台阅览全库并重构代码，请等待战报..."
+    )
+    bot = context.bot
+    chat_id = update.message.chat_id
+
+    async def _run_bridge() -> None:
+        from pipeline.tg_dev_bridge import format_telegram_report, run_dev_prompt
+
+        try:
+            result = await run_dev_prompt(prompt)
+            if result.ok and result.modified_files:
+                text = "✅ 自动编程完成。您的代码库已被修改。"
+            else:
+                text = format_telegram_report(result)
+        except Exception as e:
+            logger.exception("cmd_dev bridge: %s", e)
+            text = f"❌ 桥接执行异常：{e!s}"
+        text = text[:4096]
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            logger.warning("cmd_dev report send failed: %s", e)
+
+    asyncio.create_task(_run_bridge())
+
+
 async def handle_gateway_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -311,6 +357,7 @@ class TelegramBot:
         )
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("panel", cmd_panel))
+        app.add_handler(CommandHandler("dev", cmd_dev))
         pat = re.compile(rf"^{re.escape(GW_CB)}:")
         app.add_handler(CallbackQueryHandler(handle_gateway_callback, pattern=pat))
         return app

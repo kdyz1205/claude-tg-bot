@@ -463,31 +463,81 @@ class OKXExecutor:
         base = symbol.upper().replace("USDT", "").replace("-", "")
         return f"{base}-USDT"
 
-    async def _okx_request(self, method: str, path: str, body: str = "") -> dict:
+    def _is_signature_or_auth_error(self, data: dict) -> bool:
+        """OKX v5: 50111/50112/50113 = timestamp/signature/passphrase issues."""
+        code = str(data.get("code", ""))
+        msg = (data.get("msg") or "").lower()
+        if code in ("50111", "50112", "50113"):
+            return True
+        if "signature" in msg or "passphrase" in msg or "timestamp" in msg:
+            return True
+        try:
+            for row in data.get("data") or []:
+                if isinstance(row, dict):
+                    sm = (row.get("sMsg") or "").lower()
+                    if "signature" in sm or "passphrase" in sm:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    async def _okx_request(
+        self,
+        method: str,
+        path: str,
+        body: str = "",
+        *,
+        max_attempts: int = 2,
+    ) -> dict:
         if not self.has_api_keys():
             return {"code": "-1", "msg": "No API keys configured"}
-        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-        headers = self._make_headers(timestamp, method, path, body)
         url = f"{OKX_REST_BASE}{path}"
-        try:
-            session = await self._get_aio_session()
-            if session is not None:
-                await self._okx_http_spacing()
-                if method == "GET":
-                    async with session.get(url, headers=headers) as resp:
-                        return await resp.json()
-                async with session.post(url, headers=headers, data=body) as resp:
-                    return await resp.json()
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                if method == "GET":
-                    resp = await client.get(url, headers=headers)
+        last_err: dict = {"code": "-1", "msg": "no_attempt"}
+        for attempt in range(max(1, int(max_attempts))):
+            timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+            headers = self._make_headers(timestamp, method, path, body)
+            try:
+                session = await self._get_aio_session()
+                if session is not None:
+                    await self._okx_http_spacing()
+                    if method == "GET":
+                        async with session.get(url, headers=headers) as resp:
+                            data = await resp.json()
+                    else:
+                        async with session.post(url, headers=headers, data=body) as resp:
+                            data = await resp.json()
                 else:
-                    resp = await client.post(url, headers=headers, content=body)
-                return resp.json()
-        except asyncio.TimeoutError:
-            return {"code": "-1", "msg": "timeout"}
-        except Exception as e:
-            return {"code": "-1", "msg": str(e)}
+                    tmo = httpx.Timeout(connect=8.0, read=25.0, write=15.0, pool=5.0)
+                    async with httpx.AsyncClient(timeout=tmo) as client:
+                        if method == "GET":
+                            resp = await client.get(url, headers=headers)
+                        else:
+                            resp = await client.post(url, headers=headers, content=body)
+                        data = resp.json()
+                last_err = data
+                if self._is_signature_or_auth_error(data) and attempt + 1 < max_attempts:
+                    log.warning(
+                        "OKX auth/signature rejected (attempt %s), refreshing timestamp+sign",
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(0.15)
+                    continue
+                return data
+            except asyncio.TimeoutError:
+                last_err = {"code": "-1", "msg": "asyncio_timeout"}
+                log.warning("OKX %s %s timeout (attempt %s)", method, path, attempt + 1)
+            except httpx.TimeoutException as e:
+                last_err = {"code": "-1", "msg": f"httpx_timeout:{type(e).__name__}"}
+                log.warning("OKX %s %s httpx timeout: %s", method, path, e)
+            except httpx.HTTPError as e:
+                last_err = {"code": "-1", "msg": f"httpx_error:{e}"}
+                log.warning("OKX %s %s HTTP error: %s", method, path, e)
+            except Exception as e:
+                last_err = {"code": "-1", "msg": str(e)}
+                log.warning("OKX %s %s error: %s", method, path, e)
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(0.2 * (attempt + 1))
+        return last_err
 
     async def get_account_balance(self) -> dict:
         data = await self._okx_request("GET", "/api/v5/account/balance")

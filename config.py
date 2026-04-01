@@ -37,6 +37,23 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 CURRENT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "claude")
 
+# Task-tier API routing (see providers_router.classify_task_tier)
+# Fast / cheap: quick judgments, formatting, extraction
+TASK_TIER_FAST_CLAUDE = os.getenv("TASK_TIER_FAST_CLAUDE", "claude-3-5-haiku-20241022")
+TASK_TIER_FAST_OPENAI = os.getenv("TASK_TIER_FAST_OPENAI", "gpt-4o-mini")
+# Heavy: strategy, multimodal, long reasoning (empty string → use CLAUDE_MODEL / OPENAI_MODEL)
+TASK_TIER_HEAVY_CLAUDE = os.getenv("TASK_TIER_HEAVY_CLAUDE", "").strip() or None
+TASK_TIER_HEAVY_OPENAI = os.getenv("TASK_TIER_HEAVY_OPENAI", "").strip() or None
+
+try:
+    API_TRANSIENT_RETRIES = max(1, int(os.getenv("API_TRANSIENT_RETRIES", "4")))
+except ValueError:
+    API_TRANSIENT_RETRIES = 4
+try:
+    API_REQUEST_TIMEOUT_SEC = float(os.getenv("API_REQUEST_TIMEOUT_SEC", "120"))
+except ValueError:
+    API_REQUEST_TIMEOUT_SEC = 120.0
+
 # ─── Claude Code CLI Settings ────────────────────────────────────────────────
 BRIDGE_MODE = os.getenv("BRIDGE_MODE", "true").lower() == "true"
 # Harness mode: use browser AI as PRIMARY, CLI only for computer control

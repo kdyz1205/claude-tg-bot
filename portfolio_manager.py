@@ -49,27 +49,31 @@ def format_portfolio_plain(snapshot: dict[str, Any]) -> str:
     age = float(snapshot.get("age_sec") or 0)
     lines.append("━━ 真实持仓摘要 ━━")
     lines.append(f"总资产净值(估): ~${_fmt_usd(total_nav)}  |  快照 {age:.0f}s 前")
+    idx = 0
     if ox.get("has_keys") and ox.get("ok"):
         lines.append(f"OKX 权益 ${okx_eq:,.2f}  ·  可用 USDT {float(ox.get('usdt_available') or 0):,.2f}")
-        for i, row in enumerate((ox.get("positions") or [])[:8], 1):
+        for row in (ox.get("positions") or [])[:8]:
+            idx += 1
             inst = row.get("instId") or "?"
             upl = float(row.get("upl") or 0)
             nu = float(row.get("notionalUsd") or 0)
             em = "🟢" if upl >= 0 else "🔴"
             side = "空" if float(row.get("pos") or 0) < 0 else "多"
-            lines.append(f"{i}. ${inst} (OKX{side}保) | 名义 ${nu:,.0f} | 浮盈 {em} ${upl:+,.2f}")
+            lines.append(f"{idx}. ${inst} (OKX{side}保) | 名义 ${nu:,.0f} | 浮盈 {em} ${upl:+,.2f}")
     elif ox.get("has_keys") and not ox.get("ok"):
         lines.append(f"OKX: {str(ox.get('error') or '?')[:80]}")
-    for i, p in enumerate((dx.get("positions") or [])[:6], 1):
+    for p in (dx.get("positions") or [])[:6]:
+        idx += 1
         sym = (p.get("symbol") or p.get("name") or "?")[:14]
         amt = float(p.get("amount_sol", 0) or 0)
         pnl = float(p.get("pnl_pct", 0) or 0)
         em = "🟢" if pnl >= 0 else "🔴"
-        lines.append(f"{i}. ${sym} (DEX) | {amt:.4f} SOL 等 | 浮亏 {em} {pnl:+.1f}%")
-    for i, t in enumerate((w.get("tokens") or [])[:6], 1):
+        lines.append(f"{idx}. ${sym} (DEX) | {amt:.4f} SOL 等 | 浮亏 {em} {pnl:+.1f}%")
+    for t in (w.get("tokens") or [])[:6]:
+        idx += 1
         lab = (t.get("label") or "?")[:12]
         amt = float(t.get("amount") or 0)
-        lines.append(f"{i}. ${lab} (钱包SPL) | 数量 {_fmt_qty(amt)} | 浮亏 —")
+        lines.append(f"{idx}. ${lab} (钱包SPL) | 数量 {_fmt_qty(amt)} | 浮亏 —")
     err = (snapshot.get("last_error") or "").strip()
     if err:
         lines.append(f"⚠ 同步: {err[:120]}")

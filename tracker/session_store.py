@@ -182,7 +182,10 @@ class SessionStore:
         return self.sessions.get(session_id)
 
     def get_telegram_panel_mode(self, user_id: int) -> str:
-        """Telegram chain dashboard UI context: 'paper' | 'live'."""
+        """
+        Telegram 网关主页状态：'paper'（🔵 模拟盘）| 'live'（🔴 真金实盘）。
+        持久化文件：``telegram_panel_mode.json``（与 sessions 同目录）。
+        """
         with self._telegram_prefs_lock:
             v = self._telegram_prefs.get(str(int(user_id)), "paper")
         return v if v in ("paper", "live") else "paper"
