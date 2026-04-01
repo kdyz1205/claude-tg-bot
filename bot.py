@@ -412,6 +412,7 @@ async def handle_boot_ui_callback(update: Update, context: ContextTypes.DEFAULT_
                 )
             except Exception:
                 pass
+        return
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
