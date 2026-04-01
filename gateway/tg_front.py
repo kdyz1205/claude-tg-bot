@@ -63,7 +63,7 @@ def _hedge_section_v2(snap: dict, open_live: list[dict]) -> str:
             leg = e(f"${sym} (现货多) + (OKX空)")
         else:
             leg = e(f"${sym} (OKX空)")
-        sign = "+" if upl >= 0 else ""
+        sign = "\\+" if upl >= 0 else ""
         lines.append(f"{n}\\. {leg} \\| 浮盈: {sign}{_num_v2(upl, '.2f')}")
         n += 1
 
@@ -71,7 +71,7 @@ def _hedge_section_v2(snap: dict, open_live: list[dict]) -> str:
         for p in open_live[:3]:
             sym = e(str(p.get("symbol") or "?")[:12])
             pnl = float(p.get("pnl_sol", 0) or 0)
-            sign = "+" if pnl >= 0 else ""
+            sign = "\\+" if pnl >= 0 else ""
             lines.append(f"{n}\\. {sym} \\| PnL: {sign}{_num_v2(pnl, '.4f')} SOL")
             n += 1
 
@@ -200,8 +200,8 @@ def render_dashboard_text(
     start_bal = float(live_stats.get("starting_balance", 0) or 0)
     denom_usd = start_bal * sol_p if (start_bal > 0 and sol_p > 0) else (eq if eq > 0 else 1.0)
     pct = (daily_usd / denom_usd * 100.0) if denom_usd else 0.0
-    d_sign = "+" if daily_usd >= 0 else ""
-    p_sign = "+" if pct >= 0 else ""
+    d_sign = "\\+" if daily_usd >= 0 else ""
+    p_sign = "\\+" if pct >= 0 else ""
     emoji_pnl = "🟢" if daily_usd >= 0 else "🔴"
     eq_v = _num_v2(eq, ",.2f")
     du_v = _num_v2(abs(daily_usd), ".2f")
@@ -251,7 +251,7 @@ def render_status_brief_text(
     open_n = int(live_stats.get("open_positions") or 0)
     closed_n = int(live_stats.get("closed_trades") or 0)
     daily = float(live_stats.get("daily_pnl_sol") or 0)
-    d_sign = "+" if daily >= 0 else ""
+    d_sign = "\\+" if daily >= 0 else ""
     mode_note = e("实盘" if m == "live" else "模拟")
     lines = [
         f"*📡 {e('状态速报')}*",
