@@ -20,7 +20,8 @@ Telegram Gateway — PTB：极简全自动看板。
   ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
   配置总线：写 ``session_commander_config.json`` 的 ``active_skills``；God 引擎用 **watchdog** 监听 JSON 并 ``reload_skills``。
   斜杠：``/start`` 网关面板；``/trade``、``/t`` 委托 ``bot.trade_dashboard_command``。
-  其它 ``/…`` 与纯文本相同，走 Jarvis 语义路由（classify_intent → CHAT/TRADE/AUTO_DEV 等）。
+  其它 ``/…`` 与纯文本相同，默认走 Jarvis 语义路由；但 **脊髓快路径** 在 LLM 之前拦截（**子串**命中即可，可带 emoji/前后缀）：
+  含 ``持仓`` / ``余额`` / ``资产`` 或 ``/portfolio`` → 快照看板；含 ``状态`` / ``监控`` 或 ``/status`` → 状态速报。
 
 Run:   python -m gateway.telegram_bot
 """
@@ -70,6 +71,44 @@ from gateway.handlers.router import (
 from tracker.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
+
+# Fast path：长官一键平账（脊髓反射，不经 Jarvis LLM）
+_LEDGER_RESYNC_TRIGGERS_CN = ("校准", "平账", "同步账本")
+
+
+def _text_triggers_ledger_resync(text: str) -> bool:
+    if not (text or "").strip():
+        return False
+    raw = text.strip()
+    low = raw.lower()
+    if "resync" in low:
+        return True
+    for w in _LEDGER_RESYNC_TRIGGERS_CN:
+        if w in raw:
+            return True
+    return False
+
+
+# 脊髓反射：子串匹配（容错 emoji/前后空格/废话前缀，不经 LLM）
+def _fast_path_spinal_kind(text: str) -> str | None:
+    """Return ``portfolio`` | ``status`` | ``None``. Substring match on stripped text."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+    # 持仓类优先于状态类，避免「资产状态」等同时命中时歧义
+    for sub in ("持仓", "余额", "资产"):
+        if sub in raw:
+            return "portfolio"
+    if "/portfolio" in low:
+        return "portfolio"
+    for sub in ("状态", "监控"):
+        if sub in raw:
+            return "status"
+    if "/status" in low:
+        return "status"
+    return None
+
 
 USER_MODE: str = "paper"
 _TS: Any = None
@@ -213,6 +252,49 @@ def _dashboard_sync() -> tuple[dict, dict, dict]:
     st = trade_scheduler.read_scheduler_state()
     stats = live_trader.get_live_stats()
     return snap, st, stats
+
+
+async def _spinal_fast_path_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    uid: int,
+    text: str,
+) -> bool:
+    """Portfolio / status spinal reflex: no ``classify_intent``, no LLM."""
+    kind = _fast_path_spinal_kind(text)
+    if not kind:
+        return False
+    mark_gateway_user_activity()
+    global USER_MODE
+    store = await _session_store_async(context.application)
+    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
+    snap, st, stats = _dashboard_sync()
+    try:
+        from gateway.tg_front import (
+            build_dashboard_keyboard,
+            render_dashboard_text,
+            render_status_brief_text,
+        )
+
+        if kind == "portfolio":
+            body = render_dashboard_text(USER_MODE, snap, st, stats)
+            kb = build_dashboard_keyboard(bool(st.get("active")))
+            await update.message.reply_text(
+                body,
+                reply_markup=kb,
+                parse_mode="MarkdownV2",
+            )
+        else:
+            body = render_status_brief_text(USER_MODE, snap, st, stats)
+            await update.message.reply_text(body, parse_mode="MarkdownV2")
+    except Exception as e:
+        logger.exception("spinal fast path failed kind=%s", kind)
+        try:
+            await update.message.reply_text(f"⚡ 快路径渲染失败：{e!s}"[:4096])
+        except Exception:
+            pass
+    return True
 
 
 async def _edit_main_dashboard(bot, chat_id: int, message_id: int) -> None:
@@ -437,6 +519,39 @@ async def _jarvis_semantic_route(
         return
     text = (update.message.text or "").strip()
     if not text:
+        return
+
+    if await _spinal_fast_path_reply(update, context, uid=uid, text=text):
+        return
+
+    if _text_triggers_ledger_resync(text):
+        try:
+            import live_trader as _lt
+
+            res = await _lt.force_resync_ledger()
+        except Exception as e:
+            logger.exception("ledger resync fast path: unexpected error")
+            await update.message.reply_text(
+                f"❌ 平账指令执行异常（账本未修改）：{e!s}"[:4096]
+            )
+            return
+        if res.get("ok"):
+            await update.message.reply_text(
+                "✅ 遵命长官！实盘引擎的基准资金已强制与您的真实钱包同步，历史盈亏基准已重新校准。"
+            )
+        else:
+            err = str(res.get("error") or "")
+            if err == "wallet_not_configured":
+                fail = (
+                    "❌ 平账指令无法执行：尚未配置链上钱包。请先 /wallet_setup。"
+                    "引擎账本未作任何修改。"
+                )
+            else:
+                fail = (
+                    "❌ 平账指令无法执行：无法可靠读取链上 SOL 余额（网络或 RPC）。"
+                    "引擎账本未作任何修改。"
+                )
+            await update.message.reply_text(fail)
         return
 
     from gateway.jarvis_semantic import (
