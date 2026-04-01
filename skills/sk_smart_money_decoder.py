@@ -309,6 +309,39 @@ def _format_report(r: SmartMoneyReport) -> str:
     return "\n".join(lines)
 
 
+# ── Hot-cache alpha (on-chain only, no K-line / no technicals) ────────────────
+
+async def analyze(
+    token_address: str,
+    chain_hint: str = "solana",
+) -> Dict[str, Any]:
+    """
+    Read ``onchain_tracker.HotTokenCache`` only.
+
+    If this mint was bought (≥10 SOL swap from hardcoded targets) by **more than two**
+    distinct target wallets within the last 5 minutes, return a high-confidence buy dict.
+    Otherwise returns ``action: none`` — no DexScreener, Ethplorer, or chart data.
+    """
+    addr = str(token_address or "").strip()
+    if not addr:
+        return {"action": "none", "confidence": 0.0, "target_asset": ""}
+
+    hint = (chain_hint or "solana").lower()
+    if hint not in ("sol", "solana"):
+        return {"action": "none", "confidence": 0.0, "target_asset": addr}
+
+    from onchain_tracker import PARASITE_CONSENSUS_WINDOW_SEC, hot_token_cache
+
+    n = await hot_token_cache.distinct_wallets_in_window(addr, float(PARASITE_CONSENSUS_WINDOW_SEC))
+    if n > 2:
+        return {
+            "action": "buy",
+            "confidence": 0.99,
+            "target_asset": addr,
+        }
+    return {"action": "none", "confidence": 0.0, "target_asset": addr}
+
+
 # ── Skill interface contract ──────────────────────────────────────────────────
 
 SKILL_METADATA = {
@@ -322,6 +355,8 @@ SKILL_METADATA = {
         "chain_hint": "str optional — 'ethereum'|'bsc'|'solana'",
     },
     "output_schema": "Telegram Markdown 报告字符串",
+    "analyze_function": "analyze",
+    "analyze_schema": '{"action": str, "confidence": float, "target_asset": str}',
 }
 
 
