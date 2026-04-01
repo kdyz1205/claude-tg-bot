@@ -3,10 +3,10 @@ dispatcher/llm_filter.py — Zero-Trust LLM output interceptor.
 
 ANY trade directive from an agent/LLM must pass through
 LLMHallucinationFilter.sanitize_trade_directive() before reaching the
-execution layer. Trade JSON repair rounds use ``reask_trade_json_via_http``
-(aiohttp to Ollama / Anthropic / OpenAI per ``config``), not subprocess CLI.
+execution layer. Trade JSON repair uses ``reask_trade_json_via_http``, which calls
+``claude_agent.reask_trade_json_via_cli`` (local Claude Code CLI, async subprocess, serialized).
 
-Upstream ``llm_http_client`` enforces daily token budget (``LLM_DAILY_TOKEN_BUDGET``) and model fallback.
+Primary bot traffic does not use billing HTTP for those repair rounds; quota is the CLI subscription.
 
 Rejects:
   - Non-whitelisted trading pairs
@@ -75,30 +75,15 @@ TradeJsonReaskFn = Callable[[int, str], Awaitable[str]]
 
 async def reask_trade_json_via_http(round_idx: int, previous_output: str) -> str:
     """
-    Ask the configured HTTP LLM to emit a single trade JSON object.
-    Fixed 30s budget; aiohttp only — no subprocess. Never raises.
+    Trade JSON repair via **local Claude Code CLI** (async subprocess, global semaphore).
+    Same path as main bot brain — subscription quota, not billing HTTP API. Never raises.
     """
     try:
-        reminder = TRADE_JSON_REMINDERS[round_idx % len(TRADE_JSON_REMINDERS)]
-        import config as _cfg
+        from claude_agent import reask_trade_json_via_cli
 
-        import llm_http_client
-
-        user = (
-            f"{reminder}\n\n"
-            "先前输出无法通过交易 JSON 校验。请只输出一个对象，键为 action, pair, amount, price。\n\n"
-            f"{str(previous_output)[:3800]}"
-        )
-        text, err = await llm_http_client.complete_stateless(
-            system_prompt="Reply with a single JSON object only. Keys: action, pair, amount, price. No markdown.",
-            user_text=user,
-            model_hint=getattr(_cfg, "TASK_TIER_FAST_CLAUDE", None),
-            timeout_sec=30.0,
-            state_key=-450 - (round_idx % 40),
-        )
-        return (text or err or "").strip()
+        return await reask_trade_json_via_cli(round_idx, previous_output)
     except Exception as e:
-        logger.warning("reask_trade_json_via_http failed: %s", e)
+        logger.warning("reask_trade_json_via_cli failed: %s", e)
         return ""
 
 

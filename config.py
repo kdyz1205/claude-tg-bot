@@ -63,6 +63,12 @@ try:
     CLAUDE_CLI_TIMEOUT = int(os.getenv("CLAUDE_CLI_TIMEOUT", "1800"))  # 30 min default
 except ValueError:
     CLAUDE_CLI_TIMEOUT = 1800
+try:
+    _cli_async_t = float(os.getenv("CLAUDE_CLI_ASYNC_TIMEOUT_SEC", "45"))
+except ValueError:
+    _cli_async_t = 45.0
+# Hard cap 45s per invoke: avoids TG event-loop freeze + zombie CLI on prompts
+CLAUDE_CLI_ASYNC_TIMEOUT_SEC = max(5.0, min(45.0, _cli_async_t))
 
 # ─── HTTP LLM (aiohttp: Ollama / Anthropic / OpenAI) — replaces Claude CLI subprocess ──
 LLM_HTTP_BACKEND = os.getenv("LLM_HTTP_BACKEND", "auto").strip().lower()
