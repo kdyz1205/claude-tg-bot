@@ -23,6 +23,14 @@
   "dry_run": false,
   "rate_limit_plan_requests_per_hour": 50,
   "rate_limit_usage_log": "C:\\Users\\alexl\\Desktop\\claude tg bot\\_usage_timestamps.json",
+  "jarvis_pending_commands": [],
+  "jarvis_auto_consume": false,
+  "jarvis_drain_target_session": "",
+  "jarvis_drain_routes": {
+    "FACTOR_FORGE": "",
+    "default": ""
+  },
+  "jarvis_consumer_filter_session": "",
   "_cached_hash_build telegram bot": "75a8e55d",
   "_cached_hash_crypto agent": "0fab29cb",
   "_cached_hash_add cross-session": "23fd43ab",

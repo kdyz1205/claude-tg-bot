@@ -85,7 +85,13 @@ async def run_experiment_loop(send_status=None):
         try:
             # Wait until idle
             await asyncio.sleep(60)  # Check every minute
-            if not _is_idle():
+            skip_idle = (os.environ.get("AUTO_RESEARCH_SKIP_IDLE") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if not skip_idle and not _is_idle():
                 continue
             if _experiment_count >= _MAX_EXPERIMENTS_PER_SESSION:
                 continue
@@ -139,8 +145,92 @@ async def run_experiment_loop(send_status=None):
             await asyncio.sleep(300)
 
 
+_LAB_CURSOR_FILE = os.path.join(BOT_DIR, ".auto_research_lab_cursor.json")
+
+
+def _pick_lab_knowledge_from_disk() -> dict | None:
+    """
+    When AUTO_RESEARCH_LAB=1: pick a knowledge_build target from ``.knowledge/*.md``
+    (smallest file first) so experiments can run without harness_learn scores.
+
+    AUTO_RESEARCH_LAB_ROTATE=1: round-robin domains in ``.auto_research_lab_cursor.json``.
+    """
+    try:
+        names = [f for f in os.listdir(KNOWLEDGE_DIR) if f.endswith(".md")]
+    except OSError:
+        names = []
+    if not names:
+        return {
+            "type": "knowledge_build",
+            "goal": "Bootstrap .knowledge from repo context",
+            "target": "general",
+        }
+    rotate = (os.environ.get("AUTO_RESEARCH_LAB_ROTATE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if rotate:
+        domains = sorted({n[:-3] for n in names})
+        if not domains:
+            return None
+        last = ""
+        try:
+            if os.path.isfile(_LAB_CURSOR_FILE):
+                last = str(json.loads(Path(_LAB_CURSOR_FILE).read_text(encoding="utf-8")).get("last_domain") or "")
+        except Exception:
+            pass
+        if last in domains:
+            i = (domains.index(last) + 1) % len(domains)
+        else:
+            i = 0
+        domain = domains[i]
+        try:
+            Path(_LAB_CURSOR_FILE).write_text(
+                json.dumps({"last_domain": domain}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        return {
+            "type": "knowledge_build",
+            "goal": f"Lab expand knowledge (rotate): {domain}",
+            "target": domain,
+        }
+
+    best = None
+    best_sz = 10**12
+    for fname in names:
+        path = os.path.join(KNOWLEDGE_DIR, fname)
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            continue
+        if sz < best_sz:
+            best_sz = sz
+            best = fname[:-3]
+    if not best:
+        return None
+    return {
+        "type": "knowledge_build",
+        "goal": f"Lab expand knowledge: {best}",
+        "target": best,
+    }
+
+
 def _pick_experiment() -> dict | None:
     """Analyze recent scores/failures to decide what to experiment with."""
+    if (os.environ.get("AUTO_RESEARCH_LAB") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        lab = _pick_lab_knowledge_from_disk()
+        if lab:
+            return lab
+
     import harness_learn
 
     scores = harness_learn.get_recent_scores(20)
@@ -1034,3 +1124,24 @@ def get_meta_stats() -> str:
         lines.append(f"📚 知识库: {kb_count} 个领域")
 
     return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    print(
+        "auto_research foreground loop — Ctrl+C to stop.\n"
+        "  AUTO_RESEARCH_LAB=1        prefer .knowledge/* experiments (no harness scores needed).\n"
+        "  AUTO_RESEARCH_LAB_ROTATE=1 round-robin .knowledge domains (.auto_research_lab_cursor.json).\n"
+        "  AUTO_RESEARCH_SKIP_IDLE=1  do not wait for user idle (aggressive; use in dedicated terminal).\n"
+        "  Gateway 仍可用 GATEWAY_AUTO_RESEARCH=1 在 PTB 进程内挂同一套循环。"
+    )
+
+    async def _cli_main() -> None:
+        await run_experiment_loop(
+            send_status=lambda t: print("[auto_research]", (t or "")[:900]),
+        )
+
+    asyncio.run(_cli_main())

@@ -20,6 +20,24 @@ from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+
+class GodOrchestrator:
+    """技能控制总线：运行时热切换雷达使用的 skill_id（Jarvis / 外部可调用）。"""
+
+    __slots__ = ("active_skill",)
+
+    def __init__(self) -> None:
+        self.active_skill: str | None = None
+
+    def hot_swap_skill(self, skill_name: str) -> None:
+        name = (skill_name or "").strip()
+        self.active_skill = name or None
+        label = self.active_skill or "(全局择优/遗传同步)"
+        logger.info("⚡ 雷达已实时切换至: %s", label)
+
+
+GOD_ORCHESTRATOR = GodOrchestrator()
+
 EVOLVE_INTERVAL_SEC = float(os.environ.get("GOD_EVOLVE_INTERVAL_SEC", "7200"))
 TRADE_NOTIONAL_SOL = float(os.environ.get("GOD_TRADE_SOL", "0.5"))
 MAX_SESSION_LOSS_SOL = float(os.environ.get("GOD_MAX_LOSS_SOL", "0.1"))
@@ -226,6 +244,9 @@ async def _god_radar_once() -> None:
         return
 
     snap = get_global_best_snapshot()
+    if GOD_ORCHESTRATOR.active_skill:
+        snap = dict(snap)
+        snap["skill_id"] = GOD_ORCHESTRATOR.active_skill
     params = snap.get("strategy_params") or {}
     thr = float(snap.get("confidence_floor") or DEFAULT_CONFIDENCE_FLOOR)
     mint = (cfg.get("neural_dex_mint") or "").strip()

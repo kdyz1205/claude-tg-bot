@@ -18,6 +18,8 @@ Thumbs.db
 .DS_Store
 
 # Runtime state
+.session_commander_jarvis.lockdir/
+.auto_research_lab_cursor.json
 .sessions.json
 .bot.pid
 .harness_state/

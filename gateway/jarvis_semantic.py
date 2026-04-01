@@ -1,26 +1,55 @@
 """
 Lightweight plain-text routing for the gateway (no nested asyncio.run).
 
-Heuristic intent when no LLM keys are configured; optional LLM can be wired later.
+Heuristic intent first; optional ``JARVIS_INTENT_LLM=1`` + OpenAI/Anthropic reclassifies
+messages that would otherwise be CHAT (small JSON classification call).
+
+v2: broader quant / 造物 routing, secondary spec detector, ``reasoning`` on every path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
 import re
 from collections import defaultdict
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 _AUTO_DEV_HINT = re.compile(
-    r"(写代码|编程|实现|重构|修复\s*bug|AUTO_DEV|自动开发|代码库|加一个\s*\w+)",
+    r"(写代码|编程|实现|重构|修复\s*bug|AUTO_DEV|自动开发|代码库|加一个\s*\w+|"
+    r"脚手架|模块|接口|单测|单元测试|CI|Dockerfile|README|bugfix|BUG|报错|traceback|"
+    r"deploy|refactor|implement|fix\s+the|add\s+a\s+feature)",
     re.I,
 )
 
-# Quant factor / strategy phrasing → AUTO_DEV + sub_intent FACTOR_FORGE (checked before generic AUTO_DEV).
+# Quant factor / strategy phrasing → AUTO_DEV + sub_intent FACTOR_FORGE
 _FACTOR_FORGE_HINT = re.compile(
     r"(因子|策略|量化|alpha|ALPHA|择时|多空|回测|信号|指标|背离|动量|均线|"
     r"VWAP|vwap|MACD|macd|RSI|rsi|布林带|KDJ|kdj|夏普|波动率|"
-    r"factor|strategy|backtest|signal|indicator)",
+    r"factor|strategy|backtest|signal|indicator|portfolio|optimization|"
+    r"mean\s*reversion|pairs?\s*trading|cointegration|z-?score|bollinger|atr|obv|"
+    r"协整|套利|对冲|基差|期现|止损|止盈|入场|出场|仓位|杠杆|阈值|触发|"
+    r"金叉|死叉|超买|超卖|网格|凯利|Kelly|"
+    r"特征工程|特征|label|标签|训练集|验证集|过拟合|walk\s*forward|样本外|"
+    r"论文|arxiv|文献|摘要|复现|开源策略|开源代码|"
+    r"机器学习|LSTM|lstm|transformer|XGBoost|xgboost|lightgbm)",
+    re.I,
+)
+
+# 二次检测：像「规则/公式/代码」描述，避免复杂设想被误标成纯聊天
+_CODE_OR_DATA_HINT = re.compile(
+    r"(def\s+\w+|import\s+numpy|import\s+pandas|from\s+pandas|pd\.|np\.|"
+    r"DataFrame|dataframe|rolling\(|\.pct_change|corr\(|cov\(|"
+    r"if\s+.+[<>=]{1,2}.+\d|return\s+[\d.]+)",
+    re.I,
+)
+_RULE_LIKE_HINT = re.compile(
+    r"(阈值|周期|窗口|参数|公式|条件|当.+时|大于|小于|等于|"
+    r">=\s*\d|<=\s*\d|=\s*\d+\.?\d*|%\s*时|\d+\s*%|\d+\s*bp)",
     re.I,
 )
 
@@ -40,6 +69,14 @@ _CHAOS_IMMUNITY_HINT = re.compile(
     re.I,
 )
 
+_TRADE_HINT = re.compile(
+    r"(平仓|开仓|加仓|减仓|止损单|止盈|市价|限价|抄底|逃顶|"
+    r"买入|卖出|买进|沽出|做多|做空|清仓|全平|"
+    r"买\s*\d|卖\s*\d|"
+    r"\bBUY\b|\bSELL\b|\bCLOSE\b|\bLONG\b|\bSHORT\b)",
+    re.I,
+)
+
 
 def extract_wallet_clone_address(text: str) -> str | None:
     m = _EVM_ADDRESS_IN_TEXT.search(text or "")
@@ -47,12 +84,122 @@ def extract_wallet_clone_address(text: str) -> str | None:
 
 
 def llm_backend_configured() -> bool:
-    import os
-
     return bool(
         (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
         or (os.environ.get("OPENAI_API_KEY") or "").strip()
     )
+
+
+def intent_llm_refinement_enabled() -> bool:
+    return (os.environ.get("JARVIS_INTENT_LLM") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+_INTENT_LLM_SYSTEM = """You classify Telegram user messages for a quant/trading gateway bot.
+Reply with ONLY a JSON object (no markdown) with keys:
+- intent: one of CHAT, AUTO_DEV, TRADE
+- sub_intent: null, or FACTOR_FORGE (only when intent is AUTO_DEV and the user is describing a trading signal, factor, indicator math, strategy rules, backtest, alpha, or paper/code reproduction — not generic software)
+- reasoning: one short English phrase that MUST state whether you considered hidden trading/quant logic (e.g. "no quant content, small talk" or "describes RSI rule → factor")
+
+Rules:
+- Before choosing CHAT, explicitly rule out that the user might be describing strategy, indicators, risk rules, or code for markets.
+- TRADE: user wants an immediate order action (buy/sell/close this position now), not describing research.
+- AUTO_DEV + FACTOR_FORGE: quantitative / trading logic to implement as code.
+- AUTO_DEV without FACTOR_FORGE: general coding or repo changes unrelated to factors.
+- CHAT: greetings, off-topic, or too ambiguous to route to code or trade.
+When unsure, prefer CHAT."""
+
+
+def _normalize_llm_intent_payload(
+    data: dict[str, Any], raw_text: str
+) -> dict[str, Any] | None:
+    intent = str(data.get("intent") or "CHAT").upper()
+    if intent == "CHAT":
+        return None
+    reasoning = "llm_refine:" + str(data.get("reasoning") or "")[:220]
+    if intent == "TRADE":
+        return {
+            "intent": "TRADE",
+            "extracted_requirement": raw_text,
+            "reasoning": reasoning,
+        }
+    if intent == "AUTO_DEV":
+        out: dict[str, Any] = {
+            "intent": "AUTO_DEV",
+            "extracted_requirement": raw_text,
+            "reasoning": reasoning,
+        }
+        sub = str(data.get("sub_intent") or "").upper()
+        if sub == "FACTOR_FORGE":
+            out["sub_intent"] = SUB_INTENT_FACTOR_FORGE
+        return out
+    return None
+
+
+async def _llm_refine_intent_after_chat_heuristic(text: str, *, uid: int) -> dict[str, Any] | None:
+    """
+    When regex heuristics fell through to CHAT, optionally ask a small LLM once.
+    Enable with JARVIS_INTENT_LLM=1 and OPENAI_API_KEY or ANTHROPIC_API_KEY.
+    Model: JARVIS_INTENT_MODEL (default gpt-4o-mini or claude-3-5-haiku-20241022).
+    """
+    if not intent_llm_refinement_enabled() or not llm_backend_configured():
+        return None
+    t = (text or "").strip()
+    if len(t) < 12:
+        return None
+
+    user_block = f"uid={uid}\n\n{t[:8000]}"
+
+    try:
+        if (os.environ.get("OPENAI_API_KEY") or "").strip():
+            from openai import AsyncOpenAI
+
+            model = (os.environ.get("JARVIS_INTENT_MODEL") or "gpt-4o-mini").strip()
+            client = AsyncOpenAI()
+            completion = await client.chat.completions.create(
+                model=model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": _INTENT_LLM_SYSTEM},
+                    {"role": "user", "content": user_block},
+                ],
+                response_format={"type": "json_object"},
+            )
+            raw = (completion.choices[0].message.content or "").strip() or "{}"
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return None
+            return _normalize_llm_intent_payload(data, t)
+
+        if (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+            from anthropic import AsyncAnthropic
+
+            model = (
+                os.environ.get("JARVIS_INTENT_MODEL") or "claude-3-5-haiku-20241022"
+            ).strip()
+            client = AsyncAnthropic()
+            msg = await client.messages.create(
+                model=model,
+                max_tokens=256,
+                system=_INTENT_LLM_SYSTEM,
+                messages=[{"role": "user", "content": user_block}],
+            )
+            parts: list[str] = []
+            for block in msg.content:
+                if getattr(block, "type", None) == "text":
+                    parts.append(getattr(block, "text", "") or "")
+            raw = "".join(parts).strip() or "{}"
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return None
+            return _normalize_llm_intent_payload(data, t)
+    except Exception:
+        logger.debug("JARVIS_INTENT_LLM refine failed", exc_info=True)
+    return None
 
 
 _locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -62,30 +209,80 @@ def user_semantic_lock(uid: int) -> asyncio.Lock:
     return _locks[int(uid)]
 
 
+def _numeric_token_count(text: str) -> int:
+    return len(re.findall(r"\d+\.?\d*", text or ""))
+
+
+def _looks_like_quant_algorithm_spec(t: str) -> bool:
+    """
+    在首轮未命中显式关键词时，用「长度 + 数字密度 + 规则/代码形态」兜底进 FACTOR_FORGE。
+    刻意要求偏严，减少日常闲聊误触发。
+    """
+    s = (t or "").strip()
+    if len(s) < 28:
+        return False
+    nums = _numeric_token_count(s)
+    has_quant_anchor = bool(_FACTOR_FORGE_HINT.search(s))
+    has_code = bool(_CODE_OR_DATA_HINT.search(s))
+    has_rule = bool(_RULE_LIKE_HINT.search(s))
+    if has_code:
+        return True
+    if has_quant_anchor and nums >= 2 and (has_rule or len(s) >= 48):
+        return True
+    if nums >= 4 and has_rule and len(s) >= 40:
+        return True
+    return False
+
+
 async def classify_intent(text: str, *, uid: int) -> dict[str, Any]:
     t = (text or "").strip()
     if _CHAOS_IMMUNITY_HINT.search(t):
         return {
             "intent": "CHAOS_IMMUNITY",
             "extracted_requirement": t,
+            "reasoning": "regex_chaos_immunity",
         }
     if _WALLET_CLONE_HINT.search(t) and extract_wallet_clone_address(t):
         return {
             "intent": "WALLET_CLONE",
             "extracted_address": extract_wallet_clone_address(t),
             "extracted_requirement": t,
+            "reasoning": "regex_wallet_clone_with_address",
         }
     if _FACTOR_FORGE_HINT.search(t):
         return {
             "intent": "AUTO_DEV",
             "sub_intent": SUB_INTENT_FACTOR_FORGE,
             "extracted_requirement": t,
+            "reasoning": "regex_factor_forge_primary",
         }
     if _AUTO_DEV_HINT.search(t):
-        return {"intent": "AUTO_DEV", "extracted_requirement": t}
-    if any(k in t.upper() for k in ("买", "卖", "平仓", "BUY", "SELL", "CLOSE")):
-        return {"intent": "TRADE", "extracted_requirement": t}
-    return {"intent": "CHAT", "extracted_requirement": t}
+        return {
+            "intent": "AUTO_DEV",
+            "extracted_requirement": t,
+            "reasoning": "regex_auto_dev",
+        }
+    if _TRADE_HINT.search(t):
+        return {
+            "intent": "TRADE",
+            "extracted_requirement": t,
+            "reasoning": "regex_trade_keywords",
+        }
+    if _looks_like_quant_algorithm_spec(t):
+        return {
+            "intent": "AUTO_DEV",
+            "sub_intent": SUB_INTENT_FACTOR_FORGE,
+            "extracted_requirement": t,
+            "reasoning": "secondary_quant_spec_heuristic",
+        }
+    refined = await _llm_refine_intent_after_chat_heuristic(t, uid=uid)
+    if refined is not None:
+        return refined
+    return {
+        "intent": "CHAT",
+        "extracted_requirement": t,
+        "reasoning": "no_match_default_chat",
+    }
 
 
 def build_factor_forge_prompt(user_requirement: str) -> str:
@@ -120,7 +317,8 @@ async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
     if llm_backend_configured():
         return "", "未接入对话模型实现（仅意图路由）；请用 /dev 或看板按钮。"
     return (
-        "💬 已收到。配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 后可启用完整对话；"
-        "开发类需求请用 `/dev …` 或直接描述要改的代码。",
+        "💬 已收到。若你在描述**交易逻辑、因子或策略**（含公式、阈值、论文复现），"
+        "可直接写长一点并带指标名/回测等关键词，Jarvis 会路由到造物引擎；"
+        "也可 `/dev <需求>`。配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 后可扩展对话能力。",
         "",
     )
