@@ -23,6 +23,12 @@ from telegram.ext import (
 import config
 import claude_agent
 import bridge
+from tg_registry import (
+    START_FOOTER_COMMANDS,
+    format_help_message,
+    register_command_handlers,
+    telegram_menu_bot_commands,
+)
 from safety import handle_confirmation_callback
 import psutil  # for health/system checks
 import datetime
@@ -310,6 +316,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     exits with code 42 so run.py can kill duplicates and retry cleanly.
     """
     err_str = str(context.error)[:500] if context.error else "Unknown error"
+    user_err = (str(context.error)[:200] if context.error else "Unknown error")
+    try:
+        from telegram.error import NetworkError, TimedOut
+
+        if context.error and isinstance(context.error, TimedOut):
+            user_err = "网络超时（Telegram API）。请再点一次或稍后重试。"
+        elif context.error and isinstance(context.error, NetworkError):
+            user_err = "网络异常。请稍后重试。"
+    except ImportError:
+        pass
 
     # Detect Conflict error: "terminated by other getUpdates request"
     # This means another bot instance is running. Exit cleanly with special code.
@@ -338,7 +354,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Try to notify the user
     if isinstance(update, Update) and update.effective_chat:
         try:
-            err_msg = str(context.error)[:200] if context.error else "Unknown error"
+            err_msg = user_err
             # Strip chars that may cause Telegram to reject the message
             import re as _re
             err_msg = _re.sub(r'[<>&\x00-\x08\x0b\x0c\x0e-\x1f]', '', err_msg)
@@ -484,7 +500,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "· 实盘 = 强调调度 / Live 段\n"
             "· Paper = 强调模拟仓分段\n"
             "（OKX+钱包+DEX 真实聚合在 /chain 里始终显示）\n\n"
-            "常用: /chain /portfolio /strategy /panel /help",
+            f"常用: {START_FOOTER_COMMANDS}",
             reply_markup=_boot_ui_keyboard(),
         )
     except Exception as e:
@@ -720,40 +736,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     try:
-        await update.message.reply_text(
-            "🤖 Bot 功能一览\n\n"
-            "  /start — 欢迎 + 选择实盘/Paper 面板视图\n\n"
-            "🔗 链上交易 (Solana DEX):\n"
-            "  /chain — 链上面板（含 OKX+DEX+钱包 真实快照）\n"
-            "  /portfolio — 同上聚合持仓（MarkdownV2 长文）\n"
-            "  /strategy — 策略总控（实盘/模拟/奇点/停止）\n"
-            "  /buy <CA> [金额] — 买入代币\n"
-            "  /sell <CA> [%] — 卖出代币\n"
-            "  /positions — dex 跟踪仓\n"
-            "  /pnl — 链上PnL统计\n"
-            "  /wallet_setup — 设置钱包\n"
-            "  /paper — 模拟交易\n"
-            "  /live start|stop — 链上实盘调度\n\n"
-            "🚀 OKX 永续合约:\n"
-            "  /okx_trade start|stop|live|paper\n"
-            "  /okx — OKX行情 | /okx BTC\n"
-            "  /okx_account — 账户余额\n\n"
-            "🧬 进化引擎:\n"
-            "  /evolution — 进化状态\n\n"
-            "📊 其他:\n"
-            "  /trade — 综合面板\n"
-            "  /alpha — Alpha扫描\n"
-            "  /provider — AI模型路由\n"
-            "  /status — Bot状态\n\n"
-            "💬 中文快捷:\n"
-            "  \"价格 BTC\" — 行情\n"
-            "  \"大盘\" — 市场概览\n"
-            "  \"扫描\" — Alpha信号\n"
-            "  \"持仓\" — 真实聚合持仓（同 /portfolio）\n"
-            "  \"链上\" — 链上面板\n"
-            "  粘贴 Solana CA → 狙击卡片（现货/防夹）\n\n"
-            "直接说就行，不用客气。"
-        )
+        text = format_help_message()
+        await update.message.reply_text(text[:4096])
     except Exception as e:
         logger.error(f"Help command error: {e}", exc_info=True)
 
@@ -8195,99 +8179,109 @@ async def run_polling_lifecycle(app, on_system_ready=None):
             logger.debug("shutdown failed", exc_info=True)
 
 
+def _telegram_command_handlers():
+    """Maps tg_registry.registration keys → coroutines (single source for CommandHandler wiring)."""
+    return {
+        "start": start,
+        "help_command": help_command,
+        "ping": ping,
+        "clear": clear,
+        "panel_command": panel_command,
+        "quick_action": quick_action,
+        "dev_command": dev_command,
+        "kill_command": kill_command,
+        "tasks_command": tasks_command,
+        "cancel_command": cancel_command,
+        "bridge_command": bridge_command,
+        "quick_screenshot": quick_screenshot,
+        "model_command": model_command,
+        "provider_command": provider_command,
+        "status_command": status_command,
+        "quota_command": quota_command,
+        "sessions_command": sessions_command,
+        "learn_command": learn_command,
+        "score_command": score_command,
+        "train_command": train_command,
+        "session_control_command": session_control_command,
+        "multi_session_command": multi_session_command,
+        "health_command": health_command,
+        "vital_command": vital_command,
+        "monitor_command": monitor_command,
+        "proactive_command": proactive_command,
+        "market_command": market_command,
+        "memory_command": memory_command,
+        "chain_command": chain_command,
+        "portfolio_command": portfolio_command,
+        "strategy_command": strategy_command,
+        "buy_command": buy_command,
+        "sell_command": sell_command,
+        "positions_command": positions_command,
+        "trade_settings_command": trade_settings_command,
+        "pnl_command": pnl_command,
+        "trade_dashboard_command": trade_dashboard_command,
+        "paper_command": paper_command,
+        "live_command": live_command,
+        "wallet_setup_command": wallet_setup_command,
+        "wallet_delete_command": wallet_delete_command,
+        "okx_command": okx_command,
+        "okx_account_command": okx_account_command,
+        "okx_trade_command": okx_trade_command,
+        "okx_backtest_command": okx_backtest_command,
+        "okx_top30_command": okx_top30_command,
+        "ma_ribbon_backtest_command": ma_ribbon_backtest_command,
+        "ma_ribbon_screener_command": ma_ribbon_screener_command,
+        "signal_command": signal_command,
+        "signal_stats_command": signal_stats_command,
+        "alpha_command": alpha_command,
+        "arb_command": arb_command,
+        "token_analyze_command": token_analyze_command,
+        "optimize_command": optimize_command,
+        "onchain_command": onchain_command,
+        "search_command": search_command,
+        "whales_command": whales_command,
+        "track_command": track_command,
+        "wallets_command": wallets_command,
+        "addwallet_command": addwallet_command,
+        "report_command": report_command,
+        "risk_command": risk_command,
+        "performance_command": performance_command,
+        "evolution_command": evolution_command,
+        "evolve_command": evolve_command,
+        "strategy_evolve_command": strategy_evolve_command,
+        "evostatus_command": evostatus_command,
+        "skills_command": skills_command,
+        "autonomy_command": autonomy_command,
+        "consciousness_command": consciousness_command,
+        "selfcheck_command": selfcheck_command,
+        "repairs_command": repairs_command,
+        "repair_status_command": repair_status_command,
+        "code_health_command": code_health_command,
+        "selfrepair_command": selfrepair_command,
+        "dashboard_command": dashboard_command,
+        "codex_command": codex_command,
+    }
+
+
 def create_application():
-    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .connect_timeout(config.TELEGRAM_HTTP_CONNECT_TIMEOUT)
+        .read_timeout(config.TELEGRAM_HTTP_READ_TIMEOUT)
+        .write_timeout(config.TELEGRAM_HTTP_WRITE_TIMEOUT)
+        .pool_timeout(config.TELEGRAM_HTTP_POOL_TIMEOUT)
+        .get_updates_connect_timeout(config.TELEGRAM_HTTP_CONNECT_TIMEOUT)
+        .get_updates_read_timeout(config.TELEGRAM_GET_UPDATES_READ_TIMEOUT)
+        .get_updates_write_timeout(config.TELEGRAM_HTTP_WRITE_TIMEOUT)
+        .get_updates_pool_timeout(config.TELEGRAM_HTTP_POOL_TIMEOUT)
+        .concurrent_updates(True)
+        .build()
+    )
 
     # Global error handler
     app.add_error_handler(error_handler)
 
-    # Commands
-    app.add_handler(CommandHandler("start", start, filters=auth_filter))
-    app.add_handler(CommandHandler("help", help_command, filters=auth_filter))
-    app.add_handler(CommandHandler("dev", dev_command, filters=auth_filter))
-    app.add_handler(CommandHandler("ping", ping, filters=auth_filter))
-    app.add_handler(CommandHandler("clear", clear, filters=auth_filter))
-    app.add_handler(CommandHandler("screenshot", quick_screenshot, filters=auth_filter))
-    app.add_handler(CommandHandler("model", model_command, filters=auth_filter))
-    app.add_handler(CommandHandler("provider", provider_command, filters=auth_filter))
-    app.add_handler(CommandHandler("status", status_command, filters=auth_filter))
-    app.add_handler(CommandHandler("bridge", bridge_command, filters=auth_filter))
-    app.add_handler(CommandHandler("kill", kill_command, filters=auth_filter))
-    app.add_handler(CommandHandler("tasks", tasks_command, filters=auth_filter))
-    app.add_handler(CommandHandler("cancel", cancel_command, filters=auth_filter))
-    app.add_handler(CommandHandler("quota", quota_command, filters=auth_filter))
-    app.add_handler(CommandHandler("sessions", sessions_command, filters=auth_filter))
-    app.add_handler(CommandHandler("learn", learn_command, filters=auth_filter))
-    app.add_handler(CommandHandler("score", score_command, filters=auth_filter))
-    app.add_handler(CommandHandler("train", train_command, filters=auth_filter))
-    # /train_xxx shortcuts so TG clickable commands work
-    for _domain in ["file_ops", "code_edit", "computer_control", "browser", "obedience", "all", "stop", "reset"]:
-        app.add_handler(CommandHandler(f"train_{_domain}", train_command, filters=auth_filter))
-    app.add_handler(CommandHandler("q", quick_action, filters=auth_filter))
-    app.add_handler(CommandHandler("quick", quick_action, filters=auth_filter))
-    app.add_handler(CommandHandler("panel", panel_command, filters=auth_filter))
-    app.add_handler(CommandHandler("health", health_command, filters=auth_filter))
-    app.add_handler(CommandHandler("vital", vital_command, filters=auth_filter))
-    app.add_handler(CommandHandler("portfolio", portfolio_command, filters=auth_filter))
-    app.add_handler(CommandHandler("signal", signal_command, filters=auth_filter))
-    app.add_handler(CommandHandler("signal_stats", signal_stats_command, filters=auth_filter))
-    app.add_handler(CommandHandler("alpha", alpha_command, filters=auth_filter))
-    app.add_handler(CommandHandler("onchain", onchain_command, filters=auth_filter))
-    app.add_handler(CommandHandler("paper", paper_command, filters=auth_filter))
-    # DEX trading commands
-    app.add_handler(CommandHandler("positions", positions_command, filters=auth_filter))
-    app.add_handler(CommandHandler("pos", positions_command, filters=auth_filter))
-    app.add_handler(CommandHandler("buy", buy_command, filters=auth_filter))
-    app.add_handler(CommandHandler("sell", sell_command, filters=auth_filter))
-    app.add_handler(CommandHandler("settings", trade_settings_command, filters=auth_filter))
-    app.add_handler(CommandHandler("pnl", pnl_command, filters=auth_filter))
-    app.add_handler(CommandHandler("trade", trade_dashboard_command, filters=auth_filter))
-    app.add_handler(CommandHandler("t", trade_dashboard_command, filters=auth_filter))
-    app.add_handler(CommandHandler("chain", chain_command, filters=auth_filter))
-    app.add_handler(CommandHandler("strategy", strategy_command, filters=auth_filter))
-    app.add_handler(CommandHandler("arb", arb_command, filters=auth_filter))
-    app.add_handler(CommandHandler("okx", okx_command, filters=auth_filter))
-    app.add_handler(CommandHandler("okx_account", okx_account_command, filters=auth_filter))
-    app.add_handler(CommandHandler("okx_trade", okx_trade_command, filters=auth_filter))
-    app.add_handler(CommandHandler("evolution", evolution_command, filters=auth_filter))
-    app.add_handler(CommandHandler("search", search_command, filters=auth_filter))
-    app.add_handler(CommandHandler("whales", whales_command, filters=auth_filter))
-    app.add_handler(CommandHandler("track", track_command, filters=auth_filter))
-    app.add_handler(CommandHandler("wallets", wallets_command, filters=auth_filter))
-    app.add_handler(CommandHandler("addwallet", addwallet_command, filters=auth_filter))
-    app.add_handler(CommandHandler("report", report_command, filters=auth_filter))
-    app.add_handler(CommandHandler("risk", risk_command, filters=auth_filter))
-    app.add_handler(CommandHandler("monitor", monitor_command, filters=auth_filter))
-    app.add_handler(CommandHandler("proactive", proactive_command, filters=auth_filter))
-    app.add_handler(CommandHandler("market", market_command, filters=auth_filter))
-    # Trading skill commands
-    app.add_handler(CommandHandler("token_analyze", token_analyze_command, filters=auth_filter))
-    app.add_handler(CommandHandler("okx_backtest", okx_backtest_command, filters=auth_filter))
-    app.add_handler(CommandHandler("ma_ribbon_backtest", ma_ribbon_backtest_command, filters=auth_filter))
-    app.add_handler(CommandHandler("ma_ribbon_screener", ma_ribbon_screener_command, filters=auth_filter))
-    app.add_handler(CommandHandler("okx_top30", okx_top30_command, filters=auth_filter))
-    app.add_handler(CommandHandler("session_control", session_control_command, filters=auth_filter))
-    app.add_handler(CommandHandler("autonomy", autonomy_command, filters=auth_filter))
-    app.add_handler(CommandHandler("consciousness", consciousness_command, filters=auth_filter))
-    app.add_handler(CommandHandler("ms", multi_session_command, filters=auth_filter))
-    app.add_handler(CommandHandler("evolve", evolve_command, filters=auth_filter))
-    app.add_handler(CommandHandler("strategy_evolve", strategy_evolve_command, filters=auth_filter))
-    app.add_handler(CommandHandler("skills", skills_command, filters=auth_filter))
-    app.add_handler(CommandHandler("selfcheck", selfcheck_command, filters=auth_filter))
-    app.add_handler(CommandHandler("repairs", repairs_command, filters=auth_filter))
-    app.add_handler(CommandHandler("repair_status", repair_status_command, filters=auth_filter))
-    app.add_handler(CommandHandler("performance", performance_command, filters=auth_filter))
-    app.add_handler(CommandHandler("evostatus", evostatus_command, filters=auth_filter))
-    app.add_handler(CommandHandler("code_health", code_health_command, filters=auth_filter))
-    app.add_handler(CommandHandler("selfrepair", selfrepair_command, filters=auth_filter))
-    app.add_handler(CommandHandler("memory", memory_command, filters=auth_filter))
-    app.add_handler(CommandHandler("dashboard", dashboard_command, filters=auth_filter))
-    app.add_handler(CommandHandler("codex", codex_command, filters=auth_filter))
-    app.add_handler(CommandHandler("optimize", optimize_command, filters=auth_filter))
-    # Live trading commands
-    app.add_handler(CommandHandler("wallet_setup", wallet_setup_command, filters=auth_filter))
-    app.add_handler(CommandHandler("wallet_delete", wallet_delete_command, filters=auth_filter))
-    app.add_handler(CommandHandler("live", live_command, filters=auth_filter))
+    register_command_handlers(app, auth_filter, _telegram_command_handlers())
 
     # Callbacks — panel first, then DEX trading, then session control, then quick actions, then safety confirmations
     app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
@@ -8371,21 +8365,7 @@ def create_application():
     async def post_init(application):
         # Register commands FIRST (before any background tasks that might fail)
         try:
-            await application.bot.set_my_commands([
-                ("chain", "🔗 链上交易 (真实快照+买卖)"),
-                ("portfolio", "💼 OKX+钱包+DEX 持仓"),
-                ("strategy", "🧠 策略总控 (实盘/模拟/奇点)"),
-                ("okx_trade", "🚀 OKX 策略 (start/stop/live)"),
-                ("trade", "💹 综合交易面板"),
-                ("live", "🔴 实盘 start|stop|status"),
-                ("wallet_setup", "🔐 配置 Solana 钱包"),
-                ("alpha", "🔍 Alpha 扫描"),
-                ("evolution", "🧬 进化引擎状态"),
-                ("okx", "📊 OKX 行情"),
-                ("provider", "🤖 AI 模型"),
-                ("status", "📡 Bot 状态"),
-                ("help", "❓ 全部命令"),
-            ])
+            await application.bot.set_my_commands(telegram_menu_bot_commands())
             logger.info("Bot commands registered with Telegram")
         except Exception as e:
             logger.error(f"Failed to set bot commands: {e}")

@@ -7,6 +7,9 @@ Telegram Gateway — PTB entry with two UI modes:
 2. **terminal** — Bloomberg-style state machine. See ``gateway.terminal_ui``.
 
 Run:   python -m gateway.telegram_bot
+
+Command taxonomy for the **full** bot (bindings, /help, Telegram menu) lives in
+``tg_registry`` at repo root; this gateway exposes a slim /start|/panel|/dev surface only.
 """
 
 from __future__ import annotations

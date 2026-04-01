@@ -195,6 +195,35 @@ try:
 except ValueError:
     AUTO_RETRY_SECONDS = 60
 
+# ─── Telegram Bot API (HTTPX) ───────────────────────────────────────────────
+# PTB defaults to read_timeout=5s; slow networks / large editMessageText → "Timed out".
+try:
+    TELEGRAM_HTTP_READ_TIMEOUT = float(os.getenv("TELEGRAM_HTTP_READ_TIMEOUT", "45"))
+except ValueError:
+    TELEGRAM_HTTP_READ_TIMEOUT = 45.0
+TELEGRAM_HTTP_READ_TIMEOUT = max(10.0, min(120.0, TELEGRAM_HTTP_READ_TIMEOUT))
+try:
+    TELEGRAM_HTTP_WRITE_TIMEOUT = float(os.getenv("TELEGRAM_HTTP_WRITE_TIMEOUT", "45"))
+except ValueError:
+    TELEGRAM_HTTP_WRITE_TIMEOUT = 45.0
+TELEGRAM_HTTP_WRITE_TIMEOUT = max(10.0, min(120.0, TELEGRAM_HTTP_WRITE_TIMEOUT))
+try:
+    TELEGRAM_HTTP_CONNECT_TIMEOUT = float(os.getenv("TELEGRAM_HTTP_CONNECT_TIMEOUT", "15"))
+except ValueError:
+    TELEGRAM_HTTP_CONNECT_TIMEOUT = 15.0
+TELEGRAM_HTTP_CONNECT_TIMEOUT = max(5.0, min(60.0, TELEGRAM_HTTP_CONNECT_TIMEOUT))
+try:
+    TELEGRAM_HTTP_POOL_TIMEOUT = float(os.getenv("TELEGRAM_HTTP_POOL_TIMEOUT", "10"))
+except ValueError:
+    TELEGRAM_HTTP_POOL_TIMEOUT = 10.0
+TELEGRAM_HTTP_POOL_TIMEOUT = max(2.0, min(60.0, TELEGRAM_HTTP_POOL_TIMEOUT))
+# getUpdates long-poll must not expire before Telegram returns (often up to ~50s).
+try:
+    TELEGRAM_GET_UPDATES_READ_TIMEOUT = float(os.getenv("TELEGRAM_GET_UPDATES_READ_TIMEOUT", "70"))
+except ValueError:
+    TELEGRAM_GET_UPDATES_READ_TIMEOUT = 70.0
+TELEGRAM_GET_UPDATES_READ_TIMEOUT = max(30.0, min(180.0, TELEGRAM_GET_UPDATES_READ_TIMEOUT))
+
 # ─── Heartbeat ───────────────────────────────────────────────────────────────
 HEARTBEAT_ENABLED = os.getenv("HEARTBEAT_ENABLED", "true").lower() == "true"
 try:
