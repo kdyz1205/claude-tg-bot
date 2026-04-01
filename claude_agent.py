@@ -2,8 +2,8 @@
 claude_agent.py — Harness Agent: 本地 Claude Code CLI（订阅额度）+ 多窗口编排 + 项目管理
 
 主对话路径走 **异步子进程** ``asyncio.create_subprocess_exec``（禁止阻塞式 ``Popen``），
-全局 ``CLI_SEMAPHORE`` 串行化所有 CLI 调用；单次调用 ``asyncio.wait_for(..., 45s)``，
-超时则 ``kill`` 子进程树，避免僵尸与 TG 事件循环假死。
+全局 ``CLI_SEMAPHORE`` 串行化 CLI；网关 CHAT 经 ``claude_cli_tunnel.PersistentClaudeCLI``
+入队执行（与造物 dev 任务双轨排队，chat 优先）。
 
 可选：``llm_http_client`` 仅用于历史清理/兼容，主推理不依赖计费 HTTP API。
 """
@@ -16,7 +16,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 import config
 import llm_http_client
 import harness_learn
@@ -631,6 +631,170 @@ async def async_claude_code_prompt(
                 pass
 
 
+async def async_claude_code_prompt_stream_json(
+    prompt: str,
+    *,
+    cwd: str | None = None,
+    resume: str | None = None,
+    timeout_sec: float | None = None,
+    wall_cap_sec: float | None = None,
+    on_stream_event: Callable[[dict], Awaitable[None] | None] | None = None,
+) -> tuple[str, str, str | None]:
+    """
+    One ``claude -p`` turn with ``--output-format stream-json`` + mandatory ``--verbose``.
+
+    NDJSON on stdout is parsed incrementally; returns the same shape as
+    ``async_claude_code_prompt``. Optional ``on_stream_event`` for Telegram live edits
+    (throttle in the callback). Set ``CLAUDE_STREAM_INCLUDE_PARTIAL=1`` for
+    ``--include-partial-messages``.
+    """
+    from pipeline.cli_bridge import find_claude_executable
+    from pipeline.claude_stream_json import (
+        StreamJsonAccum,
+        drain_stderr_tail,
+        pump_stdout_ndjson,
+        stream_accum_final_text,
+    )
+
+    tlim = float(timeout_sec) if timeout_sec is not None else _cli_hard_timeout()
+    if wall_cap_sec is None:
+        _cap = 45.0
+    else:
+        _cap = max(5.0, min(600.0, float(wall_cap_sec)))
+    tlim = max(5.0, min(_cap, tlim))
+
+    exe = find_claude_executable()
+    if not Path(exe).is_file():
+        return "", f"Claude CLI not found: {exe}", None
+
+    full_text = (prompt or "").strip()
+    if not full_text:
+        return "", "empty prompt", None
+
+    tmp_path: str | None = None
+    try:
+        import tempfile
+
+        body = full_text
+        if len(body) > _CLI_PROMPT_INLINE_MAX:
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=".txt", prefix="ca_cli_", text=True, dir=BOT_PROJECT_DIR
+            )
+            os.close(fd)
+            Path(tmp_path).write_text(body, encoding="utf-8")
+            body = (
+                "Read this UTF-8 file and complete the task. Output via normal CLI JSON channel. "
+                f"File: {tmp_path}"
+            )
+
+        r = _normalize_cli_resume_id(resume)
+
+        def _argv(p_inline: str) -> list[str]:
+            a = [
+                exe,
+                "-p",
+                p_inline,
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--dangerously-skip-permissions",
+            ]
+            if (os.environ.get("CLAUDE_STREAM_INCLUDE_PARTIAL") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                a.append("--include-partial-messages")
+            if r:
+                a.extend(["--resume", r])
+            return a
+
+        args = _argv(body)
+
+        if os.name == "nt" and _estimate_windows_cmdline_chars(args) > 7800:
+            if tmp_path is None:
+                fd2, tmp_path = tempfile.mkstemp(
+                    suffix=".txt", prefix="ca_cli_", text=True, dir=BOT_PROJECT_DIR
+                )
+                os.close(fd2)
+                Path(tmp_path).write_text(full_text, encoding="utf-8")
+            body = f"Read UTF-8 task: {tmp_path}"
+            args = _argv(body)
+            if _estimate_windows_cmdline_chars(args) > 7800:
+                short_dir = Path(os.environ.get("TEMP") or tempfile.gettempdir())
+                try:
+                    alt = short_dir / f"ca_{os.getpid()}_{int(time.time() * 1000) & 0xFFFF_FFFF:x}.txt"
+                    alt.write_text(full_text, encoding="utf-8")
+                    try:
+                        if tmp_path:
+                            os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    tmp_path = str(alt)
+                    body = f"Read UTF-8 task: {tmp_path}"
+                    args = _argv(body)
+                except OSError as e:
+                    logger.warning("async_claude_code_prompt_stream_json: short-path spill failed: %s", e)
+
+        wd = cwd or BOT_PROJECT_DIR
+        proc: asyncio.subprocess.Process | None = None
+        accum = StreamJsonAccum()
+        err_tail = ""
+        async with CLI_SEMAPHORE:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(wd),
+                    limit=2**20,
+                )
+            except (OSError, NotImplementedError) as e:
+                return "", str(e)[:800], None
+
+            assert proc.stdout is not None and proc.stderr is not None
+            t_out = asyncio.create_task(
+                pump_stdout_ndjson(proc.stdout, accum, on_stream_event)
+            )
+            t_err = asyncio.create_task(drain_stderr_tail(proc.stderr))
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=tlim)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "async_claude_code_prompt_stream_json: timeout %.1fs, killing pid=%s",
+                    tlim,
+                    getattr(proc, "pid", None),
+                )
+                await _kill_cli_subprocess(proc)
+                await asyncio.gather(t_out, t_err, return_exceptions=True)
+                return "", f"timeout after {tlim}s", None
+            except Exception as e:
+                logger.exception("async_claude_code_prompt_stream_json: wait failed")
+                await _kill_cli_subprocess(proc)
+                await asyncio.gather(t_out, t_err, return_exceptions=True)
+                return "", str(e)[:800], None
+
+            await asyncio.gather(t_out, t_err, return_exceptions=True)
+            try:
+                err_tail = t_err.result()
+            except Exception:
+                err_tail = ""
+
+        text = stream_accum_final_text(accum).strip()
+        sid = accum.session_id
+        if not text and err_tail.strip():
+            text = _strip_cli_progress_noise(err_tail)
+        return text, err_tail, sid
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 _GATEWAY_CLI_AUTH_HINTS = (
     "not logged in",
     "not authenticated",
@@ -642,19 +806,14 @@ _GATEWAY_CLI_AUTH_HINTS = (
 )
 
 
-async def jarvis_gateway_cli_chat(
+async def _jarvis_gateway_cli_chat_impl(
     system_prompt: str,
     user_text: str,
     *,
     chat_id: int,
     timeout_sec: float,
 ) -> tuple[str, str]:
-    """
-    Telegram gateway CHAT: one ``claude -p`` turn with per-``chat_id`` ``--resume`` (``_claude_sessions``).
-
-    Returns ``(reply, "")`` on success, or ``("", diag)`` where ``diag`` is
-    ``auth`` | ``cli_missing`` | ``timeout`` | ``empty`` | ``error`` for callers to map UX.
-    """
+    """Single-turn gateway chat (used inside PersistentClaudeCLI tunnel)."""
     sys_t = (system_prompt or "").strip()
     usr_t = (user_text or "").strip()
     if not usr_t:
@@ -678,13 +837,27 @@ async def jarvis_gateway_cli_chat(
     )
 
     try:
-        r_text, err_tail, sid_new = await async_claude_code_prompt(
-            combined,
-            cwd=BOT_PROJECT_DIR,
-            resume=resume,
-            timeout_sec=cap,
-            wall_cap_sec=cap,
-        )
+        if (os.environ.get("JARVIS_CHAT_STREAM_JSON") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            r_text, err_tail, sid_new = await async_claude_code_prompt_stream_json(
+                combined,
+                cwd=BOT_PROJECT_DIR,
+                resume=resume,
+                timeout_sec=cap,
+                wall_cap_sec=cap,
+            )
+        else:
+            r_text, err_tail, sid_new = await async_claude_code_prompt(
+                combined,
+                cwd=BOT_PROJECT_DIR,
+                resume=resume,
+                timeout_sec=cap,
+                wall_cap_sec=cap,
+            )
     except asyncio.TimeoutError:
         logger.warning("jarvis_gateway_cli_chat asyncio.TimeoutError chat_id=%s", chat_id)
         return "", "timeout"
@@ -725,6 +898,49 @@ async def jarvis_gateway_cli_chat(
         _save_sessions()
 
     return out, ""
+
+
+async def jarvis_gateway_cli_chat(
+    system_prompt: str,
+    user_text: str,
+    *,
+    chat_id: int,
+    timeout_sec: float,
+) -> tuple[str, str]:
+    """
+    Telegram gateway CHAT: one ``claude -p`` turn (per-``chat_id`` ``--resume``), via
+    ``PersistentClaudeCLI`` chat lane — serialized with dev jobs, chat prioritized.
+    """
+    if os.environ.get("CLAUDE_CLI_TUNNEL_CHAT", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return await _jarvis_gateway_cli_chat_impl(
+            system_prompt,
+            user_text,
+            chat_id=chat_id,
+            timeout_sec=timeout_sec,
+        )
+
+    from claude_cli_tunnel import PersistentClaudeCLI
+
+    async def _job() -> tuple[str, str]:
+        return await _jarvis_gateway_cli_chat_impl(
+            system_prompt,
+            user_text,
+            chat_id=chat_id,
+            timeout_sec=timeout_sec,
+        )
+
+    try:
+        return await PersistentClaudeCLI.instance().run(_job, lane="chat")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception("jarvis_gateway_cli_chat tunnel chat_id=%s: %s", chat_id, e)
+        return "", "error"
 
 
 async def reask_trade_json_via_cli(round_idx: int, previous_output: str) -> str:

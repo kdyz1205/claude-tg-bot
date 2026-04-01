@@ -2449,6 +2449,34 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {p.get('symbol','?')} | {p.get('amount_sol',0):.4f} SOL | {age_h:.1f}h")
         await _safe_reply(update.message, "\n".join(lines))
 
+    elif subcmd in ("resync", "sync", "rebaseline"):
+        try:
+            res = await _live_trader.force_resync_ledger()
+        except Exception as e:
+            await _safe_reply(
+                update.message,
+                f"\u274c \u5e73\u8d26\u5f02\u5e38\uff08\u8d26\u672c\u672a\u6539\uff09\uff1a{e!s}"[:4096],
+            )
+            return
+        if res.get("ok"):
+            await _safe_reply(
+                update.message,
+                "\u2705 \u9075\u547d\u957f\u5b98\uff01\u5b9e\u76d8\u5f15\u64ce\u7684\u57fa\u51c6\u8d44\u91d1\u5df2\u5f3a\u5236\u4e0e\u60a8\u7684\u771f\u5b9e\u94b1\u5305\u540c\u6b65\uff0c\u5386\u53f2\u76c8\u4e8f\u57fa\u51c6\u5df2\u91cd\u65b0\u6821\u51c6\u3002",
+            )
+        else:
+            err = str(res.get("error") or "")
+            if err == "wallet_not_configured":
+                fail = (
+                    "\u274c \u5e73\u8d26\u65e0\u6cd5\u6267\u884c\uff1a\u5c1a\u672a\u914d\u7f6e\u94fe\u4e0a\u94b1\u5305\u3002\u8bf7\u5148 /wallet_setup\u3002"
+                    "\u5f15\u64ce\u8d26\u672c\u672a\u4f5c\u4efb\u4f55\u4fee\u6539\u3002"
+                )
+            else:
+                fail = (
+                    "\u274c \u5e73\u8d26\u65e0\u6cd5\u6267\u884c\uff1a\u65e0\u6cd5\u53ef\u9760\u8bfb\u53d6\u94fe\u4e0a SOL \u4f59\u989d\uff08\u7f51\u7edc\u6216 RPC\uff09\u3002"
+                    "\u5f15\u64ce\u8d26\u672c\u672a\u4f5c\u4efb\u4f55\u4fee\u6539\u3002"
+                )
+            await _safe_reply(update.message, fail)
+
     else:  # status
         status = _live_trader.format_live_status()
         if _trade_scheduler_instance:
@@ -3068,8 +3096,9 @@ def _build_dashboard_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("\U0001f517 Onchain", callback_data="td_onchain"),
             InlineKeyboardButton("\U0001f40b Whales", callback_data="td_whales"),
         ],
-        # Row 5: Live Trading + Refresh
+        # Row 5: On-chain wallet + Live + Refresh
         [
+            InlineKeyboardButton("\U0001f4bc Wallet", callback_data="td_wallet"),
             InlineKeyboardButton("\U0001f680 Live" if not (_live_available and _trade_scheduler_instance and _trade_scheduler_instance.running) else "\u23f8 Live Stop", callback_data="td_live_toggle"),
             InlineKeyboardButton("\U0001f504 Refresh", callback_data="td_refresh"),
         ],
@@ -3763,6 +3792,39 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     await query.answer()
 
+    # ── On-chain wallet panel (Pepebot-style: address, SOL, SPL, actions) ──
+    if data in ("ch_wallet", "ch_wallet_refresh"):
+        if not _live_available or not _wallet:
+            try:
+                await query.edit_message_text(
+                    "❌ 钱包模块不可用",
+                    reply_markup=InlineKeyboardMarkup([[back_btn]]),
+                )
+            except Exception:
+                pass
+            return
+        from onchain_wallet_panel import build_wallet_snapshot, format_wallet_message
+
+        lookup = _dex.lookup_token if (_dex_available and _dex) else None
+        snap = await build_wallet_snapshot(_wallet, chain_cache=_chain_cache, lookup_token=lookup)
+        msg = format_wallet_message(snap, panel="chain")
+        if snap.get("configured"):
+            w_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🔄 刷新", callback_data="ch_wallet_refresh"),
+                        InlineKeyboardButton("⬅️ 返回", callback_data="ch_back"),
+                    ],
+                ]
+            )
+        else:
+            w_kb = InlineKeyboardMarkup([[back_btn]])
+        try:
+            await query.edit_message_text(msg[:4096], reply_markup=w_kb)
+        except Exception:
+            pass
+        return
+
     # ── On-chain token info (wallet SPL, no DEX position required) ──
     if data.startswith("ch_tok_"):
         pref = data[7:]
@@ -4190,51 +4252,6 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         return
 
-    # ── Wallet ──
-    if data == "ch_wallet":
-        if not _live_available or not _wallet:
-            try:
-                await query.edit_message_text("❌ 钱包模块不可用", reply_markup=InlineKeyboardMarkup([[back_btn]]))
-            except Exception:
-                pass
-            return
-        if _wallet.wallet_exists():
-            pubkey = _wallet.get_public_key() or "?"
-            # Parallel fetch with short timeouts
-            async def _gb():
-                try:
-                    return await asyncio.wait_for(_wallet.get_sol_balance(), timeout=2)
-                except Exception:
-                    return _chain_cache.get("sol_bal", 0)
-
-            async def _gt():
-                try:
-                    return await asyncio.wait_for(_wallet.get_token_balances(), timeout=2)
-                except Exception:
-                    return []
-
-            bal, tokens = await asyncio.gather(_gb(), _gt())
-            sol_p = _chain_cache.get("sol_price", 83)
-            usd = (bal or 0) * sol_p
-            msg = (
-                f"🔐 钱包\n━━━━━━━━━━━━━━━━━━\n"
-                f"地址: {pubkey}\n"
-                f"余额: {bal:.4f} SOL (${usd:.2f})\n"
-            )
-            if tokens:
-                msg += f"\n🪙 SPL 代币 ({len(tokens)}):\n"
-                for tk in tokens[:10]:
-                    mint = tk.get("mint", "?")
-                    msg += f"  • {mint[:8]}...{mint[-4:]} : {tk.get('amount', 0):,.4f}\n"
-            msg += "\n/wallet_delete 删除钱包"
-        else:
-            msg = "🔓 钱包未配置\n\n/wallet_setup 设置钱包"
-        try:
-            await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup([[back_btn]]))
-        except Exception:
-            pass
-        return
-
     # ── Paper Toggle ──
     if data == "ch_paper_toggle":
         if not _paper_trader_available or not _paper_trader:
@@ -4529,6 +4546,55 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
         kb = _build_dashboard_keyboard()
         try:
             await query.edit_message_text(text, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    # ── On-chain wallet (Solana; same data as /chain 🔐 钱包) ──
+    if data in ("td_wallet", "td_wallet_refresh"):
+        if not _live_available or not _wallet:
+            msg = (
+                "💼 ON-CHAIN WALLET\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "❌ Wallet module unavailable."
+            )
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")]]
+            )
+        else:
+            from onchain_wallet_panel import build_wallet_snapshot, format_wallet_message
+
+            lookup = _dex.lookup_token if (_dex_available and _dex) else None
+            snap = await build_wallet_snapshot(_wallet, chain_cache=_chain_cache, lookup_token=lookup)
+            msg = format_wallet_message(snap, panel="trade")
+            if snap.get("configured"):
+                kb = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton("\U0001f504 Refresh", callback_data="td_wallet_refresh"),
+                            InlineKeyboardButton("\U0001f517 \u94fe\u4e0a\u63a7\u5236\u53f0", callback_data="td_open_chain"),
+                        ],
+                        [InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+                    ]
+                )
+            else:
+                kb = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")]]
+                )
+        try:
+            await query.edit_message_text(msg[:4096], reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "td_open_chain":
+        uid = query.from_user.id
+        try:
+            _, ctext, _ = await _build_chain_dashboard_parts(uid)
+            await query.edit_message_text(
+                ctext[:4096],
+                reply_markup=_build_chain_keyboard(uid),
+            )
         except Exception:
             pass
         return
@@ -4893,12 +4959,18 @@ async def handle_trade_dashboard_callback(update: Update, context: ContextTypes.
         msg = (
             "\U0001f517 ONCHAIN SCANNER\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Use /onchain for latest on-chain signals\n"
-            "New tokens, trending, top boosts"
+            "On-chain signals / 链上信号扫描\n"
+            "Use /onchain or Scan below.\n\n"
+            "\U0001f4bc Wallet / 钱包余额与充值地址：\n"
+            "Tap \u300cWallet\u300d on the main dashboard.\n"
+            "主面板点「Wallet」查看链上钱包。"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f504 Scan Now", callback_data="td_onchain_scan"),
-             InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
+            [
+                InlineKeyboardButton("\U0001f504 Scan Now", callback_data="td_onchain_scan"),
+                InlineKeyboardButton("\U0001f4bc Wallet", callback_data="td_wallet"),
+            ],
+            [InlineKeyboardButton("\u2b05\ufe0f Dashboard", callback_data="td_back")],
         ])
         try:
             await query.edit_message_text(msg[:4096], reply_markup=kb)

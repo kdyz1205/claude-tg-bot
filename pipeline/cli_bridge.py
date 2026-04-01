@@ -403,6 +403,11 @@ async def _run_claude_dev_subprocess(
     )
 
 
+def _use_cli_dev_tunnel() -> bool:
+    v = (os.environ.get("CLAUDE_CLI_TUNNEL_DEV") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 async def run_claude_dev_prompt(
     prompt: str,
     *,
@@ -415,6 +420,9 @@ async def run_claude_dev_prompt(
     Run a dev task: by default **local Claude CLI** via ``create_subprocess_exec`` with
     ``timeout_sec`` (default 600). Optional ``on_stdout_line`` receives each stdout line
     for Telegram streaming. Set ``TG_DEV_USE_HTTP=1`` to use HTTP LLM instead.
+
+    When ``CLAUDE_CLI_TUNNEL_DEV`` is on (default), the subprocess run is scheduled on
+    ``claude_cli_tunnel.PersistentClaudeCLI`` dev lane (chat-priority dual queue).
     """
     workdir = cwd or REPO_ROOT
     timeout_sec = int(timeout_sec if timeout_sec is not None else _DEFAULT_TIMEOUT_SEC)
@@ -428,15 +436,22 @@ async def run_claude_dev_prompt(
             error_message="Empty prompt.",
         )
 
-    if _use_http_dev():
-        return await _run_claude_dev_http(
-            cli_prompt, temp_paths, workdir=workdir, timeout_sec=timeout_sec
+    async def _job() -> CliDevRunResult:
+        if _use_http_dev():
+            return await _run_claude_dev_http(
+                cli_prompt, temp_paths, workdir=workdir, timeout_sec=timeout_sec
+            )
+        return await _run_claude_dev_subprocess(
+            cli_prompt,
+            temp_paths,
+            workdir=workdir,
+            timeout_sec=timeout_sec,
+            extra_args=extra_args,
+            on_stdout_line=on_stdout_line,
         )
-    return await _run_claude_dev_subprocess(
-        cli_prompt,
-        temp_paths,
-        workdir=workdir,
-        timeout_sec=timeout_sec,
-        extra_args=extra_args,
-        on_stdout_line=on_stdout_line,
-    )
+
+    if _use_cli_dev_tunnel():
+        from claude_cli_tunnel import PersistentClaudeCLI
+
+        return await PersistentClaudeCLI.instance().run(_job, lane="dev")
+    return await _job()

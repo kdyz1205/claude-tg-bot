@@ -20,8 +20,8 @@ Telegram Gateway — PTB：极简全自动看板。
   ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
   配置总线：写 ``session_commander_config.json`` 的 ``active_skills``；God 引擎用 **watchdog** 监听 JSON 并 ``reload_skills``。
   斜杠：``/start`` 网关面板；``/trade``、``/t`` 委托 ``bot.trade_dashboard_command``。
-  其它 ``/…`` 与纯文本相同，默认走 Jarvis 语义路由；但 **脊髓快路径** 在 LLM 之前拦截（**子串**命中即可，可带 emoji/前后缀）：
-  含 ``持仓`` / ``余额`` / ``资产`` 或 ``/portfolio`` → 快照看板；含 ``状态`` / ``监控`` 或 ``/status`` → 状态速报。
+  其它 ``/…`` 与纯文本相同，默认走 Jarvis 语义路由；**FAST_ACTION_MAP** 在 LLM 与 ``chat_reply`` 之前拦截：
+  中文「卖出/买入/下单…」→ 直接唤起 ``/trade`` 面板；「持仓/余额/资产」→ 主看板；「状态/监控」→ 速报；斜杠 ``/trade``、``/t``、``/portfolio``、``/status`` 同理。
 
 Run:   python -m gateway.telegram_bot
 """
@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from telegram import Update
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -55,6 +56,7 @@ from gateway.tg_front import (
     build_dashboard_keyboard,
     build_risk_keyboard,
     escape_v2,
+    render_dashboard_plain_text,
     render_dashboard_text,
     render_risk_settings_text,
 )
@@ -89,24 +91,51 @@ def _text_triggers_ledger_resync(text: str) -> bool:
     return False
 
 
-# 脊髓反射：子串匹配（容错 emoji/前后空格/废话前缀，不经 LLM）
-def _fast_path_spinal_kind(text: str) -> str | None:
-    """Return ``portfolio`` | ``status`` | ``None``. Substring match on stripped text."""
+# 脊髓反射 · FAST_ACTION_MAP：中文子串（有序）+ 斜杠命令头；不经 classify_intent / chat_reply
+_FAST_ACTION_CN: tuple[tuple[str, str], ...] = (
+    ("卖出", "trade_panel"),
+    ("卖币", "trade_panel"),
+    ("抛售", "trade_panel"),
+    ("平仓", "trade_panel"),
+    ("买入", "trade_panel"),
+    ("买币", "trade_panel"),
+    ("下单", "trade_panel"),
+    ("开仓", "trade_panel"),
+    ("交易面板", "trade_panel"),
+    ("极速交易", "trade_panel"),
+    ("持仓", "portfolio"),
+    ("仓位", "portfolio"),
+    ("余额", "portfolio"),
+    ("资产", "portfolio"),
+    ("状态", "status"),
+    ("监控", "status"),
+)
+
+
+def _resolve_fast_action(text: str) -> str | None:
+    """
+    Return ``trade_panel`` | ``portfolio`` | ``status`` | ``None``.
+    Slash: /trade, /t, /portfolio, /status (supports @botname).
+    """
     raw = (text or "").strip()
     if not raw:
         return None
     low = raw.lower()
-    # 持仓类优先于状态类，避免「资产状态」等同时命中时歧义
-    for sub in ("持仓", "余额", "资产"):
-        if sub in raw:
-            return "portfolio"
-    if "/portfolio" in low:
+    parts = low.split()
+    head = parts[0] if parts else low
+
+    if head in ("/trade",) or head.startswith("/trade@"):
+        return "trade_panel"
+    if head in ("/t",) or head.startswith("/t@"):
+        return "trade_panel"
+    if "/portfolio" in low or head.startswith("/portfolio"):
         return "portfolio"
-    for sub in ("状态", "监控"):
-        if sub in raw:
-            return "status"
-    if "/status" in low:
+    if "/status" in low or head.startswith("/status"):
         return "status"
+
+    for needle, action in _FAST_ACTION_CN:
+        if needle in raw:
+            return action
     return None
 
 
@@ -254,21 +283,23 @@ def _dashboard_sync() -> tuple[dict, dict, dict]:
     return snap, st, stats
 
 
-async def _spinal_fast_path_reply(
+async def _dispatch_fast_action(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
     uid: int,
-    text: str,
-) -> bool:
-    """Portfolio / status spinal reflex: no ``classify_intent``, no LLM."""
-    kind = _fast_path_spinal_kind(text)
-    if not kind:
-        return False
+    action: str,
+) -> None:
+    """Execute FAST_ACTION_MAP hit: local cache only, no Jarvis ``chat_reply``."""
     mark_gateway_user_activity()
     global USER_MODE
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
+
+    if action == "trade_panel":
+        await cmd_trade(update, context)
+        return
+
     snap, st, stats = _dashboard_sync()
     try:
         from gateway.tg_front import (
@@ -277,7 +308,7 @@ async def _spinal_fast_path_reply(
             render_status_brief_text,
         )
 
-        if kind == "portfolio":
+        if action == "portfolio":
             body = render_dashboard_text(USER_MODE, snap, st, stats)
             kb = build_dashboard_keyboard(bool(st.get("active")))
             await update.message.reply_text(
@@ -285,16 +316,15 @@ async def _spinal_fast_path_reply(
                 reply_markup=kb,
                 parse_mode="MarkdownV2",
             )
-        else:
+        elif action == "status":
             body = render_status_brief_text(USER_MODE, snap, st, stats)
             await update.message.reply_text(body, parse_mode="MarkdownV2")
     except Exception as e:
-        logger.exception("spinal fast path failed kind=%s", kind)
+        logger.exception("fast action dispatch failed action=%s", action)
         try:
             await update.message.reply_text(f"⚡ 快路径渲染失败：{e!s}"[:4096])
         except Exception:
             pass
-    return True
 
 
 async def _edit_main_dashboard(bot, chat_id: int, message_id: int) -> None:
@@ -502,12 +532,57 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
     snap, st, stats = _dashboard_sync()
     text = render_dashboard_text(USER_MODE, snap, st, stats)
+    plain = render_dashboard_plain_text(USER_MODE, snap, st, stats)
     kb = build_dashboard_keyboard(bool(st.get("active")))
-    await update.message.reply_text(
-        text,
-        reply_markup=kb,
-        parse_mode="MarkdownV2",
-    )
+    for attempt in range(2):
+        try:
+            await update.message.reply_text(
+                text,
+                reply_markup=kb,
+                parse_mode="MarkdownV2",
+            )
+            return
+        except (NetworkError, TimedOut) as e:
+            logger.warning(
+                "cmd_start: Telegram send failed (attempt %s): %s",
+                attempt + 1,
+                e,
+            )
+            if attempt == 0:
+                await asyncio.sleep(0.75)
+                continue
+            break
+        except BadRequest as e:
+            logger.warning("cmd_start: MarkdownV2 rejected: %s", e)
+            break
+        except Exception:
+            logger.exception("cmd_start: unexpected error sending MarkdownV2 panel")
+            break
+    for attempt in range(2):
+        try:
+            await update.message.reply_text(plain[:4096], reply_markup=kb)
+            return
+        except (NetworkError, TimedOut) as e:
+            logger.warning(
+                "cmd_start: plain panel send failed (attempt %s): %s",
+                attempt + 1,
+                e,
+            )
+            if attempt == 0:
+                await asyncio.sleep(0.75)
+                continue
+            break
+        except Exception as e:
+            logger.exception("cmd_start: plain fallback failed: %s", e)
+            break
+    try:
+        await update.message.reply_text(
+            "🤖 奇点量化终端\n\n暂无法发送完整面板（Telegram 或格式异常）。"
+            "请几秒后重试 /start，或检查网络。",
+            reply_markup=kb,
+        )
+    except Exception:
+        logger.exception("cmd_start: minimal stub send failed")
 
 
 async def _jarvis_semantic_route(
@@ -521,7 +596,9 @@ async def _jarvis_semantic_route(
     if not text:
         return
 
-    if await _spinal_fast_path_reply(update, context, uid=uid, text=text):
+    fa = _resolve_fast_action(text)
+    if fa:
+        await _dispatch_fast_action(update, context, uid=uid, action=fa)
         return
 
     if _text_triggers_ledger_resync(text):

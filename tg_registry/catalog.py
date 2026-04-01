@@ -32,7 +32,7 @@ HELP_SECTIONS: list[tuple[str, list[str]]] = [
             "/chain — 链上面板（快照 + 按钮）",
             "/portfolio — 聚合持仓",
             "/strategy — 策略总控",
-            "/trade (/t) — 综合交易键盘",
+            "/trade (/t) — 综合交易键盘（含 💼 Wallet 链上钱包）",
             "/live start|stop|status — 实盘调度",
             "/paper — 模拟盘",
             "/buy /sell /positions /settings /pnl",

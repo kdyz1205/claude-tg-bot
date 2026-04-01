@@ -6,7 +6,12 @@ messages that would otherwise be CHAT (small JSON classification call).
 
 v2: broader quant / 造物 routing, secondary spec detector, ``reasoning`` on every path.
 
-CHAT 对话走本地 ``claude`` CLI（``claude_agent.jarvis_gateway_cli_chat``，订阅会话 / ``--resume``）；
+CHAT 对话经 ``claude_cli_tunnel.PersistentClaudeCLI`` 的 **chat 队列** 调用
+``claude_agent.jarvis_gateway_cli_chat``（内部仍为 ``claude -p`` + ``--resume``；与造物 dev 任务双轨，chat 优先）。
+AUTO_DEV / 造物走 ``pipeline.cli_bridge.run_claude_dev_prompt`` 的 **dev 队列**（默认 ``CLAUDE_CLI_TUNNEL_DEV=1``）。
+关闭隧道：``CLAUDE_CLI_TUNNEL_CHAT=0`` / ``CLAUDE_CLI_TUNNEL_DEV=0``。
+流式 NDJSON（额度恢复后便于 TG 逐段编辑）：``JARVIS_CHAT_STREAM_JSON=1``（``--output-format stream-json`` + ``--verbose``）；
+可选 ``CLAUDE_STREAM_INCLUDE_PARTIAL=1`` 打开 ``--include-partial-messages``。
 可选 ``JARVIS_CHAT_TIMEOUT_SEC``（秒，默认参考 ``config.API_REQUEST_TIMEOUT_SEC``，上限 600）。
 """
 

@@ -8,7 +8,7 @@ OKX, wallet, and DEX legs refresh concurrently via asyncio.gather.
 
 Optional: set REDIS_URL to mirror JSON at key claude_tg_bot:portfolio (TTL 180s).
 
-OKX live ledger repair: ``trading.reconciliation_daemon`` (not this module’s 10s poll).
+OKX live ledger repair: ``trading.reconciliation_daemon`` (not this module’s background poll).
 """
 
 from __future__ import annotations
@@ -471,7 +471,7 @@ async def refresh_once() -> None:
     _publish_redis(snap)
 
 
-async def run_background_loop(interval_sec: float = 12.0) -> None:
+async def run_background_loop(interval_sec: float = 10.0) -> None:
     """Never returns; swallow errors and keep polling."""
     while True:
         try:

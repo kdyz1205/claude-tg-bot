@@ -81,6 +81,98 @@ def _hedge_section_v2(snap: dict, open_live: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _hedge_section_plain(snap: dict, open_live: list[dict]) -> str:
+    lines: list[str] = ["⚔️ 自动对冲持仓:", ""]
+    ox = snap.get("okx") or {}
+    positions = ox.get("positions") or []
+    wallet = snap.get("wallet") or {}
+    sol_bal = float(wallet.get("sol_bal") or 0)
+    sol_p = float(snap.get("sol_price") or 0)
+
+    n = 1
+    for p in positions:
+        pos = float(p.get("pos", 0) or 0)
+        if pos >= 0:
+            continue
+        inst = str(p.get("instId", ""))
+        sym = _okx_sym_from_inst(inst)
+        upl = float(p.get("upl", 0) or 0)
+        if sym == "SOL" and sol_bal > 0 and sol_p > 0:
+            leg = f"${sym} (现货多) + (OKX空)"
+        else:
+            leg = f"${sym} (OKX空)"
+        sign = "+" if upl >= 0 else ""
+        lines.append(f"{n}. {leg} | 浮盈: {sign}{upl:.2f}")
+        n += 1
+
+    if n == 1 and open_live:
+        for p in open_live[:3]:
+            sym = str(p.get("symbol") or "?")[:12]
+            pnl = float(p.get("pnl_sol", 0) or 0)
+            sign = "+" if pnl >= 0 else ""
+            lines.append(f"{n}. {sym} | PnL: {sign}{pnl:.4f} SOL")
+            n += 1
+
+    if n == 1:
+        lines.append("（暂无对冲腿快照，等待后台同步）")
+
+    return "\n".join(lines)
+
+
+def render_dashboard_plain_text(
+    mode: str,
+    snap: dict,
+    sched_state: dict,
+    live_stats: dict,
+) -> str:
+    """Same facts as ``render_dashboard_text`` but no Markdown — safe for ``parse_mode=None``."""
+    m = (mode or "paper").lower()
+    active = bool(sched_state.get("active"))
+    err = (snap.get("last_error") or "").strip()
+    health = "🟢 运行正常" if active and not err else ("🔴 异常" if err else "⚪ 引擎未启动")
+
+    ox = snap.get("okx") or {}
+    eq = float(ox.get("total_equity_usd", 0) or 0)
+    if eq <= 0:
+        sol_p0 = float(snap.get("sol_price") or 0)
+        w = snap.get("wallet") or {}
+        sol_b = float(w.get("sol_bal", 0) or 0)
+        eq = sol_b * sol_p0 if sol_p0 > 0 else 0.0
+
+    daily_sol = float(live_stats.get("daily_pnl_sol", 0) or 0)
+    sol_p = float(snap.get("sol_price") or 0)
+    daily_usd = daily_sol * sol_p if sol_p > 0 else daily_sol
+    start_bal = float(live_stats.get("starting_balance", 0) or 0)
+    denom_usd = start_bal * sol_p if (start_bal > 0 and sol_p > 0) else (eq if eq > 0 else 1.0)
+    pct = (daily_usd / denom_usd * 100.0) if denom_usd else 0.0
+    d_sign = "+" if daily_usd >= 0 else ""
+    p_sign = "+" if pct >= 0 else ""
+    emoji_pnl = "🟢" if daily_usd >= 0 else "🔴"
+
+    try:
+        import live_trader
+
+        open_live = live_trader.get_open_live_positions()
+    except Exception:
+        open_live = []
+
+    mode_note = "实盘" if m == "live" else "模拟"
+    body = (
+        f"🤖 奇点量化终端 | [{health}]\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 总资产净值: ${eq:,.2f}\n"
+        f"📈 今日盈亏: {d_sign}${abs(daily_usd):.2f} ({emoji_pnl} {p_sign}{abs(pct):.1f}%)\n"
+        f"模式: {mode_note}\n\n"
+        f"{_hedge_section_plain(snap, open_live)}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    if err:
+        body += "\n引擎: " + str(err)[:280]
+    if len(body) > 4000:
+        body = body[:3990] + "\n…"
+    return body
+
+
 def render_dashboard_text(
     mode: str,
     snap: dict,
@@ -135,6 +227,49 @@ def render_dashboard_text(
     if len(body) > 4000:
         body = body[:3990] + "\n…"
     return body
+
+
+def render_status_brief_text(
+    mode: str,
+    snap: dict,
+    sched_state: dict,
+    live_stats: dict,
+) -> str:
+    """Compact status strip for spinal fast path (MarkdownV2, no network)."""
+    e = escape_v2
+    m = (mode or "paper").lower()
+    active = bool(sched_state.get("active"))
+    err = (snap.get("last_error") or "").strip()
+    health = "🟢 运行正常" if active and not err else ("🔴 异常" if err else "⚪ 引擎未启动")
+    age = float(snap.get("age_sec") or 0)
+    scans = int(sched_state.get("total_scans") or 0)
+    err_n = int(sched_state.get("errors") or 0)
+    ox = snap.get("okx") or {}
+    w = snap.get("wallet") or {}
+    ox_ok = bool(ox.get("ok"))
+    w_ok = bool(w.get("ok"))
+    open_n = int(live_stats.get("open_positions") or 0)
+    closed_n = int(live_stats.get("closed_trades") or 0)
+    daily = float(live_stats.get("daily_pnl_sol") or 0)
+    d_sign = "+" if daily >= 0 else ""
+    mode_note = e("实盘" if m == "live" else "模拟")
+    lines = [
+        f"*📡 {e('状态速报')}*",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"· {e('模式')}: {mode_note}",
+        f"· {e('健康')}: {e(health)}",
+        f"· {e('资金快照缓存')}: {_num_v2(age, '.0f')}{e(' 秒前')}",
+        f"· {e('调度')}: `{scans}` {e('扫')} · {e('异常计数')} `{err_n}`",
+        f"· OKX: `{'1' if ox_ok else '0'}` · {e('链上钱包')}: `{'1' if w_ok else '0'}`",
+        f"· {e('引擎')}: `{open_n}` {e('开')} / `{closed_n}` {e('平')}",
+        f"· {e('今日引擎 PnL')}: `{d_sign}{_num_v2(daily, '.4f')}` SOL",
+    ]
+    if err:
+        lines.append(f"· _{e(err[:200])}_")
+    out = "\n".join(lines)
+    if len(out) > 4000:
+        out = out[:3990] + "\n…"
+    return out
 
 
 def build_dashboard_keyboard(sched_active: bool) -> InlineKeyboardMarkup | None:

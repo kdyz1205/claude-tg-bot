@@ -68,6 +68,9 @@ DEFAULT_LIVE_CONFIG = {
     "starting_balance_sol": 0,    # set on first start
     "daily_pnl_sol": 0,
     "daily_reset_ts": 0,
+    # After ``force_resync_ledger()``: only closes with close_time >= this epoch
+    # count toward displayed total PnL / win rate / closed count (independent bookkeeping).
+    "ledger_stats_epoch_ts": 0.0,
     # Phase 11–12: neural → DEX buy + OKX perp hedge (off by default)
     "neural_execution_enabled": False,
     "neural_confidence_threshold": 0.85,
@@ -725,21 +728,122 @@ async def check_positions(send_func=None) -> dict:
 # STATS & STATUS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _ledger_stats_epoch_ts(cfg: dict) -> float:
+    try:
+        return float(cfg.get("ledger_stats_epoch_ts") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _closed_positions_for_ledger_stats(
+    positions: list, cfg: dict
+) -> list:
+    """Closed rows that count toward engine-displayed PnL / win rate after optional resync."""
+    closed = [p for p in positions if p.get("status") == "closed"]
+    epoch = _ledger_stats_epoch_ts(cfg)
+    if epoch <= 0:
+        return closed
+    out = []
+    for p in closed:
+        ct = p.get("close_time") or 0
+        try:
+            ct_f = float(ct)
+        except (TypeError, ValueError):
+            ct_f = 0.0
+        if ct_f >= epoch:
+            out.append(p)
+    return out
+
+
+async def force_resync_ledger() -> dict:
+    """Force engine baseline to current on-chain SOL and start a new PnL stats epoch.
+
+    Does **not** mutate ``_live_positions.json`` (quantitative audit trail preserved).
+    On any failure before a successful config write, the on-disk ledger is unchanged.
+
+    Returns a dict with at least ``ok`` (bool) and ``unchanged`` (bool).
+    """
+    result: dict[str, Any] = {"ok": False, "unchanged": True}
+    try:
+        import secure_wallet as sw
+    except Exception as e:
+        logger.warning("force_resync_ledger: secure_wallet unavailable: %s", e)
+        result["error"] = "secure_wallet_unavailable"
+        return result
+
+    try:
+        if not sw.wallet_exists():
+            result["error"] = "wallet_not_configured"
+            return result
+    except Exception as e:
+        logger.warning("force_resync_ledger: wallet_exists check failed: %s", e)
+        result["error"] = "wallet_check_failed"
+        return result
+
+    try:
+        bal = await sw.get_sol_balance()
+    except Exception as e:
+        logger.exception("force_resync_ledger: get_sol_balance raised")
+        result["error"] = "balance_read_exception"
+        result["detail"] = str(e)[:200]
+        return result
+
+    if bal is None:
+        result["error"] = "balance_unavailable"
+        return result
+
+    try:
+        bal_f = float(bal)
+    except (TypeError, ValueError):
+        result["error"] = "balance_invalid"
+        return result
+
+    if bal_f < 0 or bal_f != bal_f:  # reject NaN
+        result["error"] = "balance_invalid"
+        return result
+
+    try:
+        cfg = _load_config()
+        prev_start = cfg.get("starting_balance_sol", 0)
+        try:
+            prev_f = float(prev_start or 0)
+        except (TypeError, ValueError):
+            prev_f = 0.0
+        now = time.time()
+        cfg["starting_balance_sol"] = round(bal_f, 9)
+        cfg["daily_pnl_sol"] = 0.0
+        cfg["daily_reset_ts"] = now
+        cfg["ledger_stats_epoch_ts"] = now
+        _save_config(cfg)
+    except Exception as e:
+        logger.exception("force_resync_ledger: config read/write failed")
+        result["error"] = "config_persist_failed"
+        result["detail"] = str(e)[:200]
+        return result
+
+    result["ok"] = True
+    result["unchanged"] = False
+    result["starting_balance_sol"] = bal_f
+    result["previous_starting_balance_sol"] = prev_f
+    result["ledger_stats_epoch_ts"] = now
+    return result
+
+
 def get_live_stats() -> dict:
     """Get live trading statistics."""
     positions = _load_positions()
     cfg = _load_config()
     open_pos = [p for p in positions if p.get("status") == "open"]
-    closed_pos = [p for p in positions if p.get("status") == "closed"]
+    closed_for_stats = _closed_positions_for_ledger_stats(positions, cfg)
 
-    total_pnl = sum(p.get("pnl_sol", 0) or 0 for p in closed_pos)
-    wins = sum(1 for p in closed_pos if (p.get("pnl_pct", 0) or 0) > 0)
-    wr = (wins / len(closed_pos) * 100) if closed_pos else 0
+    total_pnl = sum(p.get("pnl_sol", 0) or 0 for p in closed_for_stats)
+    wins = sum(1 for p in closed_for_stats if (p.get("pnl_pct", 0) or 0) > 0)
+    wr = (wins / len(closed_for_stats) * 100) if closed_for_stats else 0
 
     return {
         "enabled": cfg.get("enabled", False),
         "open_positions": len(open_pos),
-        "closed_trades": len(closed_pos),
+        "closed_trades": len(closed_for_stats),
         "total_pnl_sol": round(total_pnl, 4),
         "win_rate": round(wr, 1),
         "daily_pnl_sol": round(cfg.get("daily_pnl_sol", 0), 4),
@@ -753,7 +857,8 @@ def get_open_live_positions() -> list:
 
 
 def get_recent_closed_trades(limit: int = 5) -> list:
-    closed = [p for p in _load_positions() if p.get("status") == "closed"]
+    cfg = _load_config()
+    closed = _closed_positions_for_ledger_stats(_load_positions(), cfg)
     closed.sort(key=lambda x: x.get("close_time") or 0, reverse=True)
     return closed[: max(0, int(limit))]
 
