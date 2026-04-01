@@ -43,30 +43,38 @@ def _mode_banner_v2(mode: str) -> str:
     return f"*当前交易模式：* {label}"
 
 
-def build_main_keyboard(mode: str):
+def build_main_keyboard(mode: str, *, god_engine_active: bool = False):
     if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
         return None
     m = (mode or "paper").lower()
     paper_mark = "✓ " if m == "paper" else ""
     live_mark = "✓ " if m == "live" else ""
-    return InlineKeyboardMarkup(
+    rows = [
         [
+            InlineKeyboardButton(
+                f"{paper_mark}🔵 模拟盘",
+                callback_data=f"{GW_CB}:mode:paper",
+            ),
+            InlineKeyboardButton(
+                f"{live_mark}🔴 真金实盘",
+                callback_data=f"{GW_CB}:mode:live",
+            ),
+        ],
+        [
+            InlineKeyboardButton("📊 持仓", callback_data=f"{GW_CB}:pos"),
+            InlineKeyboardButton("📈 策略", callback_data=f"{GW_CB}:strat"),
+        ],
+    ]
+    if not god_engine_active:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    f"{paper_mark}🔵 模拟盘",
-                    callback_data=f"{GW_CB}:mode:paper",
+                    "▶️ 启动全自动引擎",
+                    callback_data=f"{GW_CB}:engine:start",
                 ),
-                InlineKeyboardButton(
-                    f"{live_mark}🔴 真金实盘",
-                    callback_data=f"{GW_CB}:mode:live",
-                ),
-            ],
-            [
-                InlineKeyboardButton("📊 持仓", callback_data=f"{GW_CB}:pos"),
-                InlineKeyboardButton("📈 策略", callback_data=f"{GW_CB}:strat"),
-            ],
-        ]
-    )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def build_back_keyboard():
@@ -88,7 +96,7 @@ def build_positions_keyboard():
     )
 
 
-def render_home_text(mode: str) -> str:
+def render_home_text(mode: str, *, god_engine_active: bool = False) -> str:
     banner = _mode_banner_v2(mode)
     m = (mode or "paper").lower()
     hint = (
@@ -97,8 +105,14 @@ def render_home_text(mode: str) -> str:
         else "⚠️ 实盘：真实资金与真实成交。请谨慎操作。"
     )
     hint_e = escape_v2(hint)
+    engine_e = (
+        escape_v2("⚙️ 奇点引擎轰鸣中 | 后台正在炼丹 & 实盘雷达已开启") + "\n\n"
+        if god_engine_active
+        else ""
+    )
     return (
         f"{banner}\n\n"
+        f"{engine_e}"
         "*🏠 交易面板 · 主页*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{hint_e}\n\n"

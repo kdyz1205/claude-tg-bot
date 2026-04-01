@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 # Persisted to SessionStore in background on change. Hydrated from disk on /start.
 # ---------------------------------------------------------------------------
 USER_MODE: str = "paper"
+GOD_ENGINE_ACTIVE: bool = False
 
 
 def _normalize_mode(raw: str | None) -> str:
@@ -136,6 +137,8 @@ def _parse_gw_callback(data: str) -> tuple[str, str] | None:
         return ("pos", "")
     if rest == "strat":
         return ("strat", "")
+    if rest == "engine:start":
+        return ("engine", "start")
     return None
 
 
@@ -184,8 +187,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
-    text = render_home_text(USER_MODE)
-    kb = build_main_keyboard(USER_MODE)
+    text = render_home_text(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE)
+    kb = build_main_keyboard(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE)
     await update.message.reply_text(
         text,
         reply_markup=kb,
@@ -297,7 +300,7 @@ async def _gw_panel_work(
     action: str,
     arg: str,
 ) -> None:
-    global USER_MODE
+    global USER_MODE, GOD_ENGINE_ACTIVE
     try:
         if action == "mode":
             new_mode = "live" if arg == "live" else "paper"
@@ -307,8 +310,8 @@ async def _gw_panel_work(
                 bot,
                 chat_id,
                 message_id,
-                render_home_text(USER_MODE),
-                build_main_keyboard(USER_MODE),
+                render_home_text(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE),
+                build_main_keyboard(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE),
             )
             return
 
@@ -317,9 +320,47 @@ async def _gw_panel_work(
                 bot,
                 chat_id,
                 message_id,
-                render_home_text(USER_MODE),
-                build_main_keyboard(USER_MODE),
+                render_home_text(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE),
+                build_main_keyboard(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE),
             )
+            return
+
+        if action == "engine" and arg == "start":
+            if USER_MODE != "live":
+                await _safe_edit_markdown(
+                    bot,
+                    chat_id,
+                    message_id,
+                    escape_v2("请先切换到 🔴 真金实盘，再启动奇点引擎。"),
+                    build_main_keyboard(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE),
+                )
+                return
+            from pipeline.god_orchestrator import start_autonomous_engine
+
+            async def _god_alert(text: str) -> None:
+                try:
+                    await bot.send_message(chat_id=chat_id, text=text[:4096])
+                except Exception as e:
+                    logger.debug("god alert send: %s", e)
+
+            started = await start_autonomous_engine(alert_sender=_god_alert, paper_mode=False)
+            if started:
+                GOD_ENGINE_ACTIVE = True
+                await _safe_edit_markdown(
+                    bot,
+                    chat_id,
+                    message_id,
+                    render_home_text(USER_MODE, god_engine_active=True),
+                    build_main_keyboard(USER_MODE, god_engine_active=True),
+                )
+            else:
+                await _safe_edit_markdown(
+                    bot,
+                    chat_id,
+                    message_id,
+                    escape_v2("奇点引擎已在运行中（或未成功启动）。"),
+                    build_main_keyboard(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE),
+                )
             return
 
         if action == "strat":
@@ -358,7 +399,7 @@ async def _gw_panel_work(
                 chat_id,
                 message_id,
                 err_body,
-                build_main_keyboard(USER_MODE),
+                build_main_keyboard(USER_MODE, god_engine_active=GOD_ENGINE_ACTIVE),
             )
         except Exception as e2:
             logger.warning("gateway panel error edit failed: %s", e2)

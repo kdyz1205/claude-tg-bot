@@ -370,6 +370,15 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
     if not cfg.get("enabled"):
         return None
 
+    try:
+        from pipeline.god_orchestrator import is_god_hard_stop
+
+        if is_god_hard_stop():
+            logger.critical("buy_token blocked: god engine circuit breaker")
+            return None
+    except ImportError:
+        pass
+
     # Risk check
     allowed, reason = await _check_risk_controls(amount_sol, cfg)
     if not allowed:
@@ -543,6 +552,15 @@ async def sell_token(position_id: str, reason: str = "manual") -> Optional[dict]
     # Update daily PnL
     cfg["daily_pnl_sol"] = cfg.get("daily_pnl_sol", 0) + pnl_sol
     _save_config(cfg)
+
+    try:
+        from pipeline.god_orchestrator import on_god_trade_closed
+
+        await on_god_trade_closed(pos)
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug("on_god_trade_closed: %s", e)
 
     logger.info(f"Position closed: {pos['symbol']} | {reason} | PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)")
     return pos
@@ -729,6 +747,20 @@ async def _run_delta_neutral_with_recovery(
     (Jupiter sell for DEX spot; ``limping_fuse_flatten_short`` = exchange reduce-only first,
     then verified flatten). No multi-second retry windows before rescue.
     """
+    try:
+        from pipeline.god_orchestrator import is_god_hard_stop
+
+        if is_god_hard_stop():
+            return {
+                "ok": False,
+                "reason": "god_circuit_breaker",
+                "dex": None,
+                "hedge": None,
+                "notional_usd": 0.0,
+            }
+    except ImportError:
+        pass
+
     from self_monitor import trigger_alert
 
     execu = _shared_hedge_okx_executor()
