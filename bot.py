@@ -63,13 +63,17 @@ _ui_session_store = SessionStore()
 try:
     from onchain_tracker import whale_tracker as _whale_tracker
     from onchain_tracker import smart_tracker as _smart_tracker
+    from onchain_tracker import target_wallet_monitor as _target_wallet_monitor
     _whale_available = True
     _smart_tracker_available = True
+    _parasite_monitor_available = True
 except ImportError:
     _whale_tracker = None
     _smart_tracker = None
+    _target_wallet_monitor = None
     _whale_available = False
     _smart_tracker_available = False
+    _parasite_monitor_available = False
 
 try:
     from arbitrage_engine import arb_engine as _arb_engine
@@ -8665,6 +8669,14 @@ def create_application():
         except Exception as e:
             logger.warning(f"SmartMoneyTracker failed to start: {e}")
 
+        # Target wallet monitor (hot-token cache for parasite / analyze() path)
+        try:
+            if _parasite_monitor_available and _target_wallet_monitor is not None:
+                await _target_wallet_monitor.start()
+                logger.info("TargetWalletMonitor (hot-token cache) started")
+        except Exception as e:
+            logger.warning(f"TargetWalletMonitor failed to start: {e}")
+
         # Start Profit Tracker background loop
         try:
             async def _profit_send(text):
@@ -9044,6 +9056,16 @@ def create_application():
         try:
             if _smart_tracker_available and _smart_tracker is not None and _smart_tracker.running:
                 await _smart_tracker.stop()
+        except Exception:
+            pass
+        # Stop TargetWalletMonitor
+        try:
+            if (
+                _parasite_monitor_available
+                and _target_wallet_monitor is not None
+                and getattr(_target_wallet_monitor, "_running", False)
+            ):
+                await _target_wallet_monitor.stop()
         except Exception:
             pass
         # Stop self_monitor

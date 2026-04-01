@@ -734,6 +734,111 @@ async def _sol_smart_process_sig(
             logger.debug("sol smart spl row: %s", e)
 
 
+async def _run_solana_ws_target_monitor(
+    monitor: Any,
+    wss_url: str,
+    http_rpc: str,
+) -> None:
+    """Solana logs_subscribe (mentions) for TargetWalletMonitor — non-blocking per-signature tasks."""
+    from solders.pubkey import Pubkey
+    from solders.rpc.config import RpcTransactionLogsFilterMentions
+    from solders.rpc.responses import LogsNotification, SubscriptionResult
+    from solana.rpc.websocket_api import connect
+
+    addrs = [a for a in monitor.targets]
+    if not addrs or not wss_url or not http_rpc:
+        logger.info("onchain_ws parasite: skip sol (no targets or URLs)")
+        return
+
+    sem = asyncio.Semaphore(6)
+    attempt = 0
+
+    while monitor._running:
+        try:
+            async with connect(wss_url) as ws:
+                attempt = 0
+                sub_id_to_addr: dict[int, str] = {}
+                for addr in addrs:
+                    await ws.logs_subscribe(
+                        RpcTransactionLogsFilterMentions(Pubkey.from_string(addr))
+                    )
+                sub_idx = 0
+                while sub_idx < len(addrs):
+                    batch = await ws.recv()
+                    for msg in batch:
+                        if isinstance(msg, SubscriptionResult):
+                            sub_id_to_addr[int(msg.result)] = addrs[sub_idx]
+                            sub_idx += 1
+
+                logger.info(
+                    "TargetWalletMonitor Solana WS connected, %d log subscriptions",
+                    len(addrs),
+                )
+
+                while monitor._running:
+                    batch = await ws.recv()
+                    for msg in batch:
+                        if isinstance(msg, LogsNotification):
+                            sub_id = int(msg.subscription)
+                            addr = sub_id_to_addr.get(sub_id)
+                            if not addr:
+                                continue
+                            if msg.result.value.err is not None:
+                                continue
+                            sig_str = str(msg.result.value.signature)
+                            asyncio.create_task(
+                                _sol_target_process_sig(monitor, addr, sig_str, http_rpc, sem),
+                                name=f"sol-parasite-{sig_str[:8]}",
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            attempt += 1
+            delay = _reconnect_sleep_s(attempt)
+            logger.warning(
+                "TargetWalletMonitor Solana WS error (attempt %s): %s — reconnect in %.1fs",
+                attempt,
+                e,
+                delay,
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+
+
+async def _sol_target_process_sig(
+    monitor: Any,
+    wallet: str,
+    sig_str: str,
+    http_rpc: str,
+    sem: asyncio.Semaphore,
+) -> None:
+    async with sem:
+        try:
+            await monitor.process_signature(wallet, sig_str, http_rpc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("sol parasite process %s: %s", sig_str[:12], e)
+
+
+def _schedule_target_wallet_monitor(monitor: Any) -> list[asyncio.Task]:
+    import config
+
+    tasks: list[asyncio.Task] = []
+    sol_u = getattr(config, "ONCHAIN_SOL_WSS", "") or ""
+    sol_http = getattr(config, "SOLANA_RPC_HTTP", "") or ""
+    if sol_u.strip() and sol_http.strip():
+        tasks.append(
+            asyncio.create_task(
+                _run_solana_ws_target_monitor(monitor, sol_u.strip(), sol_http.strip()),
+                name="target-wallet-monitor-sol",
+            )
+        )
+    return tasks
+
+
 def _schedule_ws_runners_whale(tracker: Any) -> list[asyncio.Task]:
     import config
 
