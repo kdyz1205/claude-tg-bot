@@ -8252,18 +8252,27 @@ async def jarvis_plain_text_entry(update: Update, context: ContextTypes.DEFAULT_
 
 
 def _telegram_command_handlers():
-    """Jarvis-only slash surface: /start + /trade (see tg_registry.registration)."""
+    """Jarvis slash surface: /start, /trade, /help (see tg_registry.registration)."""
     return {
         "jarvis_start": jarvis_start,
         "jarvis_trade": jarvis_trade,
+        "help_command": help_command,
     }
 
 
-async def handle_slash_as_natural_language(
-    update: Update, context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """除 /start、/trade、/t 外，其余斜杠交给 Jarvis 文本总线（与蓝图一致）。"""
-    await jarvis_plain_text_entry(update, context)
+async def handle_unknown_slash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """已注册 CommandHandler 未覆盖的斜杠：明确提示，避免「发了没反应」。"""
+    if not update.message or not update.effective_user:
+        return
+    if not _is_authorized(update.effective_user.id):
+        return
+    raw = (update.message.text or "").strip().split(maxsplit=1)
+    cmd = raw[0] if raw else ""
+    await _safe_reply(
+        update.message,
+        f"❓ `{cmd}` 未注册或已从菜单下线。当前有效列表见侧栏或发 /help。",
+        parse_mode="Markdown",
+    )
 
 
 def create_application():
@@ -8286,12 +8295,11 @@ def create_application():
     app.add_error_handler(error_handler)
 
     register_command_handlers(app, auth_filter, _telegram_command_handlers())
-    # 避免与 /start、/trade、/t 的 CommandHandler 双触发
     _slash_non_core = filters.COMMAND & ~filters.Regex(
-        r"(?i)^\s*/(start|trade|t)(@[\w_]+)?(\s|$)"
+        r"(?i)^\s*/(start|trade|help)(@[\w_]+)?(\s|$)"
     )
     app.add_handler(
-        MessageHandler(auth_filter & _slash_non_core, handle_slash_as_natural_language)
+        MessageHandler(auth_filter & _slash_non_core, handle_unknown_slash_command)
     )
 
     # Jarvis 主控台 inline 按钮（gw:*）— 唯一保留的 Callback 表面

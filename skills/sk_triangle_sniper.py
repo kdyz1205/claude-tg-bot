@@ -21,6 +21,21 @@ class TriangleSniperSkill(BaseSkill):
     skill_id = "sk_triangle_sniper"
     default_timeout_sec = 45.0
 
+    def analyze(self, payload: Dict[str, Any] | None = None) -> Any:
+        """Sync entry for tests / callers outside an event loop (delegates to ``_execute``)."""
+        merged: Dict[str, Any] = dict(payload or {})
+        params = dict(merged.get("params") or {})
+        for key in ("lookback", "vol_mult", "limit", "bar", "inst_id", "okx_inst"):
+            if key in params and params[key] is not None:
+                merged[key] = params[key]
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._execute(merged))
+        raise RuntimeError(
+            "TriangleSniperSkill.analyze() is synchronous; use await skill.run(payload) from async code."
+        )
+
     async def _execute(self, payload: Dict[str, Any]) -> Any:
         inst_id = str(payload.get("inst_id") or payload.get("okx_inst") or "").strip()
         bar = str(payload.get("bar") or "1m").strip()
@@ -84,6 +99,7 @@ class TriangleSniperSkill(BaseSkill):
             return {
                 "buy_confidence": conf,
                 "sell_confidence": 0.0,
+                "breakout_up": True,
                 "reason": "symmetrical_triangle_breakout",
                 "metadata": {
                     "pattern": "Symmetrical Triangle Breakout",

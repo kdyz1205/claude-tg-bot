@@ -19,8 +19,8 @@ Telegram Gateway — PTB：极简全自动看板。
   ``SESSION_COMMANDER_JARVIS_FILTER_SESSION`` — 本机 watch 只消费 resolve 后等于该名的任务（并行 drain）。
   ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
   配置总线：写 ``session_commander_config.json`` 的 ``active_skills``；God 引擎用 **watchdog** 监听 JSON 并 ``reload_skills``。
-  斜杠：``/start`` 网关面板；``/trade``、``/t`` 委托 ``bot.trade_dashboard_command``。
-  其它 ``/…`` 与纯文本相同，走 Jarvis 语义路由（classify_intent → CHAT/TRADE/AUTO_DEV 等）。
+  斜杠：``/start`` 网关面板；``/trade`` 委托 ``bot.trade_dashboard_command``。
+  未注册的 ``/…`` 会收到简短提示；纯文本走 Jarvis 语义路由（classify_intent → CHAT/TRADE/AUTO_DEV 等）。
 
 Run:   python -m gateway.telegram_bot
 """
@@ -446,24 +446,12 @@ async def _jarvis_semantic_route(
         update_config_active_skill,
         user_semantic_lock,
     )
-    from gateway.sentiment_feed import is_single_url_message, process_sentiment_feed
-
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
     application = context.application
 
     status_msg = None
     try:
-        if is_single_url_message(text):
-            status_msg = await update.message.reply_text("⚡ Jarvis 拉取链接并分析情绪…")
-            try:
-                out = await process_sentiment_feed(text, user_mode=USER_MODE)
-            except Exception as e:
-                logger.exception("sentiment_feed url shortcut: %s", e)
-                out = f"❌ 分析失败: {e!s}"
-            await status_msg.edit_text(out[:4096])
-            return
-
         async with user_semantic_lock(uid):
             status_msg = await update.message.reply_text("⚡ Jarvis 正在解析...")
             row = await classify_intent(text, uid=uid)
@@ -582,7 +570,7 @@ async def _jarvis_semantic_route(
                 )
             await status_msg.edit_text(final[:4096])
     except Exception as e:
-        logger.exception("handle_plain_text failed uid=%s", uid)
+        logger.exception("jarvis_semantic_route failed uid=%s", uid)
         err_reply = f"❌ 解析异常: {e!s}"[:4096]
         try:
             if status_msg is not None:
@@ -610,18 +598,22 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _jarvis_semantic_route(update, context, uid=uid)
 
 
-async def handle_slash_as_semantic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """除 /start、/trade、/t 外，其余斜杠整段交给 Jarvis（与纯文本同路由）。"""
+async def handle_unknown_slash_command_gateway(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """已注册 CommandHandler 未覆盖的斜杠：与主 bot 一致，避免静默无响应。"""
     if not update.effective_user or not update.message:
         return
     uid = update.effective_user.id
     if not _is_authorized(uid):
         return
     mark_gateway_user_activity()
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    await _jarvis_semantic_route(update, context, uid=uid)
+    raw = (update.message.text or "").strip().split(maxsplit=1)
+    cmd = raw[0] if raw else ""
+    await update.message.reply_text(
+        f"❓ `{cmd}` 未注册或已从菜单下线。侧栏仅 /start 与 /trade；其它请直接打字由 Jarvis 路由。",
+        parse_mode="Markdown",
+    )
 
 
 async def handle_gateway_callback(
@@ -680,13 +672,12 @@ class TelegramBot:
             .post_shutdown(_gw_post_shutdown)
             .build()
         )
-        # CommandHandler 仅 /start /trade；其它斜杠由 Jarvis 语义层处理（与纯文本同路径）
-        from gateway.handlers.router import NON_START_TRADE_SLASH
-
+        # CommandHandler 仅 /start /trade；其余斜杠提示；纯文本 → Jarvis
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("trade", cmd_trade))
-        app.add_handler(CommandHandler("t", cmd_trade))
-        app.add_handler(MessageHandler(NON_START_TRADE_SLASH, handle_slash_as_semantic))
+        app.add_handler(
+            MessageHandler(filters.COMMAND, handle_unknown_slash_command_gateway)
+        )
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text)
         )

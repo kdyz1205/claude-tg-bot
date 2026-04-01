@@ -12,53 +12,21 @@ from telegram import BotCommand
 # Shown under /start (short; detailed list is /help)
 START_FOOTER_COMMANDS = "/start /trade"
 
-# Sections for /help — trimmed to commands that stay registered (see tg_registry/registration.py)
+# /help：与 registration 一致，只承诺已注册的斜杠；其余能力走 Jarvis 自然语言
 HELP_SECTIONS: list[tuple[str, list[str]]] = [
     (
-        "⚙️ 核心",
+        "⚙️ 已注册斜杠",
         [
-            "/start — 欢迎 + 实盘/Paper 视图",
+            "/start — 主控台与实盘/Paper 视图（网关面板 + gw:* 回调）",
+            "/trade — 极速手动交易面板",
             "/help — 本清单",
-            "/panel /ping /clear /q /quick — 面板与快捷",
-            "/model /provider — 模型与路由",
-            "/status — Bot 与系统状态",
-            "/cancel — 取消排队任务",
-            "/train、/train_file_ops … — 子代理训练",
         ],
     ),
     (
-        "🔗 交易与链上",
+        "💬 Jarvis",
         [
-            "/chain — 链上面板（快照 + 按钮）",
-            "/portfolio — 聚合持仓",
-            "/strategy — 策略总控",
-            "/trade (/t) — 综合交易键盘",
-            "/live start|stop|status — 实盘调度",
-            "/paper — 模拟盘",
-            "/buy /sell /positions /settings /pnl",
-            "/wallet_setup /wallet_delete",
-        ],
-    ),
-    (
-        "🚀 OKX · 信号",
-        [
-            "/okx_trade /okx /okx_account",
-            "/signal /signal_stats /alpha /arb",
-        ],
-    ),
-    (
-        "🐋 聪明钱与报告",
-        [
-            "/onchain /whales /track /wallets /addwallet",
-            "/report /risk /performance",
-            "/evolution /evostatus",
-        ],
-    ),
-    (
-        "💬 自然语言",
-        [
-            "网关模式：策略、造物、风控 → 直接中文说即可（不必记斜杠）。",
-            "粘贴 Solana CA — 狙击卡片（主 bot）",
+            "策略、造物、风控、交易意图 → 直接打字即可，由语义层路由。",
+            "其它以 / 开头的命令未注册，将收到简短提示（请用侧栏或自然语言）。",
         ],
     ),
 ]

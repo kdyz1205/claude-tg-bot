@@ -77,7 +77,7 @@ def schedule_trade_moe_nonblocking(
 
 
 class _NonStartTradeSlashFilter(MessageFilter):
-    """斜杠命令且非 /start、/trade、/t（已由 CommandHandler 处理）。"""
+    """斜杠命令且非 /start、/trade（已由 CommandHandler 处理）。"""
 
     __slots__ = ()
 
@@ -87,7 +87,7 @@ class _NonStartTradeSlashFilter(MessageFilter):
         if not message.text.strip().startswith("/"):
             return False
         cmd, _ = split_command_line(message.text)
-        return cmd not in ("/start", "/trade", "/t")
+        return cmd not in ("/start", "/trade", "/help")
 
 
 NON_START_TRADE_SLASH = _NonStartTradeSlashFilter()
