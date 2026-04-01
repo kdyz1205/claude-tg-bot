@@ -5,6 +5,9 @@ Heuristic intent first; optional ``JARVIS_INTENT_LLM=1`` + OpenAI/Anthropic recl
 messages that would otherwise be CHAT (small JSON classification call).
 
 v2: broader quant / 造物 routing, secondary spec detector, ``reasoning`` on every path.
+
+CHAT 对话走 ``llm_http_client.complete_turn``；可选 ``JARVIS_CHAT_MODEL``、
+``JARVIS_CHAT_TIMEOUT_SEC``（秒，默认参考 ``config.API_REQUEST_TIMEOUT_SEC``）。
 """
 
 from __future__ import annotations
@@ -408,12 +411,87 @@ async def execute_trade_from_user_text(
     return False, "请在主机器人或专用交易流程中下单；网关面板仅展示与引擎控制。"
 
 
+# 网关日常对话：经 llm_http_client.complete_turn（aiohttp，与 agents/sessions 同栈）
+_JARVIS_CHAT_SYSTEM = """你是 Jarvis，长官的专属高频量化作战副官。
+
+风格（强制）：
+- 极度冷酷、专业、极简；华尔街宽客 / systematic desk 口吻。
+- 拒绝废话、拒绝寒暄、拒绝堆叠表情符号（非必要不用）。
+- 长官用中文提问时，用中文作答；英文则英文。保持同一冷峻密度。
+- 不编造实时行情或持仓；无依据时直说「无数据 / 未接入」。
+- 涉及下单、实盘执行时提醒：以主控交易流与风控为准，网关对话不构成指令。
+
+回答长度默认控制在必要最小；若长官明确要求深度推演再展开。"""
+
+_JARVIS_CHAT_ERR_USER = "LLM 节点连接失败或超时"
+
+# 与 agents.sessions 的 8_000_000+ 虚拟 id 错开，按 Telegram uid 稳定映射多轮记忆
+_JARVIS_GW_CHAT_BASE = 71_000_000
+_JARVIS_GW_CHAT_MOD = 89_000_000
+
+
+def _jarvis_gateway_chat_id(uid: int) -> int:
+    return _JARVIS_GW_CHAT_BASE + (abs(int(uid)) % _JARVIS_GW_CHAT_MOD)
+
+
+def _jarvis_chat_timeout_sec() -> float:
+    try:
+        raw = (os.environ.get("JARVIS_CHAT_TIMEOUT_SEC") or "").strip()
+        if raw:
+            return max(15.0, min(600.0, float(raw)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        import config
+
+        return max(30.0, float(getattr(config, "API_REQUEST_TIMEOUT_SEC", 120.0)))
+    except Exception:
+        return 120.0
+
+
 async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
-    if llm_backend_configured():
-        return "", "未接入对话模型实现（仅意图路由）；请用自然语言造物或 /start 面板。"
-    return (
-        "💬 已收到。若你在描述**交易逻辑、因子或策略**（含公式、阈值、论文复现），"
-        "可直接写长一点并带指标名/回测等关键词，Jarvis 会路由到造物引擎；"
-        "主控请用 /start。配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 后可扩展对话能力。",
-        "",
-    )
+    """
+    网关 CHAT 意图：真实 LLM 一轮（带 per-uid HTTP 会话记忆）。
+
+    成功: (reply_text, "")
+    失败: ("", _JARVIS_CHAT_ERR_USER) — 细节只写日志，交给外层展示统一文案。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+
+    import llm_http_client
+
+    chat_id = _jarvis_gateway_chat_id(uid)
+    model_hint = (os.environ.get("JARVIS_CHAT_MODEL") or "").strip() or None
+
+    try:
+        assistant_text, _sid, err = await llm_http_client.complete_turn(
+            chat_id=chat_id,
+            system_prompt=_JARVIS_CHAT_SYSTEM,
+            user_text=t[:120_000],
+            model_hint=model_hint,
+            timeout_sec=_jarvis_chat_timeout_sec(),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("jarvis chat_reply asyncio.TimeoutError uid=%s", uid)
+        return "", _JARVIS_CHAT_ERR_USER
+    except Exception as e:
+        logger.exception("jarvis chat_reply transport uid=%s: %s", uid, e)
+        return "", _JARVIS_CHAT_ERR_USER
+
+    if err:
+        logger.warning(
+            "jarvis chat_reply LLM err uid=%s chat_id=%s: %s",
+            uid,
+            chat_id,
+            (err or "")[:800],
+        )
+        return "", _JARVIS_CHAT_ERR_USER
+
+    out = (assistant_text or "").strip()
+    if not out:
+        logger.warning("jarvis chat_reply empty assistant uid=%s chat_id=%s", uid, chat_id)
+        return "", _JARVIS_CHAT_ERR_USER
+
+    return out, ""

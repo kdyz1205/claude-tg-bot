@@ -482,128 +482,148 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
     application = context.application
 
-    if is_single_url_message(text):
-        await update.message.reply_text("⚡ Jarvis 拉取链接并分析情绪…")
-        try:
-            out = await process_sentiment_feed(text, user_mode=USER_MODE)
-        except Exception as e:
-            logger.exception("sentiment_feed url shortcut: %s", e)
-            out = f"❌ 分析失败: {e!s}"
-        await update.message.reply_text(out[:4096])
-        return
-
-    async with user_semantic_lock(uid):
-        row = await classify_intent(text, uid=uid)
-        intent = str(row.get("intent") or "CHAT").upper()
-        logger.debug(
-            "jarvis_route uid=%s intent=%s sub=%s reasoning=%s",
-            uid,
-            intent,
-            row.get("sub_intent"),
-            row.get("reasoning"),
-        )
-
-        if intent == "CHAOS_IMMUNITY":
-            await update.message.reply_text(
-                "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
-                "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
-            )
-            _gw_schedule(
-                application,
-                process_chaos_immunity_task(
-                    bot=context.bot,
-                    chat_id=update.message.chat_id,
-                    uid=uid,
-                    dev_timeout_sec=900,
-                    min_interval_sec=3.0,
-                ),
-            )
+    status_msg = None
+    try:
+        if is_single_url_message(text):
+            status_msg = await update.message.reply_text("⚡ Jarvis 拉取链接并分析情绪…")
+            try:
+                out = await process_sentiment_feed(text, user_mode=USER_MODE)
+            except Exception as e:
+                logger.exception("sentiment_feed url shortcut: %s", e)
+                out = f"❌ 分析失败: {e!s}"
+            await status_msg.edit_text(out[:4096])
             return
 
-        if intent == "CONFIG_BUS":
-            from gateway.config_bus import append_lab_nudge_to_queue, apply_safe_config_patch
-
-            patches = row.get("config_patch") or {}
-            lines: list[str] = []
-            if patches:
-                ok, msg = apply_safe_config_patch(patches)
-                lines.append(f"⚙️ 配置总线：{'✅' if ok else '❌'} {msg}")
-            lp = row.get("lab_prompt")
-            if lp:
-                ok2, msg2 = append_lab_nudge_to_queue(str(lp))
-                lines.append(f"🧪 炼丹队列：{'✅' if ok2 else '❌'} {msg2}")
-            await update.message.reply_text(
-                "\n".join(lines) if lines else "✅ 已处理（无写入项）。"
+        async with user_semantic_lock(uid):
+            status_msg = await update.message.reply_text("⚡ Jarvis 正在解析...")
+            row = await classify_intent(text, uid=uid)
+            intent = str(row.get("intent") or "CHAT").upper()
+            logger.debug(
+                "jarvis_route uid=%s intent=%s sub=%s reasoning=%s",
+                uid,
+                intent,
+                row.get("sub_intent"),
+                row.get("reasoning"),
             )
-            return
 
-        if intent == "RUN_SKILL":
-            sid = str(row.get("skill_id") or "").strip()
-            ok_m, msg_m = update_config_active_skill(sid)
-            await update.message.reply_text(
-                f"⚔️ 已写入 `active_skills`：`{sid}`\n"
-                f"配置总线：{'✅' if ok_m else '❌'} {msg_m}"
-            )
-            return
-
-        if intent == "WALLET_CLONE":
-            addr = row.get("extracted_address")
-            if not addr:
-                await update.message.reply_text("未识别到有效的 0x 钱包地址。")
+            if intent == "CHAOS_IMMUNITY":
+                await status_msg.edit_text(
+                    "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
+                    "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
+                )
+                _gw_schedule(
+                    application,
+                    process_chaos_immunity_task(
+                        bot=context.bot,
+                        chat_id=update.message.chat_id,
+                        uid=uid,
+                        dev_timeout_sec=900,
+                        min_interval_sec=3.0,
+                    ),
+                )
                 return
-            await update.message.reply_text(
-                "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
-            )
-            _gw_schedule(
-                application,
-                process_wallet_clone_task(
-                    bot=context.bot,
-                    chat_id=update.message.chat_id,
-                    wallet_address=str(addr),
-                    timeout_sec=600,
-                    min_interval_sec=3.0,
-                ),
-            )
-            return
 
-        if intent == "AUTO_DEV":
-            req = (row.get("extracted_requirement") or "").strip() or text
-            sub_intent = row.get("sub_intent")
-            await update.message.reply_text(
-                "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
-            )
-            _gw_schedule(
-                application,
-                process_dev_task(
-                    bot=context.bot,
-                    chat_id=update.message.chat_id,
-                    prompt=req,
-                    timeout_sec=600,
-                    min_interval_sec=3.0,
-                    sub_intent=sub_intent,
-                ),
-            )
-            maybe_mount_skill_after_auto_dev(text, req)
-            return
+            if intent == "CONFIG_BUS":
+                from gateway.config_bus import append_lab_nudge_to_queue, apply_safe_config_patch
 
-        if intent == "TRADE":
-            await update.message.reply_text(MOE_DEBATE_ACK)
-            schedule_trade_moe_nonblocking(
-                application,
-                context.bot,
-                update.message.chat_id,
-                text,
-                uid=uid,
-                user_mode=USER_MODE,
-            )
-            return
+                patches = row.get("config_patch") or {}
+                lines: list[str] = []
+                if patches:
+                    ok, msg = apply_safe_config_patch(patches)
+                    lines.append(f"⚙️ 配置总线：{'✅' if ok else '❌'} {msg}")
+                lp = row.get("lab_prompt")
+                if lp:
+                    ok2, msg2 = append_lab_nudge_to_queue(str(lp))
+                    lines.append(f"🧪 炼丹队列：{'✅' if ok2 else '❌'} {msg2}")
+                await status_msg.edit_text(
+                    "\n".join(lines) if lines else "✅ 已处理（无写入项）。"
+                )
+                return
 
-        reply, err = await chat_reply(text, uid=uid)
-        if err:
-            await update.message.reply_text(f"（模型不可用：{err[:800]}）")
-            return
-        if reply:
-            await update.message.reply_text(reply[:4096])
+            if intent == "RUN_SKILL":
+                sid = str(row.get("skill_id") or "").strip()
+                ok_m, msg_m = update_config_active_skill(sid)
+                await status_msg.edit_text(
+                    f"⚔️ 已写入 `active_skills`：`{sid}`\n"
+                    f"配置总线：{'✅' if ok_m else '❌'} {msg_m}"
+                )
+                return
+
+            if intent == "WALLET_CLONE":
+                addr = row.get("extracted_address")
+                if not addr:
+                    await status_msg.edit_text("未识别到有效的 0x 钱包地址。")
+                    return
+                await status_msg.edit_text(
+                    "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
+                )
+                _gw_schedule(
+                    application,
+                    process_wallet_clone_task(
+                        bot=context.bot,
+                        chat_id=update.message.chat_id,
+                        wallet_address=str(addr),
+                        timeout_sec=600,
+                        min_interval_sec=3.0,
+                    ),
+                )
+                return
+
+            if intent == "AUTO_DEV":
+                req = (row.get("extracted_requirement") or "").strip() or text
+                sub_intent = row.get("sub_intent")
+                await status_msg.edit_text(
+                    "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
+                )
+                _gw_schedule(
+                    application,
+                    process_dev_task(
+                        bot=context.bot,
+                        chat_id=update.message.chat_id,
+                        prompt=req,
+                        timeout_sec=600,
+                        min_interval_sec=3.0,
+                        sub_intent=sub_intent,
+                    ),
+                )
+                maybe_mount_skill_after_auto_dev(text, req)
+                return
+
+            if intent == "TRADE":
+                await status_msg.edit_text(MOE_DEBATE_ACK)
+                schedule_trade_moe_nonblocking(
+                    application,
+                    context.bot,
+                    update.message.chat_id,
+                    text,
+                    uid=uid,
+                    user_mode=USER_MODE,
+                )
+                return
+
+            reply, err = await chat_reply(text, uid=uid)
+            if err:
+                await status_msg.edit_text(f"（模型不可用：{err[:800]}）")
+                return
+            final = (reply or "").strip()
+            if not final:
+                final = (
+                    "（Jarvis 未返回可展示的正文；请检查模型配置或稍后重试。）"
+                )
+            await status_msg.edit_text(final[:4096])
+    except Exception as e:
+        logger.exception("handle_plain_text failed uid=%s", uid)
+        err_reply = f"❌ 解析异常: {e!s}"[:4096]
+        try:
+            if status_msg is not None:
+                await status_msg.edit_text(err_reply)
+            else:
+                await update.message.reply_text(err_reply)
+        except Exception:
+            try:
+                await update.message.reply_text(err_reply)
+            except Exception:
+                pass
 
 
 async def handle_gateway_callback(
