@@ -1281,3 +1281,33 @@ class DexArbitrageExecutor:
 
 
 ArbitrageEngine = DexArbitrageExecutor
+
+
+def evaluate_stat_arb_pair(
+    close_a,
+    close_b,
+    *,
+    z_entry: float = 2.0,
+    z_exit: float = 0.5,
+    window: int = 60,
+    name_a: str = "A",
+    name_b: str = "B",
+) -> Dict[str, Any]:
+    """
+    Mean-reversion signal on two price series (log OLS spread Z-score).
+    Complements cross-venue arb: same module import path for scanners.
+    """
+    import numpy as np
+    from trading.pairs_trading import pairs_trading_signal
+
+    a = np.asarray(close_a, dtype=np.float64)
+    b = np.asarray(close_b, dtype=np.float64)
+    return pairs_trading_signal(
+        a,
+        b,
+        z_entry=z_entry,
+        z_exit=z_exit,
+        window=window,
+        name_a=name_a,
+        name_b=name_b,
+    )

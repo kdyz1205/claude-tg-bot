@@ -12,6 +12,7 @@ from typing import Any, Callable
 from telegram.ext import Application, CommandHandler
 
 # (command names..., handler_dict_key)
+# 仅注册常用斜杠；冷门调试指令已移除（减少「菜单里有、点了没反应」与维护面）。
 COMMAND_BINDINGS: list[tuple[tuple[str, ...], str]] = [
     # —— 核心与会话 ——
     (("start",), "start"),
@@ -21,30 +22,11 @@ COMMAND_BINDINGS: list[tuple[tuple[str, ...], str]] = [
     (("panel",), "panel_command"),
     (("q",), "quick_action"),
     (("quick",), "quick_action"),
-    # —— Claude / 桥接 / 任务 ——
-    (("dev",), "dev_command"),
-    (("kill",), "kill_command"),
-    (("tasks",), "tasks_command"),
-    (("cancel",), "cancel_command"),
-    (("bridge",), "bridge_command"),
-    (("screenshot",), "quick_screenshot"),
     (("model",), "model_command"),
     (("provider",), "provider_command"),
     (("status",), "status_command"),
-    (("quota",), "quota_command"),
-    (("sessions",), "sessions_command"),
-    (("learn",), "learn_command"),
-    (("score",), "score_command"),
+    (("cancel",), "cancel_command"),
     (("train",), "train_command"),
-    (("session_control",), "session_control_command"),
-    (("ms",), "multi_session_command"),
-    # —— 健康与监控 ——
-    (("health",), "health_command"),
-    (("vital",), "vital_command"),
-    (("monitor",), "monitor_command"),
-    (("proactive",), "proactive_command"),
-    (("market",), "market_command"),
-    (("memory",), "memory_command"),
     # —— 链上交易 (DEX) + 聚合面板 ——
     (("chain",), "chain_command"),
     (("portfolio",), "portfolio_command"),
@@ -63,20 +45,13 @@ COMMAND_BINDINGS: list[tuple[tuple[str, ...], str]] = [
     (("okx",), "okx_command"),
     (("okx_account",), "okx_account_command"),
     (("okx_trade",), "okx_trade_command"),
-    (("okx_backtest",), "okx_backtest_command"),
-    (("okx_top30",), "okx_top30_command"),
-    (("ma_ribbon_backtest",), "ma_ribbon_backtest_command"),
-    (("ma_ribbon_screener",), "ma_ribbon_screener_command"),
     # —— 信号 / Alpha / 套利 ——
     (("signal",), "signal_command"),
     (("signal_stats",), "signal_stats_command"),
     (("alpha",), "alpha_command"),
     (("arb",), "arb_command"),
-    (("token_analyze",), "token_analyze_command"),
-    (("optimize",), "optimize_command"),
-    # —— 链上聪明钱 / 论文 ——
+    # —— 链上聪明钱 ——
     (("onchain",), "onchain_command"),
-    (("search",), "search_command"),
     (("whales",), "whales_command"),
     (("track",), "track_command"),
     (("wallets",), "wallets_command"),
@@ -85,23 +60,9 @@ COMMAND_BINDINGS: list[tuple[tuple[str, ...], str]] = [
     (("report",), "report_command"),
     (("risk",), "risk_command"),
     (("performance",), "performance_command"),
-    # —— 进化 / 自主 / 技能 ——
+    # —— 进化 ——
     (("evolution",), "evolution_command"),
-    (("evolve",), "evolve_command"),
-    (("strategy_evolve",), "strategy_evolve_command"),
     (("evostatus",), "evostatus_command"),
-    (("skills",), "skills_command"),
-    (("autonomy",), "autonomy_command"),
-    (("consciousness",), "consciousness_command"),
-    # —— 代码自愈与质量 ——
-    (("selfcheck",), "selfcheck_command"),
-    (("repairs",), "repairs_command"),
-    (("repair_status",), "repair_status_command"),
-    (("code_health",), "code_health_command"),
-    (("selfrepair",), "selfrepair_command"),
-    # —— 仪表盘 / 外部工具 ——
-    (("dashboard",), "dashboard_command"),
-    (("codex",), "codex_command"),
 ]
 
 # /train_<domain> 共用 train_command

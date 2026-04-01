@@ -13,45 +13,20 @@ import asyncio
 import logging
 import os
 
-from telegram import BotCommand
 from telegram.ext import Application
+
+from tg_registry.catalog import minimal_slash_menu_commands
 
 logger = logging.getLogger(__name__)
 
 BOT_DATA_AUTO_RESEARCH_TASK_KEY = "_gw_auto_research_task"
 
 
-def standard_bot_commands() -> list[BotCommand]:
+def standard_bot_commands():
     """
-    菜单文案与职责一一对应：命令走 CommandHandler，绝不与纯文本语义层混用。
-    描述控制在 Telegram 菜单可读长度内，并标明「非聊天语义」边界。
+    与 ``python bot.py`` 使用同一短菜单（``tg_registry.catalog``），避免侧栏显示一堆却无法响应。
     """
-    return [
-        BotCommand(
-            "start",
-            "面板：持仓·引擎·刷新（非闲聊）",
-        ),
-        BotCommand(
-            "trade",
-            "指引：自然语言买卖（非 /dev）",
-        ),
-        BotCommand(
-            "config",
-            "风控·纸/实盘（非造物）",
-        ),
-        BotCommand(
-            "help",
-            "命令清单·环境变量（只读）",
-        ),
-        BotCommand(
-            "feed",
-            "专用：链接/正文情绪",
-        ),
-        BotCommand(
-            "dev",
-            "专用：/dev 写代码·因子",
-        ),
-    ]
+    return minimal_slash_menu_commands()
 
 
 async def sync_slash_command_menu(bot) -> None:

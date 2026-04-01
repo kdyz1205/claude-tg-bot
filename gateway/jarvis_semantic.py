@@ -69,6 +69,13 @@ _CHAOS_IMMUNITY_HINT = re.compile(
     re.I,
 )
 
+# 配置总线：改写 session_commander_config.json 白名单键 + 炼丹入队
+_LAB_EVOLVER_HINT = re.compile(
+    r"(启动炼丹|开始炼丹|启动进化|无限进化|跑\s*evolver|infinite\s*evolver|科研\s*挂机|"
+    r"开\s*实验室)",
+    re.I,
+)
+
 _TRADE_HINT = re.compile(
     r"(平仓|开仓|加仓|减仓|止损单|止盈|市价|限价|抄底|逃顶|"
     r"买入|卖出|买进|沽出|做多|做空|清仓|全平|"
@@ -205,6 +212,80 @@ async def _llm_refine_intent_after_chat_heuristic(text: str, *, uid: int) -> dic
 _locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
+def try_config_bus_intent(text: str) -> dict[str, Any] | None:
+    """配置总线 + 炼丹入队；挂载策略时写 ``active_skills``。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    patch: dict[str, Any] = {}
+    if re.search(
+        r"(启用|打开|开启).{0,20}jarvis\s*自动消费|自动消费\s*(打开|启用|开|on)",
+        t,
+        re.I,
+    ):
+        patch["jarvis_auto_consume"] = True
+    elif re.search(
+        r"(禁用|关闭).{0,20}jarvis\s*自动消费|自动消费\s*(关|关闭|off)",
+        t,
+        re.I,
+    ):
+        patch["jarvis_auto_consume"] = False
+    if re.search(
+        r"(开启|打开)\s*dry\s*run|dry\s*run\s*on|演练模式|只记录不点|干跑",
+        t,
+        re.I,
+    ):
+        patch["dry_run"] = True
+    elif re.search(
+        r"(关闭|取消)\s*dry\s*run|dry\s*run\s*off|真实点击|实盘操作",
+        t,
+        re.I,
+    ):
+        patch["dry_run"] = False
+    if re.search(r"(清空雷达技能|取消挂载|雷达\s*默认|不用固定技能)", t, re.I):
+        patch["active_skills"] = []
+    elif re.search(
+        r"(挂载|切换|雷达|使用技能|固定技能|运行策略|执行策略|用上)", t, re.I
+    ):
+        m = re.search(r"\b(sk_[a-zA-Z0-9_]{4,})\b", t)
+        if m:
+            patch["active_skills"] = [m.group(1)]
+    lab_prompt: str | None = None
+    if _LAB_EVOLVER_HINT.search(t):
+        lab_prompt = t[:2000]
+    if patch or lab_prompt is not None:
+        return {
+            "intent": "CONFIG_BUS",
+            "config_patch": patch,
+            "lab_prompt": lab_prompt,
+            "reasoning": "config_bus_keywords",
+        }
+    return None
+
+
+def update_config_active_skill(skill_name: str | None) -> tuple[bool, str]:
+    """覆写 ``active_skills`` 并触发 God ``reload_skills``（经 config_bus）。"""
+    from gateway.config_bus import apply_safe_config_patch
+
+    name = (skill_name or "").strip()
+    if name:
+        return apply_safe_config_patch({"active_skills": [name]})
+    return apply_safe_config_patch({"active_skills": []})
+
+
+def maybe_mount_skill_after_auto_dev(text: str, req: str) -> tuple[bool, str]:
+    """AUTO_DEV 语义里若明确要求挂载某 ``sk_*``，实权写入配置。"""
+    blob = f"{(text or '').strip()}\n{(req or '').strip()}"
+    if not re.search(
+        r"(部署|挂载|实盘运行|切换为|用此策略).{0,24}sk_", blob, re.I
+    ):
+        return False, "skip"
+    m = re.search(r"\b(sk_[a-zA-Z0-9_]{4,})\b", blob)
+    if not m:
+        return False, "no_skill_id"
+    return update_config_active_skill(m.group(1))
+
+
 def user_semantic_lock(uid: int) -> asyncio.Lock:
     return _locks[int(uid)]
 
@@ -236,6 +317,9 @@ def _looks_like_quant_algorithm_spec(t: str) -> bool:
 
 async def classify_intent(text: str, *, uid: int) -> dict[str, Any]:
     t = (text or "").strip()
+    _cb = try_config_bus_intent(t)
+    if _cb is not None:
+        return _cb
     if _CHAOS_IMMUNITY_HINT.search(t):
         return {
             "intent": "CHAOS_IMMUNITY",
@@ -249,6 +333,17 @@ async def classify_intent(text: str, *, uid: int) -> dict[str, Any]:
             "extracted_requirement": t,
             "reasoning": "regex_wallet_clone_with_address",
         }
+    if re.search(r"(运行|执行|切换为|用上).{0,12}", t, re.I) and re.search(
+        r"\bsk_[a-zA-Z0-9_]{4,}\b", t, re.I
+    ):
+        m = re.search(r"\b(sk_[a-zA-Z0-9_]{4,})\b", t)
+        if m:
+            return {
+                "intent": "RUN_SKILL",
+                "skill_id": m.group(1),
+                "extracted_requirement": t,
+                "reasoning": "regex_run_skill_mount",
+            }
     if _FACTOR_FORGE_HINT.search(t):
         return {
             "intent": "AUTO_DEV",
@@ -315,10 +410,10 @@ async def execute_trade_from_user_text(
 
 async def chat_reply(text: str, *, uid: int) -> tuple[str, str]:
     if llm_backend_configured():
-        return "", "未接入对话模型实现（仅意图路由）；请用 /dev 或看板按钮。"
+        return "", "未接入对话模型实现（仅意图路由）；请用自然语言造物或 /start 面板。"
     return (
         "💬 已收到。若你在描述**交易逻辑、因子或策略**（含公式、阈值、论文复现），"
         "可直接写长一点并带指标名/回测等关键词，Jarvis 会路由到造物引擎；"
-        "也可 `/dev <需求>`。配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 后可扩展对话能力。",
+        "主控请用 /start。配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 后可扩展对话能力。",
         "",
     )

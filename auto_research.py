@@ -70,6 +70,110 @@ def mark_user_active():
     _last_experiment_reset = time.time()
 
 
+def send_battlefield_telegram_notice(filename: str, sharpe: float) -> None:
+    """战报：加粗 Markdown（需 TELEGRAM_BOT_TOKEN + 通知 chat id）。"""
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat = (
+        os.environ.get("GATEWAY_AUTO_RESEARCH_NOTIFY_CHAT_ID")
+        or os.environ.get("AUTHORIZED_USER_ID")
+        or ""
+    ).strip()
+    if not token or not chat:
+        return
+    text = (
+        f"⚔️ *AI 自主研发成功：新武器* `{filename}` *已通过回测并强制部署实盘！*\n"
+        f"Sharpe≈*{sharpe:.2f}*"
+    )
+    try:
+        import requests
+
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": text[:4096], "parse_mode": "Markdown"},
+            timeout=20,
+        )
+    except Exception:
+        logger.debug("send_battlefield_telegram_notice failed", exc_info=True)
+
+
+def deploy_to_battlefield(
+    file_path: str,
+    *,
+    skill_id: str | None = None,
+    title: str = "",
+    user_request: str = "",
+    sharpe: float = 0.0,
+    send_telegram: bool = True,
+) -> tuple[bool, str]:
+    """
+    将因子 ``.py`` 移入仓库 ``skills/``，登记 ``skill_library``，热载并触发 God ``reload_skills``。
+    """
+    import shutil
+
+    src = Path(file_path).resolve()
+    if not src.is_file():
+        return False, f"not a file: {src}"
+
+    skills_dir = Path(BOT_DIR) / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = (skill_id or src.stem).strip()
+    if stem.endswith(".py"):
+        stem = stem[:-3]
+    dest = skills_dir / f"{stem}.py"
+
+    if src.resolve() != dest.resolve():
+        try:
+            shutil.move(str(src), str(dest))
+        except OSError as e:
+            return False, str(e)
+    else:
+        dest = src
+
+    rel = f"skills/{dest.name}"
+    try:
+        import skill_library
+
+        skill_library.register_or_update_factor_skill(
+            skill_id=dest.stem,
+            title=(title or dest.stem)[:200],
+            keywords=[dest.stem, "battlefield_deploy"],
+            user_request=(user_request or rel)[:500],
+            py_relpath=rel,
+        )
+    except Exception as e:
+        logger.warning("skill_library.register_or_update_factor_skill: %s", e)
+
+    try:
+        from skills.skill_runtime import load_skill_from_file
+
+        load_skill_from_file(dest)
+    except Exception:
+        logger.debug("load_skill_from_file after deploy", exc_info=True)
+
+    try:
+        from pipeline.god_orchestrator import GOD_ORCHESTRATOR
+
+        GOD_ORCHESTRATOR.reload_skills()
+    except Exception:
+        logger.debug("GOD reload after deploy", exc_info=True)
+
+    if send_telegram:
+        send_battlefield_telegram_notice(dest.name, float(sharpe))
+    return True, str(dest)
+
+
+def deploy_to_skills(script_path: str, skill_id: str) -> str:
+    """静默版挂载（不发 TG），供非 evolver 路径复用。"""
+    ok, msg = deploy_to_battlefield(
+        script_path,
+        skill_id=skill_id,
+        sharpe=0.0,
+        send_telegram=False,
+    )
+    return msg if ok else f"fail:{msg}"
+
+
 def _is_idle() -> bool:
     return time.time() - _last_user_activity > _get_idle_threshold()
 
