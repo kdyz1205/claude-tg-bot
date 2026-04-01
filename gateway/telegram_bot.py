@@ -1,8 +1,8 @@
 """
 Telegram Gateway — PTB entry with two UI modes:
 
-1. **panel** (default) — dashboard-backed trading home / positions / strategy
-   (`GW_CB:*` callbacks, in-place `edit_message_text`).
+1. **panel** (default) — dashboard MarkdownV2 templates + `GW_CB:*` callbacks;
+   秒回占位后 `asyncio.create_task` 拉取链上/刷新持仓，禁止在 CallbackQuery 协程内 await 耗时 IO。
 
 2. **terminal** — Bloomberg-style state machine: `ConversationHandler`, global
    contract-address interceptor, 2s API throttle on hot refresh. See
@@ -39,11 +39,11 @@ from dashboard import (
     tg_gw_build_back_keyboard,
     tg_gw_build_main_keyboard,
     tg_gw_build_positions_keyboard,
+    tg_gw_escape_v2,
+    tg_gw_render_callback_pending_text,
     tg_gw_render_home_text,
-    tg_gw_render_positions_stale_with_refresh_banner,
     tg_gw_render_positions_text,
     tg_gw_render_strategy_text,
-    tg_gw_sanitize_for_markdown,
 )
 from tracker.session_store import SessionStore
 
@@ -132,10 +132,8 @@ async def _safe_edit(
     query,
     text: str,
     reply_markup,
-    parse_mode: str = "Markdown",
+    parse_mode: str = "MarkdownV2",
 ) -> None:
-    if parse_mode == "Markdown":
-        text = tg_gw_sanitize_for_markdown(text)
     try:
         await query.edit_message_text(
             text,
@@ -153,6 +151,24 @@ async def _safe_edit(
             logger.warning("edit_message_text plain fallback failed: %s", e2)
 
 
+async def _bot_edit_markdown_v2(bot, chat_id: int, message_id: int, text: str, reply_markup) -> None:
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="MarkdownV2",
+        )
+    except Exception:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -162,12 +178,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     store = _session_store()
     mode = store.get_trade_mode(uid)
-    text = tg_gw_sanitize_for_markdown(tg_gw_render_home_text(mode))
+    text = tg_gw_render_home_text(mode)
     kb = tg_gw_build_main_keyboard(mode)
     await update.message.reply_text(
         text,
         reply_markup=kb,
-        parse_mode="Markdown",
+        parse_mode="MarkdownV2",
     )
 
 
@@ -220,6 +236,15 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_run_bridge())
 
 
+def _gw_pending_markup(action: str, mode: str):
+    """加载态下保留对应屏的键盘，避免用户卡在空白页。"""
+    if action == "strat":
+        return tg_gw_build_back_keyboard()
+    if action == "pos":
+        return tg_gw_build_positions_keyboard()
+    return tg_gw_build_main_keyboard(mode)
+
+
 async def handle_gateway_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -242,88 +267,90 @@ async def handle_gateway_callback(
 
     await query.answer()
 
-    if action == "mode":
-        new_mode = "live" if arg == "live" else "paper"
-        store.set_trade_mode(uid, new_mode)
-        mode = new_mode
-        await _safe_edit(
-            query,
-            tg_gw_render_home_text(mode),
-            tg_gw_build_main_keyboard(mode),
-        )
-        return
+    # 零延迟：先占位，禁止在本协程内 await 链上刷新 / 大模型
+    await _safe_edit(
+        query,
+        tg_gw_render_callback_pending_text(),
+        _gw_pending_markup(action, mode),
+    )
 
-    if action == "home":
-        await _safe_edit(
-            query,
-            tg_gw_render_home_text(mode),
-            tg_gw_build_main_keyboard(mode),
-        )
-        return
+    bot = context.bot
+    application = context.application
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
 
-    if action == "strat":
-        await _safe_edit(
-            query,
-            tg_gw_render_strategy_text(mode),
-            tg_gw_build_back_keyboard(),
-        )
-        return
-
-    if action == "pos":
+    async def _gw_panel_work() -> None:
         try:
-            from trading import portfolio_snapshot
-
-            snap_now = portfolio_snapshot.get_snapshot()
-        except Exception:
-            snap_now = None
-
-        await _safe_edit(
-            query,
-            tg_gw_render_positions_stale_with_refresh_banner(mode, snap_now),
-            tg_gw_build_positions_keyboard(),
-        )
-
-        bot = context.bot
-        application = context.application
-        chat_id = query.message.chat_id
-        message_id = query.message.message_id
-
-        async def _fetch_and_refresh() -> None:
-            lock = _gw_pos_refresh_lock(application, chat_id, message_id)
-            async with lock:
-                try:
-                    from trading import portfolio_snapshot
-
-                    await portfolio_snapshot.refresh_once()
-                    snap = portfolio_snapshot.get_snapshot()
-                except Exception as e:
-                    logger.exception("gateway positions refresh: %s", e)
-                    snap = None
-                mode_now = _session_store().get_trade_mode(uid)
-                body = tg_gw_sanitize_for_markdown(
-                    tg_gw_render_positions_text(mode_now, snap)
+            if action == "mode":
+                new_mode = "live" if arg == "live" else "paper"
+                store.set_trade_mode(uid, new_mode)
+                m = new_mode
+                await _bot_edit_markdown_v2(
+                    bot,
+                    chat_id,
+                    message_id,
+                    tg_gw_render_home_text(m),
+                    tg_gw_build_main_keyboard(m),
                 )
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=body,
-                        reply_markup=tg_gw_build_positions_keyboard(),
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            text=body,
-                            reply_markup=tg_gw_build_positions_keyboard(),
-                        )
-                    except Exception as e2:
-                        logger.warning("background edit positions failed: %s", e2)
+                return
 
-        asyncio.create_task(_fetch_and_refresh())
-        return
+            if action == "home":
+                m = store.get_trade_mode(uid)
+                await _bot_edit_markdown_v2(
+                    bot,
+                    chat_id,
+                    message_id,
+                    tg_gw_render_home_text(m),
+                    tg_gw_build_main_keyboard(m),
+                )
+                return
+
+            if action == "strat":
+                m = store.get_trade_mode(uid)
+                await _bot_edit_markdown_v2(
+                    bot,
+                    chat_id,
+                    message_id,
+                    tg_gw_render_strategy_text(m),
+                    tg_gw_build_back_keyboard(),
+                )
+                return
+
+            if action == "pos":
+                lock = _gw_pos_refresh_lock(application, chat_id, message_id)
+                async with lock:
+                    m = store.get_trade_mode(uid)
+                    try:
+                        from trading import portfolio_snapshot
+
+                        await portfolio_snapshot.refresh_once()
+                        snap = portfolio_snapshot.get_snapshot()
+                    except Exception as e:
+                        logger.exception("gateway positions refresh: %s", e)
+                        snap = None
+                    await _bot_edit_markdown_v2(
+                        bot,
+                        chat_id,
+                        message_id,
+                        tg_gw_render_positions_text(m, snap),
+                        tg_gw_build_positions_keyboard(),
+                    )
+                return
+        except Exception as e:
+            logger.exception("gateway panel work: %s", e)
+            try:
+                err_body = tg_gw_escape_v2(f"❌ 面板更新失败：{e!s}")
+                await _bot_edit_markdown_v2(
+                    bot,
+                    chat_id,
+                    message_id,
+                    err_body,
+                    tg_gw_build_main_keyboard(store.get_trade_mode(uid)),
+                )
+            except Exception as e2:
+                logger.warning("gateway panel error edit failed: %s", e2)
+
+    asyncio.create_task(_gw_panel_work())
 
 
 class TelegramBot:

@@ -1075,6 +1075,91 @@ PROVIDER_FNS = {
 PROVIDER_DISPLAY["web_ai"] = "Web AI (免费网页)"
 
 
+def _should_fallback_claude_to_openai(claude_error: str | None) -> bool:
+    """After Claude fails, attempt OpenAI (separate quota / healthier region)."""
+    if claude_error is None:
+        return False
+    if claude_error in ("no_key", "no_package", "transient_exhausted", "billing", "auth"):
+        return True
+    el = str(claude_error).lower()
+    markers = (
+        "429", "502", "503", "529", "overloaded", "rate", "timeout", "timed out",
+        "connection", "bad gateway", "unavailable", "internal server",
+    )
+    return any(m in el for m in markers)
+
+
+async def process_tiered_api_fallback(
+    messages,
+    chat_id,
+    context,
+    *,
+    selected_tools=None,
+    image_data=None,
+    claude_model: str | None = None,
+    openai_model: str | None = None,
+):
+    """Tier-selected models: Claude (async SDK + retry pool) → OpenAI → Gemini.
+
+    Used by providers_router.execute_api_routed_turn for production degradation.
+    """
+    if image_data:
+        _inject_image_into_messages(messages, image_data)
+
+    user_msg = ""
+    for m in reversed(messages):
+        content = m.get("content")
+        if m.get("role") == "user":
+            if isinstance(content, str):
+                user_msg = content
+                break
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        user_msg = part.get("text") or ""
+                        break
+                if user_msg:
+                    break
+
+    tools = selected_tools if selected_tools is not None else _select_tools(user_msg)
+    logger.info(
+        "Tiered API: tools=%s/%s claude_model=%s openai_model=%s",
+        len(tools),
+        len(TOOL_DEFINITIONS),
+        claude_model or config.CLAUDE_MODEL,
+        openai_model or config.OPENAI_MODEL,
+    )
+
+    claude_err = None
+    if config.ANTHROPIC_API_KEY:
+        ok, claude_err = await process_claude(
+            messages, chat_id, context, tools, model=claude_model
+        )
+        if ok:
+            return True
+        logger.warning("Tiered API: Claude failed (%s)", claude_err)
+    else:
+        claude_err = "no_key"
+
+    if config.OPENAI_API_KEY and _should_fallback_claude_to_openai(claude_err):
+        ok_o, oerr = await process_openai(
+            messages, chat_id, context, tools, model=openai_model
+        )
+        if ok_o:
+            logger.info("Tiered API: recovered via OpenAI fallback")
+            return True
+        logger.warning("Tiered API: OpenAI failed (%s)", oerr)
+
+    if config.GEMINI_API_KEY:
+        ok_g, gerr = await process_gemini(messages, chat_id, context, tools)
+        if ok_g:
+            logger.info("Tiered API: recovered via Gemini fallback")
+            return True
+        logger.warning("Tiered API: Gemini failed (%s)", gerr)
+
+    return False
+
+
 # ─── Cached / Pattern-Based Response System (Never-Die Last Resort) ──────────
 
 import subprocess as _cached_sp

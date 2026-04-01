@@ -1878,21 +1878,50 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         return healed
 
 
-async def _fallback_to_api_providers(user_message: str, chat_id: int, context) -> bool:
-    """Fallback: Route through Codex CLI (local OpenAI subscription, no API cost)."""
+async def _fallback_to_api_providers(
+    user_message: str, chat_id: int, context, *, image_data: str | None = None
+) -> bool:
+    """HTTP API path: tier routing (Haiku/Mini vs heavy stack) + Claude→OpenAI→Gemini; then Codex CLI."""
+    messages = [{"role": "user", "content": user_message}]
+    try:
+        from providers_router import execute_api_routed_turn
+
+        if config.ANTHROPIC_API_KEY or config.OPENAI_API_KEY or config.GEMINI_API_KEY:
+            logger.info("Chat %s: trying tier-routed API fallback", chat_id)
+            if await execute_api_routed_turn(
+                messages,
+                chat_id,
+                context,
+                user_message_hint=user_message,
+                image_data=image_data,
+            ):
+                _self_monitor.record_service_success("api_tiered")
+                return True
+            _self_monitor.record_service_failure("api_tiered", "all HTTP providers failed")
+    except ImportError:
+        logger.debug("execute_api_routed_turn unavailable")
+    except Exception as e:
+        logger.warning("Tier-routed API fallback error: %s", e)
+        _self_monitor.record_service_failure("api_tiered", str(e)[:200])
+
     try:
         from providers_router import model_router
-        if "codex_cli" in model_router.available_providers() and model_router._stats["codex_cli"].is_healthy:
-            logger.info(f"Chat {chat_id}: trying Codex CLI fallback (local subscription)")
-            success = await model_router._call_provider("codex_cli", user_message, chat_id, context)
+
+        if (
+            "codex_cli" in model_router.available_providers()
+            and model_router._stats["codex_cli"].is_healthy
+        ):
+            logger.info("Chat %s: trying Codex CLI fallback (local subscription)", chat_id)
+            success = await model_router._call_provider(
+                "codex_cli", user_message, chat_id, context
+            )
             if success:
                 model_router.record_success("codex_cli", 0)
                 return True
             model_router.record_failure("codex_cli")
-        return False
     except ImportError:
-        logger.info(f"Chat {chat_id}: Codex CLI fallback unavailable")
-        return False
+        logger.info("Chat %s: Codex CLI fallback unavailable", chat_id)
+    return False
 
 
 async def _fallback_to_web_ai(user_message: str, chat_id: int, context) -> bool:
@@ -2215,6 +2244,7 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs) ->
 
     Returns True if the message was actually processed, False if only queued.
     """
+    image_data = kwargs.get("image_data")
     auto_research.mark_user_active()  # Reset idle timer for auto-experiment
     _periodic_state_cleanup()  # Prune stale sessions/locks (rate-limited to once/hour)
 
@@ -2285,6 +2315,9 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs) ->
                         await _send_response(chat_id, f"▶ 任务 {idx+1}/{len(intents)}：{intent[:60]}...", context)
                     _update_chat_context(chat_id, intent)
                     success = await _process_with_claude_cli(intent, chat_id, context)
+                    if not success and getattr(config, "NEVER_DIE_MODE", True):
+                        if await _fallback_to_api_providers(intent, chat_id, context, image_data=image_data):
+                            success = True
                     if not success:
                         all_success = False
                         await _send_response(chat_id, f"⚠️ 任务{idx+1}失败，继续下一个", context)
@@ -2337,8 +2370,10 @@ async def process_message(user_message: str, chat_id: int, context, **kwargs) ->
 
             logger.warning(f"Chat {chat_id}: CLI failed, entering never-die fallback chain")
 
-            # Step 2: API providers (Gemini free, OpenAI if key set)
-            api_ok = await _fallback_to_api_providers(user_message, chat_id, context)
+            # Step 2: Tier-routed API (Claude→OpenAI→Gemini, async SDK + retries)
+            api_ok = await _fallback_to_api_providers(
+                user_message, chat_id, context, image_data=image_data
+            )
             if api_ok:
                 return True
 

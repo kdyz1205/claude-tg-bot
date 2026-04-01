@@ -578,15 +578,6 @@ def tg_gw_render_home_text(mode: str) -> str:
     )
 
 
-def tg_gw_render_positions_loading_text(mode: str) -> str:
-    return (
-        f"{_tg_gw_mode_banner_v2(mode)}\n\n"
-        "*📊 持仓*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{tg_gw_escape_v2('⏳ 正在获取链上与交易所数据，请稍候…')}"
-    )
-
-
 def _tg_gw_format_snapshot_v2(mode: str, snap: dict) -> str:
     e = tg_gw_escape_v2
     lines: list[str] = [

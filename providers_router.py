@@ -1,18 +1,12 @@
 """
-Multi-Model Provider Router — uses LOCAL CLI subscriptions only (zero API cost).
+Multi-model router: local CLI chain + optional HTTP API tier routing.
 
-Routes requests across local CLIs:
-- Claude CLI (Claude Pro/Max subscription — primary, best reasoning)
-- Codex CLI (OpenAI subscription — secondary, fast)
-- Web AI (browser automation fallback — free)
+Local (zero API $): Claude CLI → Codex CLI → Web AI — see `ModelRouter`.
 
-NO paid API calls. All models run through your existing subscriptions.
-
-Routing modes:
-- "auto": Claude CLI primary, Codex CLI secondary, Web AI fallback
-- "claude": force Claude CLI only
-- "codex": force Codex CLI only
-- "round_robin": alternate between Claude CLI and Codex CLI
+HTTP API tier (`execute_api_routed_turn`): when Anthropic/OpenAI keys are set,
+classifies each turn as FAST (cheap/fast models) vs HEAVY (strong reasoning /
+multimodal), then runs `providers.process_tiered_api_fallback` with transient
+retries and Claude → OpenAI → Gemini degradation.
 """
 
 from __future__ import annotations
@@ -23,11 +17,109 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import config
 
 log = logging.getLogger(__name__)
+
+
+class TaskTier(str, Enum):
+    """API compute tier for Anthropic/OpenAI model selection."""
+
+    FAST = "fast"
+    HEAVY = "heavy"
+
+
+# Signals for routing (Chinese + English). FAST = short judgments / extraction.
+_FAST_SIGNALS = (
+    "格式化", "提取", "抽取", "判断", "分类", "打标签", "转json", "parse", "regex",
+    "总结以下", "一句话", "只需", "简短", "yes or no", "true/false", "extract",
+    "format as", "bullet list", "列表", "关键词", "是否", "json",
+)
+_HEAVY_SIGNALS = (
+    "策略", "推演", "架构", "多模态", "回测", "实盘", "链上", "debug",
+    "analyze", "解释", "为什么", "对比", "设计", "实现", "重构", "优化",
+    "screenshot", "截图", "图片", "图像", "vision", "trade", "portfolio",
+)
+
+
+def classify_task_tier(
+    user_message: str,
+    *,
+    has_image: bool = False,
+    length_heavy_threshold: int = 900,
+) -> TaskTier:
+    """Route HIGH-frequency/light tasks to FAST tier; complex / vision to HEAVY."""
+    if has_image:
+        return TaskTier.HEAVY
+    t = (user_message or "").strip()
+    if len(t) >= length_heavy_threshold:
+        return TaskTier.HEAVY
+    low = t.lower()
+    if any(s.lower() in low for s in _HEAVY_SIGNALS):
+        return TaskTier.HEAVY
+    if any(s.lower() in low for s in _FAST_SIGNALS) and len(t) < 420:
+        return TaskTier.FAST
+    if len(t) > 360:
+        return TaskTier.HEAVY
+    return TaskTier.FAST
+
+
+def resolve_models_for_tier(tier: TaskTier) -> tuple[str, str]:
+    """Return (claude_model_id, openai_model_id) for the tier."""
+    if tier == TaskTier.FAST:
+        return config.TASK_TIER_FAST_CLAUDE, config.TASK_TIER_FAST_OPENAI
+    hc = config.TASK_TIER_HEAVY_CLAUDE or config.CLAUDE_MODEL
+    ho = config.TASK_TIER_HEAVY_OPENAI or config.OPENAI_MODEL
+    return hc, ho
+
+
+def _last_user_plain_text(messages: list | None) -> str:
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            for p in c:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    return (p.get("text") or "").strip()
+    return ""
+
+
+async def execute_api_routed_turn(
+    messages: list,
+    chat_id: int,
+    context: Any,
+    *,
+    user_message_hint: str = "",
+    image_data: str | None = None,
+) -> bool:
+    """Classify tier, pick Haiku/Mini vs Sonnet-class stack, run tiered API fallback."""
+    from providers import _select_tools, process_tiered_api_fallback
+
+    hint = (user_message_hint or _last_user_plain_text(messages)).strip()
+    tier = classify_task_tier(hint, has_image=bool(image_data))
+    claude_m, openai_m = resolve_models_for_tier(tier)
+    log.info(
+        "execute_api_routed_turn: tier=%s claude=%s openai=%s",
+        tier.value,
+        claude_m,
+        openai_m,
+    )
+    selected = _select_tools(hint)
+    return await process_tiered_api_fallback(
+        messages,
+        chat_id,
+        context,
+        selected_tools=selected,
+        image_data=image_data,
+        claude_model=claude_m,
+        openai_model=openai_m,
+    )
 
 
 @dataclass
