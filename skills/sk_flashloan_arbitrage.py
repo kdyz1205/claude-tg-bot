@@ -219,8 +219,8 @@ async def submit_flashbots_bundle(
     eth_sendBundle。需 FLASHBOTS_SIGNER_KEY（不含 0x 的 secp256k1 密钥，专用于签名请求，非 EOA）。
     signed_txs_hex: 已 RLP 编码的 0x 交易串列表。
     """
-    relay = relay_url or os.environ.get("FLASHBOTS_RELAY_URL", DEFAULT_FLASHBOTS_RELAY)
-    fb_key = flashbots_private_key or os.environ.get("FLASHBOTS_SIGNER_KEY")
+    relay = relay_url or os.getenv("FLASHBOTS_RELAY_URL", DEFAULT_FLASHBOTS_RELAY)
+    fb_key = flashbots_private_key or os.getenv("FLASHBOTS_SIGNER_KEY")
     if not fb_key:
         return {
             "ok": False,
@@ -364,7 +364,7 @@ async def run_skill(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
       executor / ... : 若提供则生成 calldata 预览
     """
     params = params or {}
-    rpc = params.get("rpc_url") or os.environ.get("ETH_RPC_URL") or os.environ.get("MAINNET_RPC_URL")
+    rpc = params.get("rpc_url") or os.getenv("ETH_RPC_URL") or os.getenv("MAINNET_RPC_URL")
     if not rpc:
         return {"ok": False, "error": "rpc_url or ETH_RPC_URL required"}
 

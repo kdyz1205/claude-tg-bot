@@ -49,6 +49,10 @@ from proactive_monitor import market_monitor
 import memory_engine
 import profit_tracker as _profit_tracker
 
+from tracker.session_store import SessionStore
+
+_ui_session_store = SessionStore()
+
 try:
     from onchain_tracker import whale_tracker as _whale_tracker
     from onchain_tracker import smart_tracker as _smart_tracker
@@ -2824,54 +2828,56 @@ async def _resolve_chain_token_labels(tokens: list) -> list:
     return list(await asyncio.gather(*[_one(t) for t in tokens[:8]]))
 
 
-async def _build_chain_dashboard() -> str:
-    """Build a professional on-chain Solana DEX trading dashboard."""
+async def _build_chain_dashboard(user_id: int | None = None) -> str:
+    """Build on-chain dashboard from portfolio snapshot (no RPC/OKX in this coroutine)."""
     now_ts = time.time()
-    cache_fresh = now_ts - _chain_cache["ts"] < _CHAIN_WALLET_CACHE_SEC
+    try:
+        from trading.portfolio_snapshot import get_snapshot as _portfolio_get_snapshot
 
-    # ── Fetch SOL price + wallet in parallel (cached) ──
-    sol_price = _chain_cache["sol_price"]
-    sol_chg = _chain_cache["sol_chg"]
-    sol_bal = _chain_cache["sol_bal"]
-    token_count = _chain_cache["token_count"]
+        ps = _portfolio_get_snapshot()
+    except Exception:
+        ps = {
+            "updated_at": 0.0,
+            "age_sec": 999.0,
+            "sol_price": 0.0,
+            "sol_chg_pct": 0.0,
+            "wallet": {},
+            "okx": {},
+            "dex": {},
+            "last_error": "",
+        }
 
-    if not cache_fresh:
-        async def _fetch_sol():
-            try:
-                import httpx
-                async with httpx.AsyncClient(timeout=2) as c:
-                    r = await c.get("https://www.okx.com/api/v5/market/ticker?instId=SOL-USDT")
-                    d = r.json().get("data", [{}])[0]
-                    p = float(d.get("last", 0))
-                    o = float(d.get("open24h", 0))
-                    return p, ((p - o) / o * 100) if o > 0 else 0
-            except Exception:
-                return _chain_cache["sol_price"], _chain_cache["sol_chg"]
+    uid = int(user_id) if user_id is not None else None
+    ui_mode = _ui_session_store.get_telegram_panel_mode(uid) if uid is not None else "paper"
 
-        async def _fetch_wallet():
-            b, tc, raw = 0.0, 0, []
-            if _live_available and _wallet and _wallet.wallet_exists():
-                try:
-                    b = await asyncio.wait_for(_wallet.get_sol_balance(), timeout=2.5) or 0
-                except Exception:
-                    b = _chain_cache["sol_bal"]
-                try:
-                    tks = await asyncio.wait_for(_wallet.get_token_balances(), timeout=5)
-                    if tks:
-                        raw = sorted(tks, key=lambda x: float(x.get("amount") or 0), reverse=True)[:12]
-                        tc = len(tks)
-                except Exception:
-                    tc = _chain_cache["token_count"]
-                    raw = _chain_cache.get("chain_tokens_raw") or []
-            return b, tc, raw
-
-        (sol_price, sol_chg), (sol_bal, token_count, chain_raw) = await asyncio.gather(
-            _fetch_sol(), _fetch_wallet()
+    if ps.get("updated_at"):
+        sol_price = float(ps.get("sol_price") or 0) or float(_chain_cache["sol_price"] or 0)
+        sol_chg = float(ps.get("sol_chg_pct") or 0)
+        w = ps.get("wallet") or {}
+        sol_bal = float(w.get("sol_bal") or 0)
+        token_count = int(w.get("token_count") or 0)
+        chain_display = list(w.get("tokens") or [])
+        _chain_cache["chain_tokens_display"] = chain_display
+        _chain_cache["chain_tokens_raw"] = []
+        _chain_cache.update(
+            sol_price=sol_price,
+            sol_chg=sol_chg,
+            sol_bal=sol_bal,
+            token_count=token_count,
+            ts=float(ps.get("updated_at") or now_ts),
         )
-        _chain_cache["chain_tokens_raw"] = chain_raw
-        _chain_cache["chain_tokens_display"] = await _resolve_chain_token_labels(chain_raw)
-        _chain_cache.update(sol_price=sol_price, sol_chg=sol_chg,
-                            sol_bal=sol_bal, token_count=token_count, ts=now_ts)
+        dex_positions = list((ps.get("dex") or {}).get("positions") or [])
+    else:
+        sol_price = float(_chain_cache.get("sol_price") or 0)
+        sol_chg = float(_chain_cache.get("sol_chg") or 0)
+        sol_bal = float(_chain_cache.get("sol_bal") or 0)
+        token_count = int(_chain_cache.get("token_count") or 0)
+        chain_display = list(_chain_cache.get("chain_tokens_display") or [])
+        dex_positions = (
+            list(_dex.get_open_positions())
+            if _dex_available and _dex
+            else []
+        )
 
     # ── Mode detection ──
     is_live = _live_available and _trade_scheduler_instance and _trade_scheduler_instance.running
@@ -2897,16 +2903,7 @@ async def _build_chain_dashboard() -> str:
     wallet_ok = _live_available and _wallet and _wallet.wallet_exists()
     pubkey = _wallet.get_public_key() or "?" if wallet_ok else ""
 
-    # ── DEX positions ──
-    dex_positions = []
-    if _dex_available and _dex:
-        try:
-            if not hasattr(_build_chain_dashboard, "_dex_ts") or now_ts - _build_chain_dashboard._dex_ts > 30:
-                await asyncio.wait_for(_dex.refresh_positions(), timeout=2)
-                _build_chain_dashboard._dex_ts = now_ts
-        except Exception:
-            pass
-        dex_positions = _dex.get_open_positions()
+    # ── DEX positions: already filled from snapshot (or local JSON fallback) ──
 
     # ── Evolution data ──
     evo_wr = 0.0
@@ -2956,7 +2953,57 @@ async def _build_chain_dashboard() -> str:
         L.append(f"{se} SOL ${sol_price:.2f} ({sol_chg:+.1f}%)  |  {mode_tag}")
     else:
         L.append(f"SOL $-- | {mode_tag}")
+    age_s = float(ps.get("age_sec", 0) or 0)
+    snap_note = f"{age_s:.0f}s前" if ps.get("updated_at") else "未就绪"
+    if ui_mode == "live":
+        L.append(f"🎚 界面: ✅[实盘] · 资产快照 {snap_note}")
+    else:
+        L.append(f"🎚 界面: ✅[模拟盘] · 资产快照 {snap_note}")
+    if not ps.get("updated_at"):
+        L.append("⏳ 后台正在首次同步链上/OKX/DEX…（约10–15s）")
+    err_ps = (ps.get("last_error") or "").strip()
+    if err_ps:
+        L.append(f"⚠ 同步: {err_ps[:120]}")
     L.append("")
+
+    if ui_mode == "live" and ps.get("updated_at"):
+        ox = ps.get("okx") or {}
+        dx = ps.get("dex") or {}
+        sp = float(ps.get("sol_price") or 0)
+        dex_usd = float(dx.get("total_value_sol") or 0) * sp if sp > 0 else 0.0
+        okx_eq = float(ox.get("total_equity_usd") or 0)
+        if ox.get("has_keys") or dex_positions:
+            L.append("━━ 全息持仓（实盘 · 读缓存）━━")
+            L.append(
+                f"💵 总资金(估): OKX ${okx_eq:,.2f} + DEX ~${dex_usd:,.0f} "
+                f"≈ ${okx_eq + dex_usd:,.0f}"
+            )
+        if ox.get("has_keys") and ox.get("ok"):
+            L.append(f"   OKX 可用 USDT: {float(ox.get('usdt_available') or 0):,.2f}")
+            for row in (ox.get("positions") or [])[:8]:
+                inst = row.get("instId") or "?"
+                nu = float(row.get("notionalUsd") or 0)
+                upl = float(row.get("upl") or 0)
+                L.append(f"   📈 {inst} 名义${nu:,.0f}  浮盈 {upl:+.2f} USDT")
+            L.append("")
+        elif ox.get("has_keys") and not ox.get("ok"):
+            L.append(f"   OKX: {str(ox.get('error') or '未取到余额')[:80]}")
+            L.append("")
+        if dex_positions:
+            L.append(
+                f"📌 DEX 持仓 {len(dex_positions)}  "
+                f"· 市值 ~{float(dx.get('total_value_sol') or 0):.3f} SOL"
+            )
+            for p in sorted(
+                dex_positions,
+                key=lambda x: float(x.get("amount_sol", 0) or 0),
+                reverse=True,
+            )[:6]:
+                sym = (p.get("symbol") or p.get("name") or "?")[:12]
+                amt = float(p.get("amount_sol", 0) or 0)
+                pnl = float(p.get("pnl_pct", 0) or 0)
+                L.append(f"   · {sym} 数量 {amt:.4f} SOL  盈亏 {pnl:+.1f}%")
+            L.append("")
 
     if is_live:
         st0 = sched_state.get("start_time") or 0
@@ -3152,7 +3199,7 @@ async def _build_chain_dashboard() -> str:
     return result
 
 
-def _build_chain_keyboard() -> InlineKeyboardMarkup:
+def _build_chain_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     """Build clean inline keyboard for on-chain dashboard."""
     is_live = _live_available and _trade_scheduler_instance and _trade_scheduler_instance.running
     paper_on = False
@@ -3165,7 +3212,22 @@ def _build_chain_keyboard() -> InlineKeyboardMarkup:
     live_text = "⏹ 停止实盘" if is_live else "🚀 启动实盘"
     paper_text = "📝 模拟⏸" if paper_on else "📝 模拟▶"
 
+    ui_mode = (
+        _ui_session_store.get_telegram_panel_mode(int(user_id))
+        if user_id is not None
+        else "paper"
+    )
+    demo_btn = InlineKeyboardButton(
+        "✅[模拟盘]" if ui_mode == "paper" else "[模拟盘]",
+        callback_data="ch_ui_mode_paper",
+    )
+    live_ui_btn = InlineKeyboardButton(
+        "✅[实盘]" if ui_mode == "live" else "[实盘]",
+        callback_data="ch_ui_mode_live",
+    )
+
     rows = [
+        [demo_btn, live_ui_btn],
         [
             InlineKeyboardButton("📌 持仓", callback_data="ch_positions"),
             InlineKeyboardButton("💰 买入", callback_data="ch_buy"),
@@ -3195,15 +3257,9 @@ async def chain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """On-chain (Solana DEX) trading dashboard. /chain"""
     if not update.message:
         return
-    now_ts = time.time()
-    if (
-        _chain_cache.get("dashboard_text")
-        and now_ts - _chain_cache.get("dashboard_ts", 0) < _CHAIN_DASHBOARD_CACHE_SEC
-    ):
-        text = _chain_cache["dashboard_text"]
-    else:
-        text = await _build_chain_dashboard()
-    kb = _build_chain_keyboard()
+    uid = update.effective_user.id if update.effective_user else None
+    text = await _build_chain_dashboard(uid)
+    kb = _build_chain_keyboard(uid)
     await _safe_reply(update.message, text, reply_markup=kb)
 
 
@@ -3216,10 +3272,31 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if not _is_authorized(query.from_user.id):
         await query.answer("⛔ Unauthorized", show_alert=True)
         return
-    await query.answer()
     data = query.data or ""
+    uid_cb = query.from_user.id
     chat_id = query.message.chat_id if query.message else query.from_user.id
     back_btn = InlineKeyboardButton("⬅️ 返回", callback_data="ch_back")
+
+    if data == "ch_ui_mode_paper":
+        await query.answer("界面：模拟盘", show_alert=False)
+        _ui_session_store.set_telegram_panel_mode(uid_cb, "paper")
+        text = await _build_chain_dashboard(uid_cb)
+        try:
+            await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
+        except Exception:
+            pass
+        return
+    if data == "ch_ui_mode_live":
+        await query.answer("界面：实盘（全息持仓）", show_alert=False)
+        _ui_session_store.set_telegram_panel_mode(uid_cb, "live")
+        text = await _build_chain_dashboard(uid_cb)
+        try:
+            await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
+        except Exception:
+            pass
+        return
+
+    await query.answer()
 
     # ── On-chain token info (wallet SPL, no DEX position required) ──
     if data.startswith("ch_tok_"):
@@ -3260,23 +3337,23 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── Refresh / Back ──
     if data == "ch_back":
-        # Back uses cached dashboard (instant)
-        if _chain_cache["dashboard_text"] and time.time() - _chain_cache["dashboard_ts"] < _CHAIN_DASHBOARD_CACHE_SEC:
-            text = _chain_cache["dashboard_text"]
-        else:
-            text = await _build_chain_dashboard()
+        text = await _build_chain_dashboard(uid_cb)
         try:
-            await query.edit_message_text(text, reply_markup=_build_chain_keyboard())
+            await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
         except Exception:
             pass
         return
 
     if data == "ch_refresh":
-        # Force fresh data
-        _chain_cache["ts"] = 0
-        text = await _build_chain_dashboard()
         try:
-            await query.edit_message_text(text, reply_markup=_build_chain_keyboard())
+            from trading.portfolio_snapshot import refresh_once as _pf_refresh
+
+            asyncio.create_task(_pf_refresh())
+        except Exception:
+            pass
+        text = await _build_chain_dashboard(uid_cb)
+        try:
+            await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
         except Exception:
             pass
         return
@@ -3342,6 +3419,14 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "ch_positions":
         all_pos = []
 
+        try:
+            from trading.portfolio_snapshot import get_snapshot as _pos_snap
+
+            sn = _pos_snap()
+        except Exception:
+            sn = {}
+        snap_ok = bool(sn.get("updated_at")) and float(sn.get("age_sec", 999)) < 60.0
+
         async def _tok_symbol(mint_addr: str) -> str:
             if not (_dex_available and _dex and mint_addr):
                 return mint_addr[:6] + "…"
@@ -3353,49 +3438,82 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
             return mint_addr[:6] + "…"
 
-        # 1) 链上钱包真实 SPL（与模拟仓分开显示）
-        if _live_available and _wallet and _wallet.wallet_exists():
-            try:
-                raw_tks = await asyncio.wait_for(_wallet.get_token_balances(), timeout=4)
-            except Exception:
-                raw_tks = []
-            if raw_tks:
-                mints = [t.get("mint", "") for t in raw_tks if t.get("mint")]
-                names = await asyncio.gather(*[_tok_symbol(m) for m in mints[:8]], return_exceptions=True)
-                for i, tk in enumerate(raw_tks[:8]):
-                    mint = tk.get("mint", "") or ""
-                    if not mint:
-                        continue
-                    _cache_address(mint)
-                    nm = names[i] if i < len(names) and not isinstance(names[i], Exception) else mint[:6]
-                    amt = float(tk.get("amount", 0) or 0)
+        if snap_ok:
+            w = sn.get("wallet") or {}
+            for t in (w.get("tokens") or [])[:14]:
+                mint = (t.get("mint") or "").strip()
+                if not mint:
+                    continue
+                _cache_address(mint)
+                label = (t.get("label") or mint[:6])[:12]
+                amt = float(t.get("amount") or 0)
+                all_pos.append({
+                    "sym": label[:8],
+                    "name": label,
+                    "pnl": 0.0,
+                    "sol": 0.0,
+                    "addr": mint,
+                    "mode": "链上",
+                    "is_chain": True,
+                    "tok_amt": amt,
+                })
+            if _dex_available and _dex:
+                for p in (sn.get("dex") or {}).get("positions") or []:
+                    a = p.get("address", "") or ""
+                    if a:
+                        _cache_address(a)
                     all_pos.append({
-                        "sym": (str(nm) if nm else "?")[:8],
-                        "name": str(nm) if nm else "?",
-                        "pnl": 0.0,
-                        "sol": 0.0,
-                        "addr": mint,
-                        "mode": "链上",
-                        "is_chain": True,
-                        "tok_amt": amt,
+                        "sym": (p.get("symbol") or "?")[:6],
+                        "name": p.get("name", ""),
+                        "pnl": p.get("pnl_pct", 0),
+                        "sol": p.get("amount_sol", 0),
+                        "addr": a,
+                        "mode": "DEX",
+                        "is_chain": False,
                     })
-                for tk in raw_tks[8:14]:
-                    mint = tk.get("mint", "") or ""
-                    if not mint:
-                        continue
-                    _cache_address(mint)
-                    short = f"{mint[:4]}…{mint[-4:]}"
-                    amt = float(tk.get("amount", 0) or 0)
-                    all_pos.append({
-                        "sym": short[:8],
-                        "name": short,
-                        "pnl": 0.0,
-                        "sol": 0.0,
-                        "addr": mint,
-                        "mode": "链上",
-                        "is_chain": True,
-                        "tok_amt": amt,
-                    })
+        else:
+            if _live_available and _wallet and _wallet.wallet_exists():
+                try:
+                    raw_tks = await asyncio.wait_for(_wallet.get_token_balances(), timeout=4)
+                except Exception:
+                    raw_tks = []
+                if raw_tks:
+                    mints = [t.get("mint", "") for t in raw_tks if t.get("mint")]
+                    names = await asyncio.gather(*[_tok_symbol(m) for m in mints[:8]], return_exceptions=True)
+                    for i, tk in enumerate(raw_tks[:8]):
+                        mint = tk.get("mint", "") or ""
+                        if not mint:
+                            continue
+                        _cache_address(mint)
+                        nm = names[i] if i < len(names) and not isinstance(names[i], Exception) else mint[:6]
+                        amt = float(tk.get("amount", 0) or 0)
+                        all_pos.append({
+                            "sym": (str(nm) if nm else "?")[:8],
+                            "name": str(nm) if nm else "?",
+                            "pnl": 0.0,
+                            "sol": 0.0,
+                            "addr": mint,
+                            "mode": "链上",
+                            "is_chain": True,
+                            "tok_amt": amt,
+                        })
+                    for tk in raw_tks[8:14]:
+                        mint = tk.get("mint", "") or ""
+                        if not mint:
+                            continue
+                        _cache_address(mint)
+                        short = f"{mint[:4]}…{mint[-4:]}"
+                        amt = float(tk.get("amount", 0) or 0)
+                        all_pos.append({
+                            "sym": short[:8],
+                            "name": short,
+                            "pnl": 0.0,
+                            "sol": 0.0,
+                            "addr": mint,
+                            "mode": "链上",
+                            "is_chain": True,
+                            "tok_amt": amt,
+                        })
 
         is_live_pos = _live_available and _trade_scheduler_instance and _trade_scheduler_instance.running
         if is_live_pos and _live_trader:
@@ -3417,7 +3535,7 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 pass
 
-        if _dex_available and _dex:
+        if (not snap_ok) and _dex_available and _dex:
             for p in _dex.get_open_positions():
                 a = p.get("address", "") or ""
                 if a:
@@ -6814,8 +6932,9 @@ async def _try_trading_intent(text: str, lower: str, chat_id: int, update, conte
 
     # ── Chain dashboard shortcut: "链上" / "onchain" / "dex" ──
     if lower in ("链上", "链上面板", "onchain", "dex", "dex面板", "sol交易"):
-        text_d = await _build_chain_dashboard()
-        kb = _build_chain_keyboard()
+        uix = update.effective_user.id if update.effective_user else None
+        text_d = await _build_chain_dashboard(uix)
+        kb = _build_chain_keyboard(uix)
         await _safe_reply(update.message, text_d, reply_markup=kb)
         return True
 
@@ -7773,6 +7892,17 @@ def main():
             logger.info("Bot commands registered with Telegram")
         except Exception as e:
             logger.error(f"Failed to set bot commands: {e}")
+
+        try:
+            from trading.portfolio_snapshot import refresh_once as _pf_once
+            from trading.portfolio_snapshot import run_background_loop as _pf_loop
+
+            await _pf_once()
+            _pf_task = asyncio.create_task(_pf_loop(10.0))
+            _track_task(application.bot_data, _pf_task)
+            logger.info("Portfolio snapshot background loop started (10s)")
+        except Exception as e:
+            logger.warning("Portfolio snapshot loop not started: %s", e)
 
         # Boot Vital Signs lifecycle tracking
         try:

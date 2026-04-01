@@ -25,8 +25,13 @@ USER_ID = os.getenv('AUTHORIZED_USER_ID')
 BASE = Path(__file__).parent
 QUEUE_FILE = BASE / "_evolution_queue.json"
 STATE_FILE = BASE / "_smart_evolver_state.json"
+STATE_BACKUP_FILE = BASE / "_smart_evolver_state.bak.json"
 LOG_FILE = BASE / "_smart_evolver.log"
 LOCK_FILE = BASE / "_smart_evolver.lock"
+
+MAX_LOOP_SANITY = 100_000
+MAX_TASK_INDEX_SANITY = 10_000
+MAX_TOTAL_RUNS_SANITY = 50_000
 
 # v3 新增文件
 METRICS_FILE = BASE / ".skill_metrics.json"
@@ -65,12 +70,7 @@ def tg(text):
 
 # ─── State ───────────────────────────────────────────────────────────────────
 
-def load_state():
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+def _default_state():
     return {
         "loop": 0,
         "task_index": 0,
@@ -85,9 +85,55 @@ def load_state():
     }
 
 
+def _sanitize_state(s: dict) -> dict:
+    if not isinstance(s, dict):
+        return _default_state()
+    out = dict(s)
+    lp = int(out.get("loop", 0))
+    if lp < 0 or lp > MAX_LOOP_SANITY:
+        log.warning("smart_evolver: loop out of range (%s) → clamped", lp)
+        lp = max(0, min(MAX_LOOP_SANITY, lp))
+    out["loop"] = lp
+    ti = int(out.get("task_index", 0))
+    if ti < 0 or ti > MAX_TASK_INDEX_SANITY:
+        log.warning("smart_evolver: task_index corrupt (%s) → 0", ti)
+        ti = 0
+    out["task_index"] = ti
+    tr = int(out.get("total_runs", 0))
+    if tr > MAX_TOTAL_RUNS_SANITY:
+        tr = MAX_TOTAL_RUNS_SANITY
+    out["total_runs"] = max(0, tr)
+    ttd = int(out.get("total_tasks_done", 0))
+    out["total_tasks_done"] = max(0, ttd)
+    cf = int(out.get("consecutive_failures", 0))
+    out["consecutive_failures"] = max(0, min(100, cf))
+    return out
+
+
+def load_state():
+    for path, label in (
+        (STATE_FILE, "primary"),
+        (STATE_BACKUP_FILE, "backup"),
+    ):
+        try:
+            if path.exists():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    return _sanitize_state(raw)
+        except Exception as e:
+            log.warning("load_state %s failed (%s): %s", label, path, e)
+    return _default_state()
+
+
 def save_state(s):
+    s = _sanitize_state(s)
     tmp = str(STATE_FILE) + ".tmp"
     try:
+        if STATE_FILE.exists():
+            try:
+                shutil.copy2(STATE_FILE, STATE_BACKUP_FILE)
+            except OSError as e:
+                log.debug("smart_evolver state backup skipped: %s", e)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(s, f, indent=2, ensure_ascii=False)
             f.flush()
@@ -216,11 +262,14 @@ def run_task(task, state):
             log.warning(f"Task {task_id} failed (exit {result.returncode})")
             return "failed", ""
 
-        # Parse response text
+        # Parse response text — require JSON envelope when stdout looks like JSON (anti-hallucination)
         response_text = ""
         try:
             data = json.loads(output)
-            response_text = str(data.get("result", ""))
+            if isinstance(data, dict):
+                response_text = str(data.get("result", "") or data.get("output", ""))
+            else:
+                response_text = str(data)
         except Exception:
             response_text = output
 
@@ -232,12 +281,8 @@ def run_task(task, state):
                 log.info(f"✅ Task {task_id} COMPLETED (detected: {marker})")
                 return "done", response_text
 
-        # Even without explicit marker, if we got a response, treat as done
-        if len(response_text) > 100:
-            log.info(f"Task {task_id} likely done (got {len(response_text)} char response)")
-            return "done", response_text
-
-        return "failed", ""
+        # Do not auto-pass long prose without a completion marker (prevents false "done" loops)
+        return "failed", response_text or output
 
     except subprocess.TimeoutExpired:
         log.warning(f"Task {task_id} timed out (10 min) — marking as failed")
@@ -917,6 +962,13 @@ def main():
     tasks_since_combination_check = 0  # Check skill combinations every 5 tasks
 
     while True:
+        if int(state.get("loop", 0)) >= MAX_LOOP_SANITY:
+            msg = f"⚠️ 进化循环已达安全上限 loop={MAX_LOOP_SANITY}，停止 smart_evolver"
+            log.error(msg)
+            tg(msg)
+            save_state(state)
+            break
+
         # Daily audit check (3am)
         if should_run_daily_audit(state):
             run_skill_audit(state)

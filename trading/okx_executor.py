@@ -37,7 +37,7 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 OKX_REST_BASE = "https://www.okx.com"
-OKX_DEMO_TRADING = os.environ.get("OKX_DEMO_TRADING", "false").lower() == "true"
+OKX_DEMO_TRADING = os.getenv("OKX_DEMO_TRADING", "false").lower() == "true"
 
 STATE_FILE = Path(__file__).resolve().parent.parent / "agent_state.json"
 
@@ -152,9 +152,9 @@ class OKXExecutor:
         api_secret: str = "",
         passphrase: str = "",
     ):
-        self.api_key = api_key or os.environ.get("OKX_API_KEY", "")
-        self.api_secret = api_secret or os.environ.get("OKX_SECRET", "")
-        self.passphrase = passphrase or os.environ.get("OKX_PASSPHRASE", "")
+        self.api_key = api_key or os.getenv("OKX_API_KEY", "")
+        self.api_secret = api_secret or os.getenv("OKX_SECRET", "")
+        self.passphrase = passphrase or os.getenv("OKX_PASSPHRASE", "")
         self.state = AgentState()
         self.risk = RiskLimits()
         self._price_cache: dict[str, float] = {}

@@ -163,3 +163,40 @@ class GitMerger:
         integration_branch = self.create_integration_branch()
         result = self.merge_branches(branches, integration_branch)
         return result
+
+    def commit_paths(
+        self,
+        paths: list[str | Path],
+        message: str,
+        *,
+        allow_empty: bool = False,
+    ) -> tuple[bool, str]:
+        """
+        Stage specific paths and create one commit. Does not push.
+        Returns (ok, status_message).
+        """
+        if not paths and not allow_empty:
+            return False, "No paths to commit"
+
+        for p in paths:
+            rp = self.repo_dir / Path(p)
+            if not rp.exists():
+                return False, f"Missing path: {rp}"
+            r = self._git("add", "--", str(rp.relative_to(self.repo_dir)), check=False)
+            if r.returncode != 0:
+                return False, f"git add failed: {r.stderr.strip()}"
+
+        r = self._git("diff", "--cached", "--quiet", check=False)
+        if r.returncode == 0 and not allow_empty:
+            return True, "Nothing to commit (clean index)"
+
+        r = self._git("commit", "-m", message, check=False)
+        if r.returncode != 0:
+            return False, f"git commit failed: {r.stderr.strip()}"
+        return True, "Committed"
+
+    def get_head_sha(self) -> str | None:
+        r = self._git("rev-parse", "HEAD", check=False)
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None

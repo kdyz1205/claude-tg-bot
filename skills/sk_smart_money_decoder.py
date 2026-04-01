@@ -261,10 +261,10 @@ async def _enrich_ethplorer(
 ) -> None:
     if report.chain_hint not in ("ethereum", "eth"):
         return
-    api_key = os.getenv("ETHPLORER_API_KEY", "freekey")
+    ethplorer_token = os.getenv("ETHPLORER_API_KEY", "freekey")
     url = f"{_ETHPLORER_BASE}/getTopTokenHolders/{report.token_address}"
     data = await _fetch_json(
-        session, url, "ethplorer", params={"apiKey": api_key, "limit": "20"}
+        session, url, "ethplorer", params={"apiKey": ethplorer_token, "limit": "20"}
     )
     if not data:
         report.degraded = True

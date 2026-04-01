@@ -24,9 +24,16 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # Shared HTTP policy: one client per scan avoids connection churn / RPC-style timeouts.
-_HTTP_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
-_HTTP_LIMITS = httpx.Limits(max_connections=32, max_keepalive_connections=16)
-_OKX_CONCURRENCY = asyncio.Semaphore(12)
+# Tight connect/read so slow nodes (e.g. meme-coin bursts) are abandoned — never block the loop.
+_HTTP_TIMEOUT = httpx.Timeout(10.0, connect=3.0, read=8.0, write=8.0)
+_HTTP_LIMITS = httpx.Limits(max_connections=24, max_keepalive_connections=12)
+# OKX public API: cap in-flight requests (high concurrent symbol lists = "RPC-like" stalls)
+_OKX_CONCURRENCY = asyncio.Semaphore(8)
+# CoinGecko: separate cap so mcap lookups do not steal all semaphore slots from candles
+_GECKO_CONCURRENCY = asyncio.Semaphore(4)
+
+# Hard ceiling per symbol: entire scan for one instId must finish or we drop it (no indefinite wait).
+_DEFAULT_PER_SYMBOL_DEADLINE_SEC = 14.0
 
 
 def _finite_non_negative(x: float) -> bool:
@@ -142,7 +149,8 @@ async def _fetch_mcap(client: httpx.AsyncClient, symbol: str) -> Optional[float]
 
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={gecko_id}&vs_currencies=usd&include_market_cap=true"
     try:
-        resp = await client.get(url)
+        async with _GECKO_CONCURRENCY:
+            resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
         mcap = data.get(gecko_id, {}).get("usd_market_cap")
@@ -398,15 +406,51 @@ async def _scan_one(client: httpx.AsyncClient, symbol: str, filters: dict) -> Op
         return None
 
 
+async def _scan_one_with_deadline(
+    client: httpx.AsyncClient,
+    symbol: str,
+    filters: dict,
+    deadline_sec: float,
+) -> Optional[dict]:
+    """Run _scan_one under asyncio.wait_for; timeout → drop symbol, no stall."""
+    try:
+        return await asyncio.wait_for(
+            _scan_one(client, symbol, filters),
+            timeout=deadline_sec,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "onchain_filter: dropped %s (per-symbol deadline %.1fs exceeded)",
+            symbol,
+            deadline_sec,
+        )
+        return None
+    except asyncio.CancelledError:
+        raise
+
+
 async def scan_filtered(
     symbols: list = None,
     filters: dict = None,
+    *,
+    per_symbol_deadline_sec: float | None = None,
 ) -> list:
-    """Run filter set on all symbols. Returns passing signals sorted by score desc."""
+    """Run filter set on all symbols. Returns passing signals sorted by score desc.
+
+    per_symbol_deadline_sec:
+        If set, each symbol scan is aborted after this many seconds (default from module constant).
+        Prevents one dead endpoint from wedging the event loop when scanning long meme lists.
+    """
     if symbols is None:
         symbols = DEFAULT_SYMBOLS
     if filters is None:
         filters = DEFAULT_FILTER.copy()
+
+    deadline = (
+        per_symbol_deadline_sec
+        if per_symbol_deadline_sec is not None
+        else _DEFAULT_PER_SYMBOL_DEADLINE_SEC
+    )
 
     # Batch to avoid rate limits (10 concurrent)
     results = []
@@ -417,7 +461,10 @@ async def scan_filtered(
     ) as client:
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
-            tasks = [_scan_one(client, sym, filters) for sym in batch]
+            tasks = [
+                _scan_one_with_deadline(client, sym, filters, deadline)
+                for sym in batch
+            ]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in batch_results:
                 if isinstance(r, dict):

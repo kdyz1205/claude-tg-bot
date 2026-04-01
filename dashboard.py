@@ -115,6 +115,14 @@ if _flask_available:
         sys_stats = _get_system_stats()
         evolution = _get_evolution_progress()
 
+        portfolio = {}
+        try:
+            from trading.portfolio_snapshot import get_snapshot as _pf_snap
+
+            portfolio = _pf_snap()
+        except Exception:
+            portfolio = {}
+
         return jsonify({
             "timestamp": datetime.now().isoformat(),
             "messages": {
@@ -127,6 +135,7 @@ if _flask_available:
             "system": sys_stats,
             "recent_messages": _get_recent_messages_safe(),
             "evolution": evolution,
+            "portfolio": portfolio,
         })
 
     _HTML = """<!DOCTYPE html>
@@ -211,6 +220,24 @@ if _flask_available:
     <div class="big" id="bot-state">—</div>
     <div class="sub" id="bot-sub">—</div>
   </div>
+  <div class="card">
+    <h2>Portfolio (cached)</h2>
+    <div class="big" id="pf-age">—</div>
+    <div class="sub" id="pf-total">OKX+DEX 参考 —</div>
+  </div>
+  <div class="card">
+    <h2>SOL / Wallet</h2>
+    <div class="big" id="pf-sol">—</div>
+    <div class="sub" id="pf-wallet">—</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Trading snapshot (后台轮询)</h2>
+  <table id="pf-table">
+    <thead><tr><th>来源</th><th>明细</th></tr></thead>
+    <tbody id="pf-body"></tbody>
+  </table>
 </div>
 
 <div class="section">
@@ -310,12 +337,41 @@ async function refresh() {
         <td>${msg.duration_ms}ms</td>
       </tr>`;
     });
+
+    const pf = d.portfolio || {};
+    const age = pf.age_sec != null ? Math.round(pf.age_sec) + 's' : '—';
+    document.getElementById('pf-age').textContent = age;
+    const sp = pf.sol_price || 0;
+    const okxEq = (pf.okx && pf.okx.total_equity_usd) || 0;
+    const dexV = (pf.dex && pf.dex.total_value_sol) || 0;
+    const dexUsd = sp > 0 ? dexV * sp : 0;
+    document.getElementById('pf-total').textContent = '≈ $' + (okxEq + dexUsd).toLocaleString(undefined, {maximumFractionDigits: 0});
+    document.getElementById('pf-sol').textContent = sp > 0 ? ('$' + sp.toFixed(2)) : '—';
+    const w = pf.wallet || {};
+    document.getElementById('pf-wallet').textContent = w.sol_bal != null ? (w.sol_bal + ' SOL · ' + (w.token_count || 0) + ' tok') : '—';
+
+    const pbody = document.getElementById('pf-body');
+    pbody.innerHTML = '';
+    const rows = [];
+    (pf.okx && pf.okx.positions || []).slice(0, 6).forEach(p => {
+      rows.push(['OKX', esc(p.instId || '') + '  $' + (p.notionalUsd || 0)]);
+    });
+    (pf.dex && pf.dex.positions || []).slice(0, 6).forEach(p => {
+      rows.push(['DEX', esc(p.symbol || '') + '  ' + (p.amount_sol || 0) + ' SOL']);
+    });
+    (pf.wallet && pf.wallet.tokens || []).slice(0, 6).forEach(t => {
+      rows.push(['链上', esc(t.label || '') + '  ' + t.amount]);
+    });
+    if (!rows.length) {
+      rows.push(['—', pf.last_error ? esc(String(pf.last_error).slice(0, 120)) : '等待后台同步…']);
+    }
+    rows.forEach(([a, b]) => { pbody.innerHTML += `<tr><td>${a}</td><td>${b}</td></tr>`; });
   } catch(e) {
     document.getElementById('ts').textContent = 'Error: ' + e.message;
   }
 }
 refresh();
-setInterval(refresh, 5000);
+setInterval(refresh, 2000);
 </script>
 </body>
 </html>"""
@@ -405,3 +461,219 @@ def get_stats_text() -> str:
     if len(result) > 4000:
         result = result[:4000] + "\n... (truncated)"
     return result
+
+
+# ── Telegram Gateway panel (text + keyboards for gateway/telegram_bot.py) ───
+
+try:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+except ImportError:  # pragma: no cover
+    InlineKeyboardButton = None  # type: ignore[misc, assignment]
+    InlineKeyboardMarkup = None  # type: ignore[misc, assignment]
+
+# Callback prefix — keep under 64 bytes per Telegram rule
+GW_CB = "gw"
+
+
+def tg_gw_mode_label(mode: str) -> str:
+    m = (mode or "paper").lower()
+    if m == "live":
+        return "🔴 真金实盘 (Live)"
+    return "🔵 模拟盘 (Paper)"
+
+
+def tg_gw_mode_banner(mode: str) -> str:
+    return f"**当前交易模式：** {tg_gw_mode_label(mode)}"
+
+
+def tg_gw_build_main_keyboard(mode: str):
+    """Main menu: mode row (always visible) + home navigation."""
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+    m = (mode or "paper").lower()
+    paper_mark = "✓ " if m == "paper" else ""
+    live_mark = "✓ " if m == "live" else ""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{paper_mark}🔵 模拟盘 (Paper)",
+                    callback_data=f"{GW_CB}:mode:paper",
+                ),
+                InlineKeyboardButton(
+                    f"{live_mark}🔴 真金实盘 (Live)",
+                    callback_data=f"{GW_CB}:mode:live",
+                ),
+            ],
+            [
+                InlineKeyboardButton("📊 持仓", callback_data=f"{GW_CB}:pos"),
+                InlineKeyboardButton("📈 策略", callback_data=f"{GW_CB}:strat"),
+            ],
+        ]
+    )
+
+
+def tg_gw_build_back_keyboard():
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ 返回主页", callback_data=f"{GW_CB}:home")]]
+    )
+
+
+def tg_gw_build_positions_keyboard():
+    """Positions screen: refresh + home."""
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 刷新数据", callback_data=f"{GW_CB}:pos"),
+            ],
+            [InlineKeyboardButton("⬅️ 返回主页", callback_data=f"{GW_CB}:home")],
+        ]
+    )
+
+
+def tg_gw_render_home_text(mode: str) -> str:
+    banner = tg_gw_mode_banner(mode)
+    m = (mode or "paper").lower()
+    hint = (
+        "模拟盘：展示与演练环境，链上/交易所只读或按你的本地配置；下单前请再确认。"
+        if m == "paper"
+        else "⚠️ 实盘：真实资金与真实成交。请谨慎操作。"
+    )
+    return (
+        f"{banner}\n\n"
+        "🏠 **交易面板 · 主页**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{hint}\n\n"
+        "请选择上方模式，或进入 **持仓** / **策略**。"
+    )
+
+
+def tg_gw_render_positions_loading_text(mode: str) -> str:
+    return (
+        f"{tg_gw_mode_banner(mode)}\n\n"
+        "📊 **持仓**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⏳ 正在获取链上与交易所数据，请稍候…"
+    )
+
+
+def _tg_gw_format_snapshot(mode: str, snap: dict) -> str:
+    lines = [
+        tg_gw_mode_banner(mode),
+        "",
+        "📊 **持仓概览**",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    age = snap.get("age_sec")
+    if age is not None:
+        lines.append(f"_数据延迟：约 {int(age)}s（后台刷新后更新）_")
+    lines.append("")
+
+    w = snap.get("wallet") or {}
+    if w.get("ok"):
+        lines.append("**链上钱包**")
+        lines.append(f"· 地址：`{w.get('pubkey_short', '?')}`")
+        lines.append(f"· SOL：`{w.get('sol_bal', 0):.4f}`")
+        lines.append(f"· Token 数：{w.get('token_count', 0)}")
+        for t in (w.get("tokens") or [])[:8]:
+            lines.append(f"  - {t.get('label', '?')}: {t.get('amount', 0):.6g}")
+        lines.append("")
+    elif w.get("error"):
+        lines.append(f"**链上钱包：** 读取失败（{w.get('error', '')[:120]}）")
+        lines.append("")
+    else:
+        lines.append("**链上钱包：** 未配置或不可用")
+        lines.append("")
+
+    ox = snap.get("okx") or {}
+    if ox.get("ok"):
+        lines.append("**OKX**")
+        lines.append(f"· 权益 USD：`{ox.get('total_equity_usd', 0):.2f}`")
+        lines.append(f"· 可用 USDT：`{ox.get('usdt_available', 0):.2f}`")
+        pos = ox.get("positions") or []
+        if pos:
+            lines.append("· 合约持仓：")
+            for p in pos[:10]:
+                lines.append(
+                    f"  - `{p.get('instId', '')}` pos={p.get('pos', 0)} "
+                    f"upl={p.get('upl', 0):.4f}"
+                )
+        lines.append("")
+    elif ox.get("has_keys") and ox.get("error"):
+        lines.append(f"**OKX：** {ox.get('error', '')[:200]}")
+        lines.append("")
+    elif not ox.get("has_keys"):
+        lines.append("**OKX：** 未配置 API 密钥")
+        lines.append("")
+
+    dex = snap.get("dex") or {}
+    dpos = dex.get("positions") or []
+    if dpos:
+        lines.append("**DEX 持仓**")
+        lines.append(
+            f"· 合计投入 SOL：`{dex.get('total_invested_sol', 0):.4f}` | "
+            f"估值 SOL：`{dex.get('total_value_sol', 0):.4f}`"
+        )
+        for p in dpos[:8]:
+            sym = (p.get("symbol") or "?")[:10]
+            lines.append(
+                f"  - {sym} | PnL {float(p.get('pnl_pct', 0) or 0):+.1f}% | "
+                f"{float(p.get('amount_sol', 0) or 0):.4f} SOL"
+            )
+        lines.append("")
+    elif dex.get("error"):
+        lines.append(f"**DEX：** {dex.get('error', '')[:200]}")
+        lines.append("")
+
+    sol_p = snap.get("sol_price") or 0
+    if sol_p:
+        chg = snap.get("sol_chg_pct") or 0
+        lines.append(f"**SOL 参考价：** ${sol_p:.4f} ({chg:+.2f}% 24h)")
+
+    err = snap.get("last_error") or ""
+    if err:
+        lines.append("")
+        lines.append(f"⚠️ _部分数据源：{err[:300]}_")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
+    return text
+
+
+def tg_gw_render_positions_text(mode: str, snap: dict | None) -> str:
+    if not snap:
+        return (
+            f"{tg_gw_mode_banner(mode)}\n\n"
+            "📊 **持仓**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "暂无快照数据。请点击 **刷新数据**。"
+        )
+    return _tg_gw_format_snapshot(mode, snap)
+
+
+def tg_gw_render_strategy_text(mode: str) -> str:
+    m = (mode or "paper").lower()
+    banner = tg_gw_mode_banner(mode)
+    if m == "paper":
+        body = (
+            "📈 **策略 · 模拟盘**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "· 建议：先在模拟盘完成信号验证与仓位规则演练。\n"
+            "· 与主机器人 `/panel` 中的 Paper 模块配合使用。\n"
+            "· 切换到实盘前请确认 API / 钱包权限与风控上限。"
+        )
+    else:
+        body = (
+            "📈 **策略 · 实盘**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "⚠️ **真实资金** — 任何自动或手动下单均可能产生盈亏。\n\n"
+            "· 确认 API Key 权限（只读 vs 交易）。\n"
+            "· 建议启用单笔上限、日亏损熔断。\n"
+            "· 详细执行逻辑见项目内 `trading/` 与 `live_trader` 配置。"
+        )
+    return f"{banner}\n\n{body}"

@@ -2690,6 +2690,39 @@ async def _run_claude_raw(
             pass
 
 
+async def _repair_trade_json_via_haiku(round_idx: int, bad_snippet: str) -> str:
+    """Re-prompt Haiku with one of 20 rotating JSON-only reminders (dispatcher.llm_filter)."""
+    from dispatcher.llm_filter import TRADE_JSON_REMINDERS
+
+    reminder = TRADE_JSON_REMINDERS[round_idx % len(TRADE_JSON_REMINDERS)]
+    prompt = (
+        f"{reminder}\n\n"
+        "先前输出无法通过交易 JSON 校验。请只输出一个对象，键为 action, pair, amount, price。\n\n"
+        f"{bad_snippet[:3800]}"
+    )
+    return (
+        await _run_claude_raw(
+            prompt=prompt,
+            model="claude-haiku-4-5-20251001",
+            timeout=40,
+        )
+    ).strip()
+
+
+async def sanitize_llm_trade_output_with_retries(raw_llm_text: str, max_retries: int = 3):
+    """Pydantic gate + up to ``max_retries`` Haiku repair rounds (no prose trade spam)."""
+    from dispatcher.llm_filter import sanitize_trade_directive_with_retries
+
+    text = (raw_llm_text or "").strip()
+    if not text:
+        return None
+    return await sanitize_trade_directive_with_retries(
+        text,
+        reask=lambda ri, prev: _repair_trade_json_via_haiku(ri, prev),
+        max_retries=max_retries,
+    )
+
+
 async def _forward_new_screenshots_direct(send_photo):
     """Forward screenshots for training (no chat_id context)."""
     if not send_photo or not os.path.isdir(_TG_SCREENSHOT_DIR):

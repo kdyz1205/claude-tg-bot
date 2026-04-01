@@ -144,7 +144,11 @@ class SessionStore:
         self.state_file = Path(state_file)
         self.sessions: dict[str, SessionState] = {}
         self._save_lock = __import__("threading").Lock()
+        self.telegram_prefs_file = self.state_file.parent / "telegram_panel_mode.json"
+        self._telegram_prefs: dict[str, str] = {}
+        self._telegram_prefs_lock = __import__("threading").Lock()
         self._load()
+        self._load_telegram_prefs()
 
     MAX_SESSIONS = 200  # Prevent unbounded memory growth
 
@@ -176,6 +180,19 @@ class SessionStore:
 
     def get(self, session_id: str) -> SessionState | None:
         return self.sessions.get(session_id)
+
+    def get_telegram_panel_mode(self, user_id: int) -> str:
+        """Telegram chain dashboard UI context: 'paper' | 'live'."""
+        with self._telegram_prefs_lock:
+            v = self._telegram_prefs.get(str(int(user_id)), "paper")
+        return v if v in ("paper", "live") else "paper"
+
+    def set_telegram_panel_mode(self, user_id: int, mode: str) -> None:
+        m = "live" if str(mode).lower() in ("live", "实盘", "real") else "paper"
+        with self._telegram_prefs_lock:
+            self._telegram_prefs[str(int(user_id))] = m
+        self._save_telegram_prefs()
+        logger.info("Telegram panel mode for user %s -> %s", user_id, m)
 
     def update(self, session: SessionState):
         """Update a session's state."""
@@ -274,3 +291,28 @@ class SessionStore:
             logger.info(f"Loaded {len(self.sessions)} sessions from disk")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning(f"Failed to load sessions: {e}")
+
+    def _save_telegram_prefs(self):
+        with self._telegram_prefs_lock:
+            blob = dict(self._telegram_prefs)
+        try:
+            self.telegram_prefs_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.telegram_prefs_file.with_suffix(".tmp")
+            with open(str(tmp), "w", encoding="utf-8") as f:
+                json.dump(blob, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(self.telegram_prefs_file))
+        except OSError as e:
+            logger.error("Failed to save telegram panel prefs: %s", e)
+
+    def _load_telegram_prefs(self):
+        if not self.telegram_prefs_file.exists():
+            return
+        try:
+            data = json.loads(self.telegram_prefs_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                with self._telegram_prefs_lock:
+                    self._telegram_prefs = {str(k): str(v) for k, v in data.items()}
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning("Failed to load telegram panel prefs: %s", e)

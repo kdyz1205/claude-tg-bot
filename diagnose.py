@@ -86,6 +86,22 @@ def run_cli(claude_cmd, message, timeout=60):
         return {"returncode": -1, "stdout": "", "stderr": str(e)}
 
 
+def run_meta_qa_snapshot(bot_dir: Path) -> list[str]:
+    """AST policy scan summary for Meta-QA / chaos readiness (no side effects on network)."""
+    lines: list[str] = []
+    try:
+        sys.path.insert(0, str(bot_dir))
+        from pipeline.security_ast import scan_strategy_tree
+
+        r = scan_strategy_tree(bot_dir)
+        lines.append(f"Meta-QA AST: scanned={len(r.scanned)} violations={len(r.violations)}")
+        for v in r.violations[:12]:
+            lines.append(f"  • {v.path}:L{v.line} [{v.rule}] {v.detail[:72]}")
+    except Exception as exc:
+        lines.append(f"Meta-QA AST: error — {exc}")
+    return lines
+
+
 def main():
     print("=== DIAGNOSE ===")
 
@@ -171,6 +187,9 @@ def main():
     report.append(f"Claude CLI: {claude_cmd}")
     if not claude_cmd:
         report.append("  CLAUDE CLI NOT FOUND!")
+        report.append("")
+        report.append("=== META-QA (AST policy snapshot) ===")
+        report.extend(run_meta_qa_snapshot(bot_dir))
         tg_send(token, chat_id, "\n".join(report))
         return
 
@@ -180,6 +199,10 @@ def main():
         report.append(f"Claude version: {r.stdout.strip()}")
     except Exception as e:
         report.append(f"Claude version: error - {e}")
+
+    report.append("")
+    report.append("=== META-QA (AST policy snapshot) ===")
+    report.extend(run_meta_qa_snapshot(bot_dir))
 
     report.append("")
 

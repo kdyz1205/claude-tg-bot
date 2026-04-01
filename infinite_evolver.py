@@ -22,8 +22,14 @@ TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 USER_ID = os.getenv('AUTHORIZED_USER_ID')
 BASE = Path(__file__).parent
 STATE_FILE = BASE / "_infinite_evolver_state.json"
+STATE_BACKUP_FILE = BASE / "_infinite_evolver_state.bak.json"
 LOG_FILE = BASE / "_infinite_evolver.log"
 LOCK_FILE = BASE / "_infinite_evolver.lock"
+
+# Anti runaway: caps to avoid state / counter corruption loops
+MAX_TOTAL_RUNS_SANITY = 50_000
+MAX_CONSECUTIVE_SKIPS_SANITY = 500
+MAX_TASK_INDEX_SANITY = 10_000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -222,12 +228,7 @@ def tg(text):
         log.warning(f"TG失败: {e}")
 
 
-def load_state():
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, IOError, OSError):
-            pass
+def _default_state():
     return {
         "phase": 2,
         "task_index": 0,
@@ -240,10 +241,67 @@ def load_state():
     }
 
 
+def _sanitize_state(state: dict) -> dict:
+    """Clamp numeric fields to sane ranges (gene-collapse / corruption guard)."""
+    if not isinstance(state, dict):
+        return _default_state()
+    out = dict(state)
+    phase = int(out.get("phase", 2))
+    out["phase"] = max(2, min(100, phase))
+    ti = int(out.get("task_index", 0))
+    if ti < 0 or ti > MAX_TASK_INDEX_SANITY:
+        log.warning("State rollback: task_index out of range (%s) → 0", ti)
+        ti = 0
+    out["task_index"] = ti
+    tr = int(out.get("total_runs", 0))
+    if tr < 0:
+        tr = 0
+    if tr > MAX_TOTAL_RUNS_SANITY:
+        log.warning("State clamp: total_runs %s → capped", tr)
+        tr = min(tr, MAX_TOTAL_RUNS_SANITY)
+    out["total_runs"] = tr
+    cf = int(out.get("consecutive_failures", 0))
+    out["consecutive_failures"] = max(0, min(100, cf))
+    ct = out.get("completed_tasks", [])
+    if not isinstance(ct, list):
+        ct = []
+    out["completed_tasks"] = ct[-200:]
+    ft = out.get("failed_tasks", [])
+    if not isinstance(ft, list):
+        ft = []
+    out["failed_tasks"] = ft[-200:]
+    return out
+
+
+def load_state():
+    def _read(path):
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return None
+
+    for path, label in (
+        (STATE_FILE, "primary"),
+        (STATE_BACKUP_FILE, "backup"),
+    ):
+        try:
+            raw = _read(path)
+            if isinstance(raw, dict):
+                return _sanitize_state(raw)
+        except (json.JSONDecodeError, IOError, OSError) as e:
+            log.warning("load_state %s unreadable (%s): %s", label, path, e)
+    return _default_state()
+
+
 def save_state(state):
+    state = _sanitize_state(state)
     state["last_update"] = datetime.now().isoformat()
     tmp = str(STATE_FILE) + ".tmp"
     try:
+        if STATE_FILE.exists():
+            try:
+                shutil.copy2(STATE_FILE, STATE_BACKUP_FILE)
+            except OSError as e:
+                log.debug("State backup copy skipped: %s", e)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
             f.flush()
@@ -455,6 +513,15 @@ def main():
             # 已完成的跳过
             if task_id in state.get("completed_tasks", []):
                 consecutive_skips += 1
+                if consecutive_skips >= MAX_CONSECUTIVE_SKIPS_SANITY:
+                    log.error(
+                        "⚠️ Excessive consecutive skips (%s) — rolling back completed_tasks",
+                        consecutive_skips,
+                    )
+                    state["completed_tasks"] = []
+                    consecutive_skips = 0
+                    save_state(state)
+                    continue
                 if consecutive_skips >= len(current_tasks):
                     # ALL tasks skipped = ID collision bug, force reset
                     log.error(f"⚠️ All {len(current_tasks)} tasks skipped (ID collision). Resetting completed_tasks.")
@@ -554,6 +621,127 @@ _SHARPE_THRESHOLD = 1.5       # minimum annualised Sharpe to promote a strategy
 _BACKTEST_TIMEOUT = 300       # seconds; subprocess timeout for backtest script
 _SKILL_LIB_INDEX = BASE / ".skill_library" / "index.json"
 _SKILL_LIB_SKILLS = BASE / ".skill_library" / "skills"
+
+# ── Gene pool / rollback (ties into _evolve_state.json telemetry) ───────────
+_GENETICS_FILE = BASE / "_evolve_genetics.json"
+_EVOLVE_STATE_FILE = BASE / "_evolve_state.json"
+_SHARPE_HISTORY_CAP = 80
+_GENE_FLOOR_RATIO = 0.5       # reject new gen if sharpe < 50% of historical mean (when mean > 0)
+
+
+def _load_genetics() -> dict:
+    default: dict = {"sharpe_history": [], "last_good_params": None}
+    if not _GENETICS_FILE.exists():
+        return default
+    try:
+        d = json.loads(_GENETICS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            return default
+        d.setdefault("sharpe_history", [])
+        d.setdefault("last_good_params", None)
+        return d
+    except Exception as e:
+        log.warning("genetics load failed: %s", e)
+        return default
+
+
+def _save_genetics(d: dict) -> None:
+    tmp = str(_GENETICS_FILE) + ".tmp"
+    try:
+        out = dict(d)
+        hist = [float(x) for x in (out.get("sharpe_history") or [])][-_SHARPE_HISTORY_CAP:]
+        out["sharpe_history"] = hist
+        out["updated_at"] = datetime.now().isoformat()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(_GENETICS_FILE))
+    except Exception as e:
+        log.warning("genetics save failed: %s", e)
+
+
+def _historical_mean_sharpe(g: dict) -> float | None:
+    h = g.get("sharpe_history") or []
+    if not h:
+        return None
+    return sum(h) / len(h)
+
+
+def _gene_gate_allows(sharpe: float, win_rate: float | None, genetics: dict) -> tuple[bool, str]:
+    """Block garbage sand-box runs (negative win-rate hallucinations, collapsing Sharpe)."""
+    if sharpe != sharpe or abs(sharpe) == float("inf"):
+        return False, "non-finite sharpe"
+    if win_rate is not None and win_rate < 0:
+        return False, "negative win_rate"
+    mu = _historical_mean_sharpe(genetics)
+    if mu is not None and mu > 0 and sharpe < _GENE_FLOOR_RATIO * mu:
+        return False, f"sharpe {sharpe:.3f} < {int(_GENE_FLOOR_RATIO * 100)}% of hist_avg {mu:.3f}"
+    return True, "ok"
+
+
+def _touch_evolve_state_gene_event(event: str, detail: str = "") -> None:
+    """Merge gene-rollback telemetry into _evolve_state.json (non-destructive)."""
+    try:
+        d: dict = {}
+        if _EVOLVE_STATE_FILE.exists():
+            d = json.loads(_EVOLVE_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            d = {}
+        d["last_gene_event"] = event[:120]
+        d["last_gene_detail"] = detail[:400]
+        d["last_gene_ts"] = datetime.now().isoformat()
+        tmp = str(_EVOLVE_STATE_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(_EVOLVE_STATE_FILE))
+    except Exception as e:
+        log.debug("touch _evolve_state.json: %s", e)
+
+
+def _apply_strategy_params_to_agent_state(params: dict) -> bool:
+    """Merge V6 strategy_params into agent_state.json (okx_executor.STATE_FILE)."""
+    try:
+        import copy
+
+        from trading.okx_executor import STATE_FILE
+
+        data: dict = {}
+        if STATE_FILE.exists():
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+        sp = data.get("strategy_params")
+        if not isinstance(sp, dict):
+            sp = {}
+        sp.update(copy.deepcopy(params))
+        data["strategy_params"] = sp
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(STATE_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(STATE_FILE))
+        return True
+    except Exception as e:
+        log.warning("merge strategy_params → agent_state failed: %s", e)
+        return False
+
+
+def _rollback_last_good_genes(genetics: dict) -> bool:
+    """Restore last_good_params onto agent_state.json; no-op if unknown."""
+    last = genetics.get("last_good_params")
+    if not last or not isinstance(last, dict):
+        log.warning("gene rollback: no last_good_params on disk")
+        return False
+    log.error("🧬 Gene rollback: restoring last_good_params → agent_state.json")
+    ok = _apply_strategy_params_to_agent_state(last)
+    if ok:
+        _touch_evolve_state_gene_event("rollback_last_good", "restored strategy_params")
+    return ok
 
 
 def _run_subprocess_backtest(
@@ -800,8 +988,14 @@ class InfiniteEvolver:
             log.warning("V6 backtest failed: %s", e)
             return
 
-        sharpe = result.get("sharpe", -999)
+        sharpe = float(result.get("sharpe", -999))
         viable = result.get("viable", False)
+        wr = result.get("win_rate")
+        try:
+            win_rate_f = float(wr) if wr is not None else None
+        except (TypeError, ValueError):
+            win_rate_f = None
+
         log.info(
             "V6 mutation result: sharpe=%.3f return=%.2f%% dd=%.2f%% trades=%d viable=%s",
             sharpe, result.get("total_return_pct", 0),
@@ -809,25 +1003,46 @@ class InfiniteEvolver:
             viable,
         )
 
-        if viable:
-            skill_id = f"sk_v6_mutant_{int(time.time())}"
-            title = f"V6 Mutant: {', '.join(f'{k}={mutant[k]}' for k in to_mutate[:3])}"
-            promoted = await _asyncio.to_thread(
-                _promote_skill, skill_id, title[:80],
-                str(BASE / "trading" / "strategy_brain.py"), result,
+        if not viable or sharpe < _SHARPE_THRESHOLD:
+            return
+
+        genetics = _load_genetics()
+        ok_gene, gene_reason = _gene_gate_allows(sharpe, win_rate_f, genetics)
+        if not ok_gene:
+            log.error("🧬 V6 mutant REJECTED (gene gate): %s", gene_reason)
+            _rollback_last_good_genes(genetics)
+            tg(f"🧬 基因回滚: {gene_reason}\n已尝试恢复上一代 strategy_params。")
+            _touch_evolve_state_gene_event("v6_rejected_gene_gate", gene_reason)
+            return
+
+        skill_id = f"sk_v6_mutant_{int(time.time())}"
+        title = f"V6 Mutant: {', '.join(f'{k}={mutant[k]}' for k in to_mutate[:3])}"
+        promoted = await _asyncio.to_thread(
+            _promote_skill, skill_id, title[:80],
+            str(BASE / "trading" / "strategy_brain.py"), result,
+        )
+        if promoted:
+            import copy
+
+            hist = list(genetics.get("sharpe_history") or [])
+            hist.append(sharpe)
+            genetics["sharpe_history"] = hist[-_SHARPE_HISTORY_CAP:]
+            genetics["last_good_params"] = copy.deepcopy(mutant)
+            _save_genetics(genetics)
+            _apply_strategy_params_to_agent_state(mutant)
+            _touch_evolve_state_gene_event("v6_promoted", f"sharpe={sharpe:.3f}")
+
+            msg = (
+                f"✅ V6 Mutant Promoted: `{skill_id}`\n"
+                f"  Sharpe={sharpe:.2f} | Return={result.get('total_return_pct',0):.1f}%\n"
+                f"  Params: {', '.join(f'{k}={mutant[k]}' for k in to_mutate)}"
             )
-            if promoted:
-                msg = (
-                    f"✅ V6 Mutant Promoted: `{skill_id}`\n"
-                    f"  Sharpe={sharpe:.2f} | Return={result.get('total_return_pct',0):.1f}%\n"
-                    f"  Params: {', '.join(f'{k}={mutant[k]}' for k in to_mutate)}"
-                )
-                log.info(msg)
-                if self._send:
-                    try:
-                        await self._send(msg)
-                    except Exception:
-                        pass
+            log.info(msg)
+            if self._send:
+                try:
+                    await self._send(msg)
+                except Exception:
+                    pass
 
     async def _sweep_codegen(self) -> None:
         """Classic codegen hypothesis pipeline."""
@@ -879,10 +1094,33 @@ class InfiniteEvolver:
                 pass
             return
 
+        genetics = _load_genetics()
+        wr2 = backtest.get("win_rate")
+        try:
+            wrf = float(wr2) if wr2 is not None else None
+        except (TypeError, ValueError):
+            wrf = None
+        ok_gene, gene_reason = _gene_gate_allows(float(sharpe), wrf, genetics)
+        if not ok_gene:
+            log.error("InfiniteEvolver: codegen REJECTED (gene gate): %s", gene_reason)
+            _rollback_last_good_genes(genetics)
+            tg(f"🧬 代码策略基因回滚: {gene_reason}")
+            _touch_evolve_state_gene_event("codegen_rejected_gene_gate", gene_reason)
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
+            return
+
         promoted = await _asyncio.to_thread(
             _promote_skill, skill_id, hypothesis[:80], script_path, backtest
         )
         if promoted:
+            hist = list(genetics.get("sharpe_history") or [])
+            hist.append(float(sharpe))
+            genetics["sharpe_history"] = hist[-_SHARPE_HISTORY_CAP:]
+            _save_genetics(genetics)
+            _touch_evolve_state_gene_event("codegen_promoted", f"sharpe={sharpe:.3f}")
             msg = (
                 f"✅ 策略晋升: `{skill_id}`\n"
                 f"  Sharpe={sharpe:.2f} | Return={backtest.get('total_return_pct',0):.1f}%"

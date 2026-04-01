@@ -339,7 +339,17 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
 
             raw = signal_data["llm_trade_directive_json"]
             st = raw if isinstance(raw, str) else _json.dumps(raw)
-            safe = await sanitize_llm_trade_output(st)
+            safe = None
+            try:
+                import claude_agent as _ca
+
+                _fn = getattr(_ca, "sanitize_llm_trade_output_with_retries", None)
+                if _fn is not None:
+                    safe = await _fn(st, max_retries=3)
+            except Exception as ex:
+                logger.debug("llm trade JSON retries skipped: %s", ex)
+            if safe is None:
+                safe = await sanitize_llm_trade_output(st)
             if safe is None:
                 logger.warning("Trade blocked: LLM directive failed hallucination filter")
                 return None

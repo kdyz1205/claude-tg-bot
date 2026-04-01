@@ -366,7 +366,7 @@ Recent arXiv evidence (last {RECENT_HOURS}h window after client filter):
         try:
             import anthropic
 
-            client = anthropic.AsyncAnthropic(api_key=ak, timeout=120.0)
+            client = anthropic.AsyncAnthropic(**{"api_key": ak, "timeout": 120.0})
             msg = await client.messages.create(
                 model=os.getenv("POLY_ORACLE_ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
                 max_tokens=512,
@@ -386,7 +386,7 @@ Recent arXiv evidence (last {RECENT_HOURS}h window after client filter):
             try:
                 from openai import AsyncOpenAI
 
-                oai = AsyncOpenAI(api_key=ok, timeout=120.0)
+                oai = AsyncOpenAI(**{"api_key": ok, "timeout": 120.0})
                 resp = await oai.chat.completions.create(
                     model=os.getenv("POLY_ORACLE_OPENAI_MODEL", "gpt-4o-mini"),
                     max_tokens=512,

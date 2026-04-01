@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -234,6 +235,115 @@ async def _generate_syntax_fix(file_path: str, error_msg: str) -> Optional[str]:
     except Exception as exc:
         logger.warning("self_repair: _generate_syntax_fix error: %s", exc)
         return None
+
+
+async def generate_traceback_fix(
+    file_path: str,
+    traceback_text: str,
+    extra_context: str = "",
+) -> Optional[str]:
+    """
+    Ask Claude CLI for a full-file fix given a runtime traceback.
+    Returns corrected source or None.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except Exception:
+        return None
+
+    prompt = (
+        f"A Python module raised an exception in production tests.\n"
+        f"Traceback:\n{traceback_text[:8000]}\n\n"
+        f"Additional context:\n{extra_context[:2000]}\n\n"
+        f"Current file ({file_path}):\n```python\n{source[:6000]}\n```\n\n"
+        f"Return ONLY the complete corrected Python source for this file. "
+        f"No markdown fences, no explanation."
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(CLAUDE_CMD),
+            "-p", prompt,
+            "--output-format", "text",
+            "--dangerously-skip-permissions",
+            "--model", "claude-haiku-4-5-20251001",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(BOT_DIR),
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+        if proc.returncode != 0:
+            return None
+        text = stdout.decode("utf-8", errors="replace").strip()
+        for prefix in ("```python", "```"):
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+        if text.endswith("```"):
+            text = text[:-3].rstrip()
+        return text or None
+    except Exception as exc:
+        logger.warning("self_repair: generate_traceback_fix error: %s", exc)
+        return None
+
+
+def verify_python_file_subprocess(abs_path: str, timeout: float = 60.0) -> tuple[bool, str]:
+    """Run py_compile on *abs_path* in a subprocess (sandbox-style check)."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "py_compile", abs_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(BOT_DIR),
+        )
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "py_compile failed").strip()
+            return False, msg[:800]
+        return True, ""
+    except subprocess.TimeoutExpired:
+        return False, "py_compile subprocess timeout"
+    except Exception as exc:
+        return False, str(exc)[:500]
+
+
+async def apply_traceback_repair(
+    file_path: str,
+    traceback_text: str,
+    *,
+    notify_fn=None,
+    extra_context: str = "",
+) -> bool:
+    """
+    Generate fix from traceback, verify in subprocess, then apply via _apply_syntax_fix.
+    """
+    fixed = await generate_traceback_fix(file_path, traceback_text, extra_context)
+    if not fixed:
+        return False
+    tmp_dir = tempfile.mkdtemp(prefix="self_repair_tb_")
+    tmp_py = Path(tmp_dir) / Path(file_path).name
+    ok2, vmsg2 = False, ""
+    try:
+        tmp_py.write_text(fixed, encoding="utf-8")
+        ok2, vmsg2 = verify_python_file_subprocess(str(tmp_py))
+    finally:
+        try:
+            tmp_py.unlink(missing_ok=True)
+            Path(tmp_dir).rmdir()
+        except Exception:
+            pass
+    if not ok2:
+        logger.warning("self_repair: traceback fix failed verify: %s", vmsg2)
+        if notify_fn:
+            await notify_fn(f"⚠️ 补丁未通过沙盒编译: `{Path(file_path).name}`\n{vmsg2[:200]}")
+        return False
+    err_info = {
+        "file": Path(file_path).name,
+        "path": file_path,
+        "error_type": "TracebackRepair",
+        "error_msg": traceback_text[:300],
+        "line": 0,
+    }
+    return await _apply_syntax_fix(file_path, fixed, err_info, notify_fn)
 
 
 async def _apply_syntax_fix(

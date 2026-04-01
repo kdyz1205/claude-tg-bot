@@ -474,13 +474,15 @@ class OnchainTracker:
                     except Exception:
                         pass
 
-    async def _scan_address(self, address: str, meta: dict, prices: dict) -> list:
+    async def _scan_address(
+        self, client: httpx.AsyncClient, address: str, meta: dict, prices: dict
+    ) -> list:
         network = meta.get("network", "eth")
         label = meta.get("label", address[:8])
         found = []
 
         if network == "sol":
-            for tx in await _solscan_txs(address):
+            for tx in await _solscan_txs(client, address):
                 c = _classify_sol(tx, address, prices)
                 if c:
                     found.append(self._build_signal(c, address, label, "sol"))
@@ -491,13 +493,13 @@ class OnchainTracker:
             base_url = eth_url if network == "eth" else bsc_url
             api_key = self._etherscan_key if network == "eth" else self._bscscan_key
 
-            for tx in await _etherscan_txlist(address, api_key, base_url):
+            for tx in await _etherscan_txlist(client, address, api_key, base_url):
                 c = _classify_native(tx, address, prices, network)
                 if c:
                     found.append(self._build_signal(c, address, label, network))
 
             await asyncio.sleep(0.5)
-            for tx in await _etherscan_tokentx(address, api_key, base_url):
+            for tx in await _etherscan_tokentx(client, address, api_key, base_url):
                 c = _classify_erc20(tx, address)
                 if c:
                     found.append(self._build_signal(c, address, label, network))
@@ -656,15 +658,16 @@ DEFAULT_SMART_WALLETS: dict = {
 }
 
 
-async def _dexscreener_token_info(contract_address: str) -> dict:
+async def _dexscreener_token_info(
+    client: httpx.AsyncClient, contract_address: str
+) -> dict:
     """Fetch token price and info from Dexscreener (free, no key)."""
     if not contract_address:
         return {}
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            data = resp.json()
+        resp = await client.get(url)
+        data = resp.json()
         pairs = data.get("pairs") or []
         if pairs:
             p = pairs[0]
@@ -681,25 +684,26 @@ async def _dexscreener_token_info(contract_address: str) -> dict:
     return {}
 
 
-async def _solscan_spl_transfers(address: str, lookback: int) -> list:
+async def _solscan_spl_transfers(
+    client: httpx.AsyncClient, address: str, lookback: int
+) -> list:
     """Fetch recent SPL token transfers for a Solana address."""
     try:
         url = "https://public-api.solscan.io/account/splTransfers"
         params = {"account": address, "limit": 25, "offset": 0}
         headers = {"accept": "application/json"}
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, params=params, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = (
-                    data.get("data", []) if isinstance(data, dict)
-                    else (data if isinstance(data, list) else [])
-                )
-                min_ts = int(time.time()) - lookback
-                return [
-                    tx for tx in items
-                    if isinstance(tx, dict) and tx.get("blockTime", 0) >= min_ts
-                ]
+        resp = await client.get(url, params=params, headers=headers)
+        if resp.status_code == 200:
+            data = resp.json()
+            items = (
+                data.get("data", []) if isinstance(data, dict)
+                else (data if isinstance(data, list) else [])
+            )
+            min_ts = int(time.time()) - lookback
+            return [
+                tx for tx in items
+                if isinstance(tx, dict) and tx.get("blockTime", 0) >= min_ts
+            ]
     except Exception as e:
         logger.debug("solscan_spl %s: %s", address[:8], e)
     return []
@@ -853,33 +857,38 @@ class SmartMoneyTracker:
         """Check signals that are >24h old and record price performance."""
         now = time.time()
         updated = False
-        for rec in self._perf_records:
-            if rec.get("result") is not None:
-                continue
-            if now < rec.get("check_at", now + 1):
-                continue
-            contract = rec.get("contract_address", "")
-            if not contract:
-                rec["result"] = "no_price"
-                updated = True
-                continue
-            try:
-                info = await _dexscreener_token_info(contract)
-                current_price = info.get("price_usd", 0)
-                entry_price = rec.get("entry_price", 0)
-                if current_price and entry_price:
-                    pnl_pct = (current_price - entry_price) / entry_price * 100
-                    rec["exit_price"] = current_price
-                    rec["pnl_pct"] = round(pnl_pct, 2)
-                    rec["result"] = True if pnl_pct > 0 else False
+        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
+        async with httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
+        ) as http:
+            for rec in self._perf_records:
+                if rec.get("result") is not None:
+                    continue
+                if now < rec.get("check_at", now + 1):
+                    continue
+                contract = rec.get("contract_address", "")
+                if not contract:
+                    rec["result"] = "no_price"
                     updated = True
-                    logger.info(
-                        "SmartMoney perf: %s %s entry=%.6f exit=%.6f pnl=%.1f%%",
-                        rec.get("address_label", "?"), rec.get("token", "?"), entry_price, current_price, pnl_pct
-                    )
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.debug("evaluate_pending: %s", e)
+                    continue
+                try:
+                    info = await _dexscreener_token_info(http, contract)
+                    current_price = info.get("price_usd", 0)
+                    entry_price = rec.get("entry_price", 0)
+                    if current_price and entry_price:
+                        pnl_pct = (current_price - entry_price) / entry_price * 100
+                        rec["exit_price"] = current_price
+                        rec["pnl_pct"] = round(pnl_pct, 2)
+                        rec["result"] = True if pnl_pct > 0 else False
+                        updated = True
+                        logger.info(
+                            "SmartMoney perf: %s %s entry=%.6f exit=%.6f pnl=%.1f%%",
+                            rec.get("address_label", "?"), rec.get("token", "?"),
+                            entry_price, current_price, pnl_pct,
+                        )
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.debug("evaluate_pending: %s", e)
         if updated:
             self._save_perf()
 
@@ -960,14 +969,16 @@ class SmartMoneyTracker:
 
     # ── v2: Cached Dexscreener lookup ────────────────────────────────────
 
-    async def _cached_token_info(self, contract_address: str) -> dict:
+    async def _cached_token_info(
+        self, client: httpx.AsyncClient, contract_address: str
+    ) -> dict:
         """Dexscreener lookup with 5-min TTL cache."""
         if not contract_address:
             return {}
         cached = self._token_price_cache.get(contract_address)
         if cached and time.time() - cached.get("ts", 0) < 300:
             return cached.get("info", {})
-        info = await _dexscreener_token_info(contract_address)
+        info = await _dexscreener_token_info(client, contract_address)
         if info:
             # Cap token price cache to prevent unbounded growth
             if len(self._token_price_cache) > 500:
@@ -1031,7 +1042,11 @@ class SmartMoneyTracker:
                 if not contract or not entry_price:
                     continue
                 try:
-                    info = await self._cached_token_info(contract)
+                    headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
+                    async with httpx.AsyncClient(
+                        timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
+                    ) as http:
+                        info = await self._cached_token_info(http, contract)
                     current_price = info.get("price_usd", 0)
                     if current_price and entry_price:
                         pnl_pct = (current_price - entry_price) / entry_price * 100
@@ -1043,6 +1058,7 @@ class SmartMoneyTracker:
                         total = meta["total_trades"]
                         wins = meta.get("win_trades", 0)
                         meta["score"] = int((wins / total) * 100) if total > 0 else 50
+                        meta["score"] = max(0, min(100, meta["score"]))
                         meta["last_score_update"] = now
                         updated = True
                         logger.info(
@@ -1241,16 +1257,22 @@ class SmartMoneyTracker:
 
     async def _check_all_discoveries(self):
         """Periodically check price for all tracked discoveries."""
-        for contract, disc in list(self._new_token_discoveries.items()):
-            if len(disc.get("checkpoints", {})) >= len(DISCOVERY_CHECKPOINTS):
-                continue  # all checkpoints done
-            try:
-                info = await self._cached_token_info(contract)
-                if info.get("price_usd"):
-                    await self._update_discovery_follow_results(contract, info["price_usd"])
-            except Exception as e:
-                logger.debug("discovery check %s: %s", contract[:10], e)
-            await asyncio.sleep(0.5)
+        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
+        async with httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
+        ) as http:
+            for contract, disc in list(self._new_token_discoveries.items()):
+                if len(disc.get("checkpoints", {})) >= len(DISCOVERY_CHECKPOINTS):
+                    continue  # all checkpoints done
+                try:
+                    info = await self._cached_token_info(http, contract)
+                    if info.get("price_usd"):
+                        await self._update_discovery_follow_results(
+                            contract, info["price_usd"]
+                        )
+                except Exception as e:
+                    logger.debug("discovery check %s: %s", contract[:10], e)
+                await asyncio.sleep(0.5)
 
     # ── v2: Helius API integration ───────────────────────────────────────
 
@@ -1392,11 +1414,35 @@ class SmartMoneyTracker:
     # ── Scanning ──────────────────────────────────────────────────────────
 
     async def _scan_all(self):
-        prices = await _get_prices()
-        for address, meta in list(self._wallets.items()):
-            try:
-                signals = await self._scan_address(address, meta, prices)
-                for sig in signals:
+        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
+        async with httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
+        ) as client:
+            prices = await _get_prices(client)
+
+            async def _one_wallet(addr: str, meta: dict) -> list:
+                async with _SCAN_CONCURRENCY:
+                    try:
+                        return await self._scan_address(client, addr, meta, prices)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.debug("smart_scan %s: %s", addr[:8], e)
+                        return []
+
+            pairs = list(self._wallets.items())
+            batches = await asyncio.gather(
+                *[_one_wallet(a, m) for a, m in pairs],
+                return_exceptions=True,
+            )
+            for i, item in enumerate(batches):
+                if isinstance(item, Exception):
+                    logger.debug("smart batch error: %s", item)
+                    continue
+                if not isinstance(item, list) or i >= len(pairs):
+                    continue
+                address, _meta = pairs[i]
+                for sig in item:
                     tx_hash = sig.get("tx_hash", "")
                     if tx_hash and tx_hash not in self._seen_hashes:
                         self._seen_hashes.add(tx_hash)
@@ -1408,22 +1454,23 @@ class SmartMoneyTracker:
                         entry_price = sig.get("entry_price", 0)
                         amount_usd = sig.get("amount_usd", 0)
 
-                        # v2: Record pending outcome for wallet scoring
                         self._record_pending_outcome(address, contract, entry_price, token)
 
-                        # v2: Update consensus window + check
                         self._update_consensus_window(contract, address, amount_usd, token)
                         await self._check_consensus(contract, token)
 
-                        # v2: New token discovery tracking
-                        await self._handle_new_token_discovery(contract, token, address, entry_price)
+                        await self._handle_new_token_discovery(
+                            contract, token, address, entry_price
+                        )
 
-                        # v2: Whale alert for large SOL new positions
                         is_whale = False
                         if sig.get("network") == "sol":
                             sol_price = prices.get("SOL", 150)
                             sol_amount = amount_usd / sol_price if sol_price else 0
-                            if sol_amount >= WHALE_SOL_THRESHOLD and self._is_new_position(address, contract):
+                            if (
+                                sol_amount >= WHALE_SOL_THRESHOLD
+                                and self._is_new_position(address, contract)
+                            ):
                                 is_whale = True
 
                         if self._send:
@@ -1434,23 +1481,24 @@ class SmartMoneyTracker:
                                     await self._send(self._format_buy_signal(sig))
                             except Exception:
                                 pass
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.debug("smart_scan %s: %s", address[:8], e)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.3)
 
-    async def _scan_address(self, address: str, meta: dict, prices: dict) -> list:
+    async def _scan_address(
+        self, client: httpx.AsyncClient, address: str, meta: dict, prices: dict
+    ) -> list:
         network = meta.get("network", "eth")
         label = meta.get("label", address[:8])
         found = []
 
         if network == "sol":
-            for tx in await _solscan_spl_transfers(address, SMART_LOOKBACK_SECONDS):
-                sig = await self._classify_sol_buy(tx, address, label, prices)
+            for tx in await _solscan_spl_transfers(
+                client, address, SMART_LOOKBACK_SECONDS
+            ):
+                sig = await self._classify_sol_buy(
+                    client, tx, address, label, prices
+                )
                 if sig:
                     found.append(sig)
-
 
         elif network in ("eth", "bsc"):
             base_url = (
@@ -1458,17 +1506,25 @@ class SmartMoneyTracker:
                 else "https://api.bscscan.com/api"
             )
             api_key = self._etherscan_key if network == "eth" else self._bscscan_key
-            for tx in await _etherscan_tokentx(address, api_key, base_url):
+            for tx in await _etherscan_tokentx(client, address, api_key, base_url):
                 if tx.get("to", "").lower() != address.lower():
                     continue  # only receives (buys)
-                sig = await self._classify_erc20_buy(tx, address, label, network, prices)
+                sig = await self._classify_erc20_buy(
+                    client, tx, address, label, network, prices
+                )
                 if sig:
                     found.append(sig)
 
         return found
 
     async def _classify_erc20_buy(
-        self, tx: dict, address: str, label: str, network: str, prices: dict
+        self,
+        client: httpx.AsyncClient,
+        tx: dict,
+        address: str,
+        label: str,
+        network: str,
+        prices: dict,
     ) -> Optional[dict]:
         try:
             token_symbol = tx.get("tokenSymbol", "UNKNOWN")
@@ -1484,7 +1540,7 @@ class SmartMoneyTracker:
                 amount_usd = token_amount
                 current_price = 1.0
             elif contract_addr:
-                info = await self._cached_token_info(contract_addr)
+                info = await self._cached_token_info(client, contract_addr)
                 if info.get("price_usd"):
                     current_price = info["price_usd"]
                     amount_usd = token_amount * current_price
@@ -1519,7 +1575,12 @@ class SmartMoneyTracker:
             return None
 
     async def _classify_sol_buy(
-        self, tx: dict, address: str, label: str, prices: dict
+        self,
+        client: httpx.AsyncClient,
+        tx: dict,
+        address: str,
+        label: str,
+        prices: dict,
     ) -> Optional[dict]:
         try:
             dst = (
@@ -1542,7 +1603,7 @@ class SmartMoneyTracker:
             current_price = 0.0
 
             if token_address:
-                info = await self._cached_token_info(token_address)
+                info = await self._cached_token_info(client, token_address)
                 if info.get("price_usd"):
                     current_price = info["price_usd"]
                     amount_usd = token_amount * current_price

@@ -254,7 +254,11 @@ class Dispatcher:
 
 
 # ── LLM trade directive guard (call from codex / live paths before execution) ─
-from .llm_filter import LLMHallucinationFilter  # noqa: E402
+from .llm_filter import (  # noqa: E402
+    LLMHallucinationFilter,
+    TRADE_JSON_REMINDERS,
+    sanitize_trade_directive_with_retries,
+)
 
 
 async def sanitize_llm_trade_output(raw_llm_output: str):

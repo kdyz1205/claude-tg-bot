@@ -113,17 +113,17 @@ def _normalize_hex_key(raw: str) -> str:
 
 
 def load_private_key() -> str:
-    k = os.environ.get("POLYMARKET_PRIVATE_KEY") or os.environ.get("POLY_PRIVATE_KEY") or ""
+    k = os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY") or ""
     return _normalize_hex_key(k)
 
 
 def build_clob_client() -> Any:
     if not _PY_CLOB:
         raise PolyExecutorError("py-clob-client is not installed")
-    host = os.environ.get("POLY_CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
+    host = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
     key = load_private_key()
-    sig_type = int(os.environ.get("POLY_SIGNATURE_TYPE", "0"))
-    funder = (os.environ.get("POLY_FUNDER") or "").strip() or None
+    sig_type = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
+    funder = (os.getenv("POLY_FUNDER") or "").strip() or None
     client = ClobClient(
         host,
         chain_id=POLYGON,
@@ -408,7 +408,7 @@ def run_minimal_usdc_test_order(usdc: float = 0.1) -> dict[str, Any]:
 
     Requires POLYMARKET_PRIVATE_KEY (or POLY_PRIVATE_KEY) and POLY_TEST_TOKEN_ID.
     """
-    tid = (os.environ.get("POLY_TEST_TOKEN_ID") or "").strip()
+    tid = (os.getenv("POLY_TEST_TOKEN_ID") or "").strip()
     if not tid:
         return {
             "ok": False,

@@ -146,7 +146,7 @@ class ContinuousLearner:
                     self._save_metrics()
                     self._last_metrics_save = now
 
-                if os.environ.get("ENABLE_LIVE_TENSOR_STREAM", "").lower() in (
+                if os.getenv("ENABLE_LIVE_TENSOR_STREAM", "").lower() in (
                     "1",
                     "true",
                     "yes",
@@ -156,7 +156,7 @@ class ContinuousLearner:
                         try:
                             from trading.live_tensor_stream import ensure_stream_started
 
-                            inst = os.environ.get("OKX_TENSOR_INST", "BTC-USDT-SWAP")
+                            inst = os.getenv("OKX_TENSOR_INST", "BTC-USDT-SWAP")
                             await ensure_stream_started(inst)
                         except Exception as e:
                             log.debug("Live tensor stream ping: %s", e)
