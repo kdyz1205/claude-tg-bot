@@ -80,6 +80,10 @@ DEFAULT_LIVE_CONFIG = {
     "hedge_leg_retry_delay_sec": 0.35,
     "dex_leg_retry_count": 3,
     "limping_fuse_verify_rounds": 8,
+    # OKX 极端正资金费 + Solana DEX 流动性 → Jupiter 现货多 + OKX 永续空（默认关闭）
+    "funding_delta_execution_enabled": False,
+    "funding_delta_cooldown_sec": 14400,
+    "funding_delta_min_liquidity_override_usd": 50_000.0,
     # Polymarket：Gamma/CLOB 概率差扫描 + CLOB 处决（默认关闭）
     "poly_enabled": False,
     "poly_oracle_interval_sec": 3600,
@@ -417,6 +421,12 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
             return None
 
     val_cfg = dict(cfg)
+    if signal_data and signal_data.get("funding_delta_carry"):
+        floor_liq = float(
+            cfg.get("funding_delta_min_liquidity_override_usd", 50_000.0) or 50_000.0
+        )
+        val_cfg["min_liquidity_usd"] = floor_liq
+        val_cfg["min_mcap_usd"] = 0.0
     if signal_data and signal_data.get("god_engine"):
         val_cfg["min_liquidity_usd"] = max(
             float(val_cfg.get("min_liquidity_usd", 0) or 0),
@@ -717,6 +727,7 @@ def format_live_status() -> str:
 _mint_delta_locks: dict[str, asyncio.Lock] = {}
 _neural_pipeline_lock = asyncio.Lock()
 _shared_hedge_okx: Any = None
+_last_funding_delta_exec_ts: dict[str, float] = {}
 
 
 def _shared_hedge_okx_executor():
@@ -1376,6 +1387,41 @@ class LiveTrader:
         if not isinstance(signals, list):
             signals = list(signals) if signals else []
 
+        if cfg.get("funding_delta_execution_enabled"):
+            try:
+                from arbitrage_engine import scan_funding_delta_neutral_signals
+
+                funding_rows = await scan_funding_delta_neutral_signals()
+            except Exception as e:
+                logger.warning("funding delta neutral scan failed: %s", e)
+                funding_rows = []
+            for fr in funding_rows:
+                if not isinstance(fr, dict) or not fr.get("execute_delta_neutral_buy_compat"):
+                    continue
+                sm = fr.get("solana_mint")
+                if not sm or len(str(sm)) < 32:
+                    continue
+                hs = (fr.get("hedge_symbol") or "").strip()
+                if not hs:
+                    continue
+                base = (fr.get("base_asset") or "").strip() or "?"
+                signals.insert(
+                    0,
+                    {
+                        "symbol": f"{base}-USDT" if base else "?",
+                        "direction": "long",
+                        "combined_score": 100.0,
+                        "mint_address": str(sm),
+                        "source": "funding_delta_positive",
+                        "execute_delta_neutral_buy_compat": True,
+                        "hedge_symbol": hs,
+                        "funding_annualized_pct": fr.get("annualized_rate"),
+                        "dex_spot_liquidity_usd": fr.get("dex_spot_liquidity_usd"),
+                        "funding_delta_carry": True,
+                        "okx_inst_id": fr.get("okx_inst_id"),
+                    },
+                )
+
         try:
             from alpha_engine import scan_alpha, scan_onchain_filter
 
@@ -1438,6 +1484,58 @@ class LiveTrader:
                         pass
                 elif not poly_r.get("ok"):
                     logger.warning("Polymarket signal not executed: %s", poly_r.get("reason"))
+                await asyncio.sleep(2)
+                continue
+
+            if sig.get("execute_delta_neutral_buy_compat") and sig.get("mint_address"):
+                mint_dn = sig["mint_address"]
+                hedge_sym = (sig.get("hedge_symbol") or "").strip()
+                if not hedge_sym:
+                    continue
+                cooldown = float(cfg.get("funding_delta_cooldown_sec", 14400))
+                now_ts = time.time()
+                if now_ts - _last_funding_delta_exec_ts.get(mint_dn, 0) < cooldown:
+                    continue
+
+                balance = await secure_wallet.get_sol_balance()
+                if not balance:
+                    continue
+
+                regime_mult = float(sig.get("regime_mult", 1.0) or 1.0)
+                base_pct = cfg.get("max_trade_pct", 15.0) / 100
+                trade_sol = balance * base_pct * regime_mult
+                trade_sol = min(trade_sol, balance - cfg.get("min_sol_reserve", 0.05))
+                cap = cfg.get("max_trade_sol")
+                if cap is not None:
+                    try:
+                        trade_sol = min(trade_sol, float(cap))
+                    except (TypeError, ValueError):
+                        pass
+                trade_sol = max(trade_sol, 0.01)
+
+                sym_short = (sig.get("symbol") or "?").replace("-USDT", "").replace(
+                    "-USDC", ""
+                )
+                dn_result = await execute_delta_neutral_buy(
+                    mint_dn,
+                    trade_sol,
+                    sym_short,
+                    hedge_sym,
+                    signal_data=sig,
+                )
+                if dn_result.get("ok"):
+                    _last_funding_delta_exec_ts[mint_dn] = now_ts
+                if self._send:
+                    try:
+                        ann = sig.get("funding_annualized_pct", 0)
+                        await self._send(
+                            f"\U0001f4b5 **FUNDING \u0394-neutral** ok={dn_result.get('ok')}\n"
+                            f"{sym_short}  hedge `{hedge_sym}`  ~${dn_result.get('notional_usd', 0):.0f}\n"
+                            f"\u5e74\u5316\u8d44\u91d1\u8d39(OKX): **{ann}%**\n"
+                            f"reason: `{dn_result.get('reason', '')}`"
+                        )
+                    except Exception:
+                        pass
                 await asyncio.sleep(2)
                 continue
 

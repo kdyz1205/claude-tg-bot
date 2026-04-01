@@ -22,7 +22,11 @@ from .mtf_confluence import MultiTimeframeConfluence
 from .correlation_monitor import CorrelationHedgeMonitor
 from .entry_optimizer import EntryTimingOptimizer
 from .post_trade_analyzer import PostTradeAnalyzer
-from .funding_scanner import FundingRateScanner
+from .funding_scanner import (
+    FundingRateScanner,
+    okx_swap_inst_to_base,
+    okx_swap_inst_to_hedge_symbol,
+)
 
 __all__ = [
     "MarketRegimeDetector", "MarketRegime",
@@ -34,4 +38,6 @@ __all__ = [
     "EntryTimingOptimizer",
     "PostTradeAnalyzer",
     "FundingRateScanner",
+    "okx_swap_inst_to_base",
+    "okx_swap_inst_to_hedge_symbol",
 ]
