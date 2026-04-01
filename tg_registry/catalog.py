@@ -10,7 +10,7 @@ from __future__ import annotations
 from telegram import BotCommand
 
 # Shown under /start (short; detailed list is /help)
-START_FOOTER_COMMANDS = "/live /chain /trade /portfolio /help"
+START_FOOTER_COMMANDS = "/start /trade"
 
 # Sections for /help — trimmed to commands that stay registered (see tg_registry/registration.py)
 HELP_SECTIONS: list[tuple[str, list[str]]] = [
@@ -75,24 +75,12 @@ def format_help_message() -> str:
     return "".join(lines)
 
 
-def minimal_slash_menu_commands() -> list[BotCommand]:
+def get_core_menu_commands() -> list[BotCommand]:
     """
-    Telegram 侧栏菜单 — 短列表，避免客户端截断；与网关实际注册的斜杠一致。
-
-    未出现在菜单里的指令仍可在主进程 ``python bot.py`` 中通过打字使用（若仍在 registration 中）。
+    唯一 Telegram 侧栏菜单源：主进程与网关共用 ``set_my_commands``。
+    仅两项；其余指令仍可通过打字或 registration 使用，不进入 Bot 菜单。
     """
     return [
-        BotCommand("start", "入门 / 实盘·Paper 视图"),
-        BotCommand("live", "实盘 start|stop|status"),
-        BotCommand("chain", "链上面板"),
-        BotCommand("trade", "综合交易键盘"),
-        BotCommand("portfolio", "聚合持仓"),
-        BotCommand("status", "Bot / 系统状态"),
-        BotCommand("help", "命令清单"),
-        BotCommand("wallet_setup", "配置 Solana 钱包"),
+        BotCommand("start", "🚀 主控台与实盘大盘"),
+        BotCommand("trade", "⚔️ 极速手动交易面板"),
     ]
-
-
-def telegram_menu_bot_commands() -> list[BotCommand]:
-    """Alias: bot.py post_init 与网关共用同一短菜单。"""
-    return minimal_slash_menu_commands()

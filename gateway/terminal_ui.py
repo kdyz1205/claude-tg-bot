@@ -4,7 +4,7 @@ address interceptor, and Telegram API throttling.
 
 Slash menu与可选 ``auto_research`` 后台与面板共用 ``gateway.gateway_lifecycle``（
 ``GATEWAY_AUTO_RESEARCH`` / ``GATEWAY_AUTO_RESEARCH_NOTIFY_CHAT_ID``）。
-全局命令（group -2）：仅 ``/trade``；其它斜杠提示已废弃（除会话内 ``/start``）。
+全局命令（group -2）：``/trade``；其它斜杠交给 Jarvis 语义（与面板网关一致，除会话内 ``/start``）。
 
 Callback routing (prefix ``term:`` to avoid clashes with bot.py):
   term:main_menu
@@ -48,7 +48,7 @@ from gateway.gateway_lifecycle import (
     sync_slash_command_menu,
 )
 from gateway.handlers.router import NON_START_TRADE_SLASH
-from gateway.telegram_bot import cmd_trade, handle_deprecated_slash_command
+from gateway.telegram_bot import cmd_trade, handle_slash_as_semantic
 
 logger = logging.getLogger(__name__)
 
@@ -672,7 +672,7 @@ def build_terminal_application(token: str) -> Application:
 
     app.add_handler(CommandHandler("trade", cmd_trade), group=_GLOBAL_COMMAND_GROUP)
     app.add_handler(
-        MessageHandler(NON_START_TRADE_SLASH, handle_deprecated_slash_command),
+        MessageHandler(NON_START_TRADE_SLASH, handle_slash_as_semantic),
         group=_GLOBAL_COMMAND_GROUP,
     )
 

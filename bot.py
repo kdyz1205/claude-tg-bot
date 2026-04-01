@@ -26,8 +26,8 @@ import bridge
 from tg_registry import (
     START_FOOTER_COMMANDS,
     format_help_message,
+    get_core_menu_commands,
     register_command_handlers,
-    telegram_menu_bot_commands,
 )
 from safety import handle_confirmation_callback
 import psutil  # for health/system checks
@@ -8196,101 +8196,18 @@ async def run_polling_lifecycle(app, on_system_ready=None):
 
 
 def _telegram_command_handlers():
-    """Maps tg_registry.registration keys → coroutines (single source for CommandHandler wiring)."""
+    """仅 ``/start`` 与 ``/trade``（``/t``）注册为 CommandHandler；见 tg_registry.registration。"""
     return {
         "start": start,
-        "help_command": help_command,
-        "ping": ping,
-        "clear": clear,
-        "panel_command": panel_command,
-        "quick_action": quick_action,
-        "dev_command": dev_command,
-        "kill_command": kill_command,
-        "tasks_command": tasks_command,
-        "cancel_command": cancel_command,
-        "bridge_command": bridge_command,
-        "quick_screenshot": quick_screenshot,
-        "model_command": model_command,
-        "provider_command": provider_command,
-        "status_command": status_command,
-        "quota_command": quota_command,
-        "sessions_command": sessions_command,
-        "learn_command": learn_command,
-        "score_command": score_command,
-        "train_command": train_command,
-        "session_control_command": session_control_command,
-        "multi_session_command": multi_session_command,
-        "health_command": health_command,
-        "vital_command": vital_command,
-        "monitor_command": monitor_command,
-        "proactive_command": proactive_command,
-        "market_command": market_command,
-        "memory_command": memory_command,
-        "chain_command": chain_command,
-        "portfolio_command": portfolio_command,
-        "strategy_command": strategy_command,
-        "buy_command": buy_command,
-        "sell_command": sell_command,
-        "positions_command": positions_command,
-        "trade_settings_command": trade_settings_command,
-        "pnl_command": pnl_command,
         "trade_dashboard_command": trade_dashboard_command,
-        "paper_command": paper_command,
-        "live_command": live_command,
-        "wallet_setup_command": wallet_setup_command,
-        "wallet_delete_command": wallet_delete_command,
-        "okx_command": okx_command,
-        "okx_account_command": okx_account_command,
-        "okx_trade_command": okx_trade_command,
-        "okx_backtest_command": okx_backtest_command,
-        "okx_top30_command": okx_top30_command,
-        "ma_ribbon_backtest_command": ma_ribbon_backtest_command,
-        "ma_ribbon_screener_command": ma_ribbon_screener_command,
-        "signal_command": signal_command,
-        "signal_stats_command": signal_stats_command,
-        "alpha_command": alpha_command,
-        "arb_command": arb_command,
-        "token_analyze_command": token_analyze_command,
-        "optimize_command": optimize_command,
-        "onchain_command": onchain_command,
-        "search_command": search_command,
-        "whales_command": whales_command,
-        "track_command": track_command,
-        "wallets_command": wallets_command,
-        "addwallet_command": addwallet_command,
-        "report_command": report_command,
-        "risk_command": risk_command,
-        "performance_command": performance_command,
-        "evolution_command": evolution_command,
-        "evolve_command": evolve_command,
-        "strategy_evolve_command": strategy_evolve_command,
-        "evostatus_command": evostatus_command,
-        "skills_command": skills_command,
-        "autonomy_command": autonomy_command,
-        "consciousness_command": consciousness_command,
-        "selfcheck_command": selfcheck_command,
-        "repairs_command": repairs_command,
-        "repair_status_command": repair_status_command,
-        "code_health_command": code_health_command,
-        "selfrepair_command": selfrepair_command,
-        "dashboard_command": dashboard_command,
-        "codex_command": codex_command,
     }
 
 
-async def handle_unknown_slash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """已注册 CommandHandler 未覆盖的斜杠：明确提示，避免「发了没反应」。"""
-    if not update.message or not update.effective_user:
-        return
-    if not _is_authorized(update.effective_user.id):
-        return
-    raw = (update.message.text or "").strip().split(maxsplit=1)
-    cmd = raw[0] if raw else ""
-    await _safe_reply(
-        update.message,
-        f"❓ `{cmd}` 未注册或已从菜单下线。当前有效列表见侧栏或发 /help。",
-        parse_mode="Markdown",
-    )
+async def handle_slash_as_natural_language(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """未在 COMMAND_BINDINGS 注册的斜杠：整段交给 handle_message（主对话 / 工具链）。"""
+    await handle_message(update, context)
 
 
 def create_application():
@@ -8313,7 +8230,13 @@ def create_application():
     app.add_error_handler(error_handler)
 
     register_command_handlers(app, auth_filter, _telegram_command_handlers())
-    app.add_handler(MessageHandler(auth_filter & filters.COMMAND, handle_unknown_slash_command))
+    # 避免与 /start、/trade、/t 的 CommandHandler 双触发
+    _slash_non_core = filters.COMMAND & ~filters.Regex(
+        r"(?i)^\s*/(start|trade|t)(@[\w_]+)?(\s|$)"
+    )
+    app.add_handler(
+        MessageHandler(auth_filter & _slash_non_core, handle_slash_as_natural_language)
+    )
 
     # Callbacks — panel first, then DEX trading, then session control, then quick actions, then safety confirmations
     app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
@@ -8397,7 +8320,7 @@ def create_application():
     async def post_init(application):
         # Register commands FIRST (before any background tasks that might fail)
         try:
-            await application.bot.set_my_commands(telegram_menu_bot_commands())
+            await application.bot.set_my_commands(get_core_menu_commands())
             logger.info("Bot commands registered with Telegram")
         except Exception as e:
             logger.error(f"Failed to set bot commands: {e}")
