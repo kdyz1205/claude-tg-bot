@@ -1,6 +1,6 @@
 """
-Canonical live trader implementation lives at repository root: ``live_trader.py``.
-This module re-exports it so ``from trading.live_trader import LiveTrader`` works.
+Canonical implementation: repository root ``live_trader.py``.
+Re-export full API for ``from trading.live_trader import …``.
 """
 
 from __future__ import annotations
@@ -17,8 +17,12 @@ _mod = importlib.util.module_from_spec(_spec)
 sys.modules.setdefault("_repo_live_trader", _mod)
 _spec.loader.exec_module(_mod)
 
-globals().update(
-    {k: v for k, v in _mod.__dict__.items() if not k.startswith("_") or k in ("__all__",)}
+_skip = frozenset(
+    {"__name__", "__file__", "__package__", "__loader__", "__spec__", "__doc__", "__builtins__"}
 )
+for _k, _v in _mod.__dict__.items():
+    if _k in _skip:
+        continue
+    globals()[_k] = _v
 
-__all__ = getattr(_mod, "__all__", [k for k in _mod.__dict__ if not k.startswith("_")])
+del _k, _v, _skip, _spec, _mod, _root_lt
