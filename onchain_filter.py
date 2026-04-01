@@ -23,6 +23,23 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Shared HTTP policy: one client per scan avoids connection churn / RPC-style timeouts.
+_HTTP_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+_HTTP_LIMITS = httpx.Limits(max_connections=32, max_keepalive_connections=16)
+_OKX_CONCURRENCY = asyncio.Semaphore(12)
+
+
+def _finite_non_negative(x: float) -> bool:
+    return x == x and x >= 0 and abs(x) != float("inf")
+
+
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        return v if _finite_non_negative(v) else default
+    except (TypeError, ValueError):
+        return default
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ALERTED_FILE = os.path.join(BASE_DIR, ".vol_filter_alerted.json")
 
@@ -50,12 +67,15 @@ DEFAULT_SYMBOLS = [
 
 # ── Data fetching ────────────────────────────────────────────────────────────
 
-async def _fetch_okx_candles(symbol: str, bar: str, limit: int = 10) -> list:
+async def _fetch_okx_candles(
+    client: httpx.AsyncClient, symbol: str, bar: str, limit: int = 10
+) -> list:
     """OKX candles: returns [[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm], ...]"""
     url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with _OKX_CONCURRENCY:
             resp = await client.get(url)
+            resp.raise_for_status()
             data = resp.json()
             if data.get("code") == "0":
                 return list(reversed(data.get("data", [])))
@@ -64,25 +84,29 @@ async def _fetch_okx_candles(symbol: str, bar: str, limit: int = 10) -> list:
     return []
 
 
-async def _get_volume(symbol: str, bar: str, num_bars: int = 1) -> float:
+async def _get_volume(
+    client: httpx.AsyncClient, symbol: str, bar: str, num_bars: int = 1
+) -> float:
     """Get total volume (coin-denominated) over last num_bars candles."""
-    candles = await _fetch_okx_candles(symbol, bar, limit=num_bars + 1)
+    candles = await _fetch_okx_candles(client, symbol, bar, limit=num_bars + 1)
     if len(candles) < 2:
         return 0.0
     # Use completed candles only (skip the latest which may be incomplete)
     completed = candles[-(num_bars + 1):-1] if len(candles) > num_bars else candles[:-1]
-    total_vol = sum(float(c[5]) for c in completed if len(c) > 5)
+    total_vol = sum(_safe_float(c[5]) for c in completed if len(c) > 5)
     return total_vol
 
 
-async def _get_volume_usdt(symbol: str, bar: str, num_bars: int = 1) -> float:
+async def _get_volume_usdt(
+    client: httpx.AsyncClient, symbol: str, bar: str, num_bars: int = 1
+) -> float:
     """Get total USDT volume over last num_bars candles."""
-    candles = await _fetch_okx_candles(symbol, bar, limit=num_bars + 1)
+    candles = await _fetch_okx_candles(client, symbol, bar, limit=num_bars + 1)
     if len(candles) < 2:
         return 0.0
     completed = candles[-(num_bars + 1):-1] if len(candles) > num_bars else candles[:-1]
     # volCcyQuote = index 7 on OKX
-    total_vol = sum(float(c[7]) if len(c) > 7 else 0.0 for c in completed)
+    total_vol = sum(_safe_float(c[7]) if len(c) > 7 else 0.0 for c in completed)
     return total_vol
 
 
@@ -104,7 +128,7 @@ _GECKO_IDS = {
 }
 
 
-async def _fetch_mcap(symbol: str) -> Optional[float]:
+async def _fetch_mcap(client: httpx.AsyncClient, symbol: str) -> Optional[float]:
     """Get market cap in USDT via CoinGecko. Returns None if unavailable."""
     base = symbol.split("-")[0]
     gecko_id = _GECKO_IDS.get(base)
@@ -118,19 +142,22 @@ async def _fetch_mcap(symbol: str) -> Optional[float]:
 
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={gecko_id}&vs_currencies=usd&include_market_cap=true"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            data = resp.json()
-            mcap = data.get(gecko_id, {}).get("usd_market_cap")
-            if mcap is not None:
-                _mcap_cache[base] = (mcap, time.time())
-                # Evict stale entries when cache is too large
-                if len(_mcap_cache) > _MCAP_CACHE_MAX:
-                    now = time.time()
-                    stale = [k for k, (_, ts) in _mcap_cache.items() if now - ts > _MCAP_CACHE_TTL]
-                    for k in stale:
-                        del _mcap_cache[k]
-                return mcap
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        mcap = data.get(gecko_id, {}).get("usd_market_cap")
+        if mcap is not None:
+            mcap_f = float(mcap)
+            if not _finite_non_negative(mcap_f):
+                return None
+            _mcap_cache[base] = (mcap_f, time.time())
+            # Evict stale entries when cache is too large
+            if len(_mcap_cache) > _MCAP_CACHE_MAX:
+                now = time.time()
+                stale = [k for k, (_, ts) in _mcap_cache.items() if now - ts > _MCAP_CACHE_TTL]
+                for k in stale:
+                    del _mcap_cache[k]
+            return mcap_f
     except Exception as e:
         logger.debug("onchain_filter: mcap fetch %s: %s", symbol, e)
     return None
@@ -301,23 +328,23 @@ def _quick_score(closes: list) -> tuple:
 
 # ── Main filter scanner ──────────────────────────────────────────────────────
 
-async def _scan_one(symbol: str, filters: dict) -> Optional[dict]:
+async def _scan_one(client: httpx.AsyncClient, symbol: str, filters: dict) -> Optional[dict]:
     """Scan a single symbol against filter set."""
     try:
         # Fetch 3m and 5m candles + 1H for scoring in parallel
         candles_3m, candles_5m, candles_1h = await asyncio.gather(
-            _fetch_okx_candles(symbol, "3m", limit=5),
-            _fetch_okx_candles(symbol, "5m", limit=5),
-            _fetch_okx_candles(symbol, "1H", limit=40),
+            _fetch_okx_candles(client, symbol, "3m", limit=5),
+            _fetch_okx_candles(client, symbol, "5m", limit=5),
+            _fetch_okx_candles(client, symbol, "1H", limit=40),
         )
 
         # Volume check: latest completed 3m candle
-        vol_3m = float(candles_3m[-2][5] or 0) if len(candles_3m) >= 2 and len(candles_3m[-2]) > 5 else 0.0
-        vol_5m = float(candles_5m[-2][5] or 0) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 5 else 0.0
+        vol_3m = _safe_float(candles_3m[-2][5]) if len(candles_3m) >= 2 and len(candles_3m[-2]) > 5 else 0.0
+        vol_5m = _safe_float(candles_5m[-2][5]) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 5 else 0.0
 
         # USDT volume for display
-        vol_3m_usdt = float(candles_3m[-2][7] or 0) if len(candles_3m) >= 2 and len(candles_3m[-2]) > 7 else 0.0
-        vol_5m_usdt = float(candles_5m[-2][7] or 0) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 7 else 0.0
+        vol_3m_usdt = _safe_float(candles_3m[-2][7]) if len(candles_3m) >= 2 and len(candles_3m[-2]) > 7 else 0.0
+        vol_5m_usdt = _safe_float(candles_5m[-2][7]) if len(candles_5m) >= 2 and len(candles_5m[-2]) > 7 else 0.0
 
         # Filter 1: 3m volume
         if vol_3m < filters.get("vol_3m_min", 0):
@@ -329,12 +356,13 @@ async def _scan_one(symbol: str, filters: dict) -> Optional[dict]:
 
         # Filter 3: market cap (skip if unavailable — CoinGecko rate limit)
         max_mcap = filters.get("max_mcap_usdt")
-        mcap = await _fetch_mcap(symbol)
+        mcap = await _fetch_mcap(client, symbol)
         if max_mcap and mcap is not None and mcap > max_mcap:
             return None
 
         # Score
-        closes_1h = [float(c[4]) for c in candles_1h]
+        closes_1h = [_safe_float(c[4]) for c in candles_1h if len(c) > 4]
+        closes_1h = [c for c in closes_1h if c > 0]
         direction, score = _quick_score(closes_1h)
 
         # Filter 4: minimum score
@@ -383,15 +411,21 @@ async def scan_filtered(
     # Batch to avoid rate limits (10 concurrent)
     results = []
     batch_size = 10
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
-        tasks = [_scan_one(sym, filters) for sym in batch]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in batch_results:
-            if isinstance(r, dict):
-                results.append(r)
-        if i + batch_size < len(symbols):
-            await asyncio.sleep(0.5)  # rate limit buffer
+    headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/onchain_filter"}
+    async with httpx.AsyncClient(
+        timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
+    ) as client:
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            tasks = [_scan_one(client, sym, filters) for sym in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in batch_results:
+                if isinstance(r, dict):
+                    results.append(r)
+                elif isinstance(r, Exception):
+                    logger.debug("onchain_filter batch item error: %s", r)
+            if i + batch_size < len(symbols):
+                await asyncio.sleep(0.5)  # rate limit buffer
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
