@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +55,7 @@ class ContinuousLearner:
         self._last_arena_tournament: float = _now
         self._last_weekly_report: float = _now
         self._last_metrics_save: float = _now
+        self._last_tensor_ping: float = 0.0
 
         # Performance tracking
         self._metrics: dict[str, Any] = self._load_metrics()
@@ -143,6 +145,21 @@ class ContinuousLearner:
                     self._update_live_metrics()
                     self._save_metrics()
                     self._last_metrics_save = now
+
+                if os.environ.get("ENABLE_LIVE_TENSOR_STREAM", "").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    if now - self._last_tensor_ping > 600:
+                        self._last_tensor_ping = now
+                        try:
+                            from trading.live_tensor_stream import ensure_stream_started
+
+                            inst = os.environ.get("OKX_TENSOR_INST", "BTC-USDT-SWAP")
+                            await ensure_stream_started(inst)
+                        except Exception as e:
+                            log.debug("Live tensor stream ping: %s", e)
 
             except asyncio.CancelledError:
                 return

@@ -1188,3 +1188,13 @@ def get_combined_signals(technical_signals: list = None, top_arb: int = 5) -> li
 
     combined.sort(key=lambda x: x["unified_score"], reverse=True)
     return combined[:100]  # cap combined signals list
+
+
+# ── Phase 11: live tensor stream (OKX WebSocket → singularity-shaped tensors) ──
+
+
+async def start_okx_live_tensor_stream(inst_id: str = "BTC-USDT-SWAP", window: int = 512):
+    """Start shared WebSocket buffer for real-time OHLCV tensors."""
+    from trading.live_tensor_stream import ensure_stream_started
+
+    return await ensure_stream_started(inst_id, window)

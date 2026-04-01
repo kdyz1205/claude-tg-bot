@@ -1270,12 +1270,20 @@ class LiveTrader:
                 ci = max(10.0, float(cfg.get("check_interval", 30)))
                 si = max(60.0, float(cfg.get("scan_interval", 300)))
                 n_int = max(20.0, float(cfg.get("neural_poll_sec", 45)))
+                poly_int = max(300.0, float(cfg.get("poly_oracle_interval_sec", 3600)))
 
                 if cfg.get("neural_execution_enabled") and (
                     self._last_neural_ts == 0 or (now - self._last_neural_ts) >= n_int
                 ):
                     self._last_neural_ts = time.time()
                     await _neural_delta_neutral_once(self._send)
+
+                if cfg.get("poly_enabled") and (
+                    self._last_poly_oracle_ts == 0
+                    or (now - self._last_poly_oracle_ts) >= poly_int
+                ):
+                    self._last_poly_oracle_ts = time.time()
+                    await _poly_oracle_scan_and_execute(self._send)
 
                 if self._last_pos_check == 0 or (now - self._last_pos_check) >= ci:
                     self._last_pos_check = time.time()
@@ -1290,7 +1298,10 @@ class LiveTrader:
                 next_p = self._last_pos_check + ci
                 next_s = self._last_sig_scan + si
                 next_n = self._last_neural_ts + n_int if cfg.get("neural_execution_enabled") else 1e18
-                wait = min(next_p, next_s, next_n) - now
+                next_poly = (
+                    self._last_poly_oracle_ts + poly_int if cfg.get("poly_enabled") else 1e18
+                )
+                wait = min(next_p, next_s, next_n, next_poly) - now
                 wait = max(1.0, min(wait, 120.0))
                 await asyncio.sleep(wait)
 

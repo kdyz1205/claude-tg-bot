@@ -253,6 +253,10 @@ class StrategyBrain:
         self._cycle_phase: str = "idle"
         self._last_evolved_at: int = 0
         self._send_callback: Any = None
+        self._singularity_bundle: dict | None = None
+        self._singularity_lock = asyncio.Lock()
+        self._singularity_reload_interval = 300.0
+        self._last_singularity_reload: float = 0.0
 
     async def _notify(self, text: str):
         if self._send_callback:
@@ -409,6 +413,100 @@ class StrategyBrain:
             "price": round(float(price), 6),
             "volatility_regime": volatility_regime,
         }
+
+    # ── Phase 11: live tensor → singularity inference (hot-swappable) ─────
+
+    async def reload_singularity_weights(self, force: bool = False) -> bool:
+        """Load best harness run (metrics + model.pt) without process restart."""
+        now = time.time()
+        if (
+            not force
+            and self._singularity_bundle is not None
+            and (now - self._last_singularity_reload) < self._singularity_reload_interval
+        ):
+            return True
+
+        def _load():
+            from trading.hot_singularity import load_best_bundle
+
+            return load_best_bundle()
+
+        bundle = await asyncio.to_thread(_load)
+        async with self._singularity_lock:
+            self._singularity_bundle = bundle
+            self._last_singularity_reload = now
+        return bundle is not None
+
+    def _live_predict_fallback(self, x: np.ndarray) -> dict | None:
+        """Momentum logit when no PyTorch checkpoint is available."""
+        if x.ndim == 3:
+            x0 = x[0]
+        else:
+            x0 = x
+        if x0.shape[0] < 2 or x0.shape[1] < 4:
+            return None
+        c = x0[:, 3].astype(np.float64, copy=False)
+        ret = (c[-1] - c[-2]) / (abs(c[-2]) + 1e-9)
+        z = 30.0 * float(np.tanh(ret * 50))
+        prob = float(1.0 / (1.0 + np.exp(-z)))
+        conf = max(prob, 1.0 - prob)
+        return {
+            "logit": float(z),
+            "prob_up": prob,
+            "confidence": conf,
+            "action": "long" if prob >= 0.5 else "short",
+            "source": "fallback_momentum",
+            "run_dir": "",
+        }
+
+    async def live_predict(self, x: np.ndarray) -> dict | None:
+        """
+        Neural direction from current tensor window (1, T, 5) z-scored OHLCV.
+        Hot-reloads singularity weights periodically. Falls back to momentum if no .pt.
+        """
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        if x.ndim == 2:
+            x = x[np.newaxis, ...]
+        if x.ndim != 3 or x.shape[2] != 5:
+            log.warning("live_predict expects (1,T,5) OHLCV tensor, got %s", x.shape)
+            return None
+
+        await self.reload_singularity_weights(force=False)
+        async with self._singularity_lock:
+            bundle = self._singularity_bundle
+
+        if bundle is None:
+            return self._live_predict_fallback(x)
+
+        def _forward() -> dict:
+            import math
+
+            import torch
+
+            model = bundle["model"]
+            fm = bundle["frag_mask"]
+            device = bundle["device"]
+            xt = torch.from_numpy(x.copy()).float().to(device)
+            with torch.inference_mode():
+                logit_t = model(xt, fm)
+                logit_f = float(logit_t.reshape(-1)[0].detach().cpu().item())
+            if logit_f > 20:
+                prob = 1.0
+            elif logit_f < -20:
+                prob = 0.0
+            else:
+                prob = 1.0 / (1.0 + math.exp(-logit_f))
+            conf = max(prob, 1.0 - prob)
+            return {
+                "logit": logit_f,
+                "prob_up": prob,
+                "confidence": conf,
+                "action": "long" if prob >= 0.5 else "short",
+                "source": "singularity",
+                "run_dir": str(bundle["run_dir"]),
+            }
+
+        return await asyncio.to_thread(_forward)
 
     # ── Position management ───────────────────────────────────────────────
 
@@ -692,4 +790,16 @@ class StrategyBrain:
                 "cooldown_seconds": self.executor.risk.cooldown_seconds,
             },
             "harness": self.lessons.get_summary(),
+            "singularity_loaded": self._singularity_bundle is not None,
         }
+
+
+_default_strategy_brain: StrategyBrain | None = None
+
+
+def get_default_strategy_brain() -> StrategyBrain:
+    """Process-wide brain for neural / OKX bridge (Phase 11–12)."""
+    global _default_strategy_brain
+    if _default_strategy_brain is None:
+        _default_strategy_brain = StrategyBrain()
+    return _default_strategy_brain

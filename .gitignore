@@ -94,3 +94,11 @@ session_knowledge.json
 
 # Generated docs
 docs/
+
+# Local ML / backtest caches & bot runtime blobs (regenerated locally)
+_data_cache/
+_arena/
+_singularity_engine_state.json
+_optimization_log.json
+intelligence_data/performance_metrics.json
+agent_state.json

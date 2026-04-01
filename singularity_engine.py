@@ -186,6 +186,16 @@ def main() -> None:
         "bundled": True,
     }
     (ROOT / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "hp": hp,
+            "seq_len": seq_len,
+            "fragment_len": frag,
+            "metrics": metrics,
+        },
+        ROOT / "model.pt",
+    )
     print(json.dumps(metrics))
 
 

@@ -652,3 +652,76 @@ def format_trade_stats() -> str:
     if len(result) > 4000:
         result = result[:3950] + "\n\n... (truncated)"
     return result
+
+
+# ─── Phase 12: dynamic slippage + private route hooks ───
+
+
+def compute_dynamic_slippage_bps(
+    price_impact_pct: float,
+    volatility_hint: float = 0.0,
+    *,
+    min_bps: int = 25,
+    max_bps: int = 500,
+) -> int:
+    """Map Jupiter quote impact + optional vol hint to slippage bps (not hard-coded)."""
+    impact = max(0.0, float(price_impact_pct or 0))
+    vol = max(0.0, float(volatility_hint or 0))
+    raw = 40 + impact * 120 + vol * 80
+    return int(max(min_bps, min(max_bps, round(raw))))
+
+
+def get_private_solana_rpc_url() -> str:
+    """
+    Optional JSON-RPC for sendTransaction (Flashbots / bloXroute-style endpoints).
+    """
+    return (
+        os.environ.get("PRIVATE_SOLANA_RPC_URL")
+        or os.environ.get("FLASHBOTS_SOLANA_RPC")
+        or os.environ.get("BLOXROUTE_SOLANA_RPC")
+        or "https://api.mainnet-beta.solana.com"
+    )
+
+
+def get_bloxroute_auth_header() -> Optional[str]:
+    return os.environ.get("BLOXROUTE_AUTH_HEADER")
+
+
+async def submit_signed_tx_base64(
+    signed_b64: str,
+    *,
+    skip_preflight: bool = False,
+) -> Optional[str]:
+    """Broadcast via configurable RPC (public or private)."""
+    import httpx
+
+    rpc = get_private_solana_rpc_url()
+    headers = {"Content-Type": "application/json"}
+    auth = get_bloxroute_auth_header()
+    if auth:
+        headers["Authorization"] = auth
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            signed_b64,
+            {
+                "encoding": "base64",
+                "skipPreflight": skip_preflight,
+                "preflightCommitment": "confirmed",
+                "maxRetries": 3,
+            },
+        ],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(rpc, json=payload, headers=headers)
+            data = resp.json()
+        if "error" in data:
+            logger.warning("sendTransaction error: %s", data["error"])
+            return None
+        return data.get("result")
+    except Exception as e:
+        logger.error("submit_signed_tx_base64 failed: %s", e)
+        return None
