@@ -60,6 +60,73 @@ def _parse_atom(xml_text: str) -> List[ArxivEntry]:
     return out
 
 
+def parse_arxiv_id_from_url(url: str) -> Optional[str]:
+    """Extract arXiv id from ``/abs/...`` or ``/pdf/...`` URL."""
+    if not (url or "").strip():
+        return None
+    u = url.strip()
+    m = re.search(
+        r"arxiv\.org/(?:abs|pdf)/([\w.+\-]+(?:/[\w.+\-]+)?)(?:\.pdf)?(?:\s|$|\?|#)",
+        u,
+        re.I,
+    )
+    if not m:
+        return None
+    rid = m.group(1).strip().strip("/")
+    if rid.lower().endswith(".pdf"):
+        rid = rid[:-4]
+    return rid.split("/")[-1] if "/" in rid else rid
+
+
+async def fetch_arxiv_by_id(arxiv_id: str) -> List[ArxivEntry]:
+    """Fetch a single paper by arXiv id (``id_list`` API)."""
+    aid = (arxiv_id or "").strip()
+    if not aid:
+        return []
+    params = {"id_list": aid}
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        r = await client.get(ARXIV_API, params=params)
+        r.raise_for_status()
+        return _parse_atom(r.text)
+
+
+def extract_formula_snippets(*texts: str) -> List[str]:
+    """Pull inline ``$...$`` / ``$$...$$`` fragments as formula summaries for downstream code gen."""
+    out: List[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for m in re.finditer(r"(?<!\$)\$([^$\n]+)\$(?!\$)", text):
+            s = m.group(1).strip()
+            if 2 <= len(s) <= 400:
+                out.append(s)
+        for m in re.finditer(r"\$\$([\s\S]*?)\$\$", text):
+            s = re.sub(r"\s+", " ", m.group(1).strip())
+            if 2 <= len(s) <= 500:
+                out.append(s)
+    seen: set[str] = set()
+    uniq: List[str] = []
+    for s in out:
+        k = s.lower()[:120]
+        if k not in seen:
+            seen.add(k)
+            uniq.append(s)
+    return uniq[:25]
+
+
+def formulas_from_architecture(architecture: Dict[str, Any]) -> List[str]:
+    """When abstracts lack LaTeX, expose tensor / mechanism text as symbolic formulas."""
+    out: List[str] = []
+    tc = architecture.get("tensor_contracts") or {}
+    if isinstance(tc, dict):
+        for k, v in tc.items():
+            out.append(f"{k}: {v}")
+    mech = architecture.get("mechanism_description")
+    if isinstance(mech, str) and mech.strip():
+        out.append(mech.strip()[:400])
+    return out[:18]
+
+
 async def fetch_arxiv_hft_transformer(
     search_query: Optional[str] = None,
     max_results: int = 5,
@@ -190,20 +257,50 @@ class AcademicResearcherSkill(BaseSkill):
         force_mock = bool(params.get("force_mock"))
         max_results = int(params.get("max_results") or 5)
         search_query = params.get("search_query")
+        paper_url = params.get("paper_url") or params.get("arxiv_url")
+        theory_term = (
+            params.get("theory_query")
+            or params.get("theory_term")
+            or params.get("query")
+        )
 
         papers: List[ArxivEntry] = []
         source = "arxiv"
 
-        if not force_mock:
+        if force_mock:
+            papers = _mock_arxiv_entries()
+            source = "mock"
+        elif paper_url:
+            aid = parse_arxiv_id_from_url(str(paper_url))
+            if aid:
+                try:
+                    papers = await fetch_arxiv_by_id(aid)
+                    source = "arxiv_id_list"
+                except Exception as e:
+                    logger.warning("arXiv id fetch failed: %s", e)
+            if not papers:
+                papers = _mock_arxiv_entries()
+                source = "mock_fallback"
+        elif theory_term and str(theory_term).strip():
+            t = str(theory_term).strip()
+            q = search_query if search_query else f'all:"{t}" AND (all:trading OR all:finance OR all:market)'
             try:
-                papers = await fetch_arxiv_hft_transformer(search_query, max_results=max_results)
+                papers = await fetch_arxiv_hft_transformer(q, max_results=max_results)
+                source = "arxiv_theory_search"
             except Exception as e:
-                logger.warning("arXiv fetch failed, using mock: %s", e)
+                logger.warning("arXiv theory search failed, using mock: %s", e)
                 papers = _mock_arxiv_entries()
                 source = "mock_fallback"
         else:
-            papers = _mock_arxiv_entries()
-            source = "mock"
+            if not force_mock:
+                try:
+                    papers = await fetch_arxiv_hft_transformer(
+                        search_query, max_results=max_results
+                    )
+                except Exception as e:
+                    logger.warning("arXiv fetch failed, using mock: %s", e)
+                    papers = _mock_arxiv_entries()
+                    source = "mock_fallback"
 
         if not papers:
             papers = _mock_arxiv_entries()
@@ -212,6 +309,11 @@ class AcademicResearcherSkill(BaseSkill):
         architecture = synthesize_attention_architecture(papers)
         codex_prompt = build_codex_prompt(architecture)
 
+        blob = " ".join(f"{p.title} {p.summary}" for p in papers)
+        formulas = extract_formula_snippets(blob)
+        if len(formulas) < 2:
+            formulas = list(formulas) + formulas_from_architecture(architecture)
+
         return {
             "ok": True,
             "source": source,
@@ -219,6 +321,8 @@ class AcademicResearcherSkill(BaseSkill):
             "papers": [p.__dict__ for p in papers],
             "architecture": architecture,
             "codex_prompt": codex_prompt,
+            "formulas_extracted": formulas,
+            "formula_context": "\n---\n".join(formulas[:12]),
             "skill": "sk_academic_researcher",
         }
 
@@ -231,6 +335,8 @@ async def run_skill(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     Skill 标准入口（异步），供 singularity_engine / 调度器 await。
 
     params:
+      paper_url / arxiv_url: arXiv 链接，按 id 拉取单篇
+      theory_query / theory_term / query: 理论关键词，构造 arXiv 检索
       search_query: 覆盖默认 arXiv 查询
       max_results: 拉取条数
       force_mock: True 则跳过网络，仅用内置模拟论文

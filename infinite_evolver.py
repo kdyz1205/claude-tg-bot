@@ -25,6 +25,8 @@ STATE_FILE = BASE / "_infinite_evolver_state.json"
 STATE_BACKUP_FILE = BASE / "_infinite_evolver_state.bak.json"
 LOG_FILE = BASE / "_infinite_evolver.log"
 LOCK_FILE = BASE / "_infinite_evolver.lock"
+# Drop ``{"command": "TUNE_STRATEGY"}`` here (or call ``request_tune_strategy()``) to run offline grid.
+_INFINITE_EVOLVER_DIRECTIVE_FILE = BASE / "_infinite_evolver_directive.json"
 
 # Anti runaway: caps to avoid state / counter corruption loops
 MAX_TOTAL_RUNS_SANITY = 50_000
@@ -630,6 +632,161 @@ def _get_evolver_proc_pool() -> _cf.ProcessPoolExecutor:
     return _EVOLVER_PROC_POOL
 
 
+_TUNE_GRID_POOL: _cf.ProcessPoolExecutor | None = None
+
+
+def _get_tune_grid_pool() -> _cf.ProcessPoolExecutor:
+    """Full-machine CPU pool for offline ``TUNE_STRATEGY`` cartesian sweeps (no HTTP in workers)."""
+    global _TUNE_GRID_POOL
+    if _TUNE_GRID_POOL is None:
+        cpus = os.cpu_count() or 8
+        n = int(os.environ.get("EVOLVER_TUNE_MAX_WORKERS", str(cpus)))
+        n = max(1, min(n, max(1, cpus)))
+        _TUNE_GRID_POOL = _cf.ProcessPoolExecutor(max_workers=n)
+    return _TUNE_GRID_POOL
+
+
+def request_tune_strategy() -> None:
+    """External trigger: next InfiniteEvolver sweep runs offline grid search."""
+    try:
+        d: dict = {}
+        if _INFINITE_EVOLVER_DIRECTIVE_FILE.exists():
+            raw = _INFINITE_EVOLVER_DIRECTIVE_FILE.read_text(encoding="utf-8")
+            d = json.loads(raw) if raw.strip() else {}
+        if not isinstance(d, dict):
+            d = {}
+        d["command"] = "TUNE_STRATEGY"
+        d["requested_at"] = datetime.now().isoformat()
+        tmp = str(_INFINITE_EVOLVER_DIRECTIVE_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(_INFINITE_EVOLVER_DIRECTIVE_FILE))
+    except OSError as e:
+        log.warning("request_tune_strategy: %s", e)
+
+
+def consume_tune_strategy_directive() -> bool:
+    if not _INFINITE_EVOLVER_DIRECTIVE_FILE.exists():
+        return False
+    try:
+        d = json.loads(_INFINITE_EVOLVER_DIRECTIVE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(d, dict) or d.get("command") != "TUNE_STRATEGY":
+            return False
+        d.pop("command", None)
+        d["last_tune_consumed_at"] = datetime.now().isoformat()
+        tmp = str(_INFINITE_EVOLVER_DIRECTIVE_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(_INFINITE_EVOLVER_DIRECTIVE_FILE))
+        return True
+    except Exception as e:
+        log.debug("consume_tune_strategy_directive: %s", e)
+        return False
+
+
+def _offline_tune_worker(payload: tuple) -> dict:
+    """
+    ProcessPool entry: run V6 backtest on pre-loaded bundles only.
+    Sets offline env so any accidental fetch path refuses HTTP.
+    """
+    import copy
+
+    os.environ["EVOLVER_BACKTEST_OFFLINE_ONLY"] = "1"
+    strategy_params, bundles, config_dict = payload
+    from trading.backtest_engine import BacktestConfig, _run_backtest_cpu_inner
+
+    cfg = BacktestConfig(**config_dict)
+    r = _run_backtest_cpu_inner(copy.deepcopy(strategy_params), bundles, cfg, None)
+    out = r.to_dict()
+    out["_winning_grid_params"] = copy.deepcopy(strategy_params)
+    return out
+
+
+def _build_v6_param_grid(base: dict, *, max_combos: int) -> list[dict]:
+    import copy
+    import itertools
+
+    keys_grid: dict[str, list] = {
+        "ma5_len": [4, 5, 6, 7],
+        "ma8_len": [7, 8, 9, 10, 11],
+        "ema21_len": [18, 21, 24],
+        "ma55_len": [45, 50, 55, 60, 65],
+        "bb_length": [18, 21, 24],
+        "bb_std_dev": [2.0, 2.5, 3.0],
+        "slope_threshold": [0.06, 0.1, 0.14, 0.18],
+        "dist_ma5_ma8": [1.0, 1.5, 2.0],
+        "fee_mult": [0.9, 1.0, 1.1],
+        "slippage_mult": [0.85, 1.0, 1.15],
+    }
+    names = list(keys_grid.keys())
+    vals = [keys_grid[k] for k in names]
+    out: list[dict] = []
+    for combo in itertools.islice(itertools.product(*vals), max_combos):
+        row = copy.deepcopy(base)
+        for k, v in zip(names, combo):
+            row[k] = v
+        if row["ma5_len"] >= row["ma8_len"]:
+            row["ma8_len"] = row["ma5_len"] + 1
+        if row["ma8_len"] >= row["ema21_len"]:
+            row["ema21_len"] = row["ma8_len"] + 3
+        if row["ema21_len"] >= row["ma55_len"]:
+            row["ma55_len"] = row["ema21_len"] + 12
+        out.append(row)
+    return out
+
+
+def _run_tune_grid_sync(
+    bundles: list,
+    config_dict: dict,
+    base_params: dict,
+    max_combos: int,
+) -> list[dict]:
+    grid = _build_v6_param_grid(base_params, max_combos=max_combos)
+    payloads = [(p, bundles, config_dict) for p in grid]
+    pool = _get_tune_grid_pool()
+    nw = getattr(pool, "_max_workers", 4) or 4
+    chunksize = max(1, len(payloads) // max(nw * 8, 1))
+    return list(pool.map(_offline_tune_worker, payloads, chunksize=chunksize))
+
+
+def _apply_tune_winner_hot(
+    winning_params: dict,
+    metrics: dict,
+) -> None:
+    """Persist best grid row + overwrite ``GLOBAL_BEST_STRATEGY`` for live hot-swap."""
+    import copy
+
+    genetics = _load_genetics()
+    hist = list(genetics.get("sharpe_history") or [])
+    st = float(metrics.get("sharpe_test", 0.0) or 0.0)
+    hist.append(st)
+    genetics["sharpe_history"] = hist[-_SHARPE_HISTORY_CAP:]
+    genetics["last_good_params"] = copy.deepcopy(winning_params)
+    _save_genetics(genetics)
+    _apply_strategy_params_to_agent_state(winning_params)
+    _touch_evolve_state_gene_event(
+        "tune_strategy_offline",
+        f"pnl_test={metrics.get('total_return_pct')} sharpe_test={st}",
+    )
+    try:
+        from pipeline.god_orchestrator import GLOBAL_BEST_STRATEGY, _GLOBAL_LOCK
+
+        with _GLOBAL_LOCK:
+            GLOBAL_BEST_STRATEGY["strategy_params"] = copy.deepcopy(winning_params)
+            GLOBAL_BEST_STRATEGY["sharpe"] = st
+            GLOBAL_BEST_STRATEGY["win_rate"] = float(metrics.get("win_rate") or 0.0)
+            GLOBAL_BEST_STRATEGY["source"] = "tune_strategy_offline"
+            GLOBAL_BEST_STRATEGY["title"] = "offline_grid_max_pnl"
+            GLOBAL_BEST_STRATEGY["skill_id"] = None
+            GLOBAL_BEST_STRATEGY["updated_at"] = time.time()
+    except Exception as e:
+        log.warning("GLOBAL_BEST_STRATEGY hot update failed: %s", e)
+
+
 async def _run_subprocess_backtest_async(script_path: str, data_snapshot: list) -> dict:
     """``ProcessPoolExecutor`` + ``wait_for`` so evolver never blocks the TG loop."""
     from evolver_firewall import get_heavy_async_timeout_sec
@@ -991,8 +1148,105 @@ class InfiniteEvolver:
             except _asyncio.CancelledError:
                 return
 
+    async def _run_offline_tune_strategy_grid(self) -> None:
+        """``TUNE_STRATEGY``: cartesian grid on V6 params, offline OHLCV only, max CPU cores."""
+        import dataclasses
+
+        from trading.backtest_engine import BacktestConfig, fetch_ohlcv
+        from trading.okx_executor import AgentState
+
+        log.info("TUNE_STRATEGY: offline cartesian grid (ProcessPoolExecutor, no HTTP in workers)")
+        prev = os.environ.get("EVOLVER_BACKTEST_OFFLINE_ONLY")
+        os.environ["EVOLVER_BACKTEST_OFFLINE_ONLY"] = "1"
+        try:
+            syms = os.environ.get("EVOLVER_TUNE_SYMBOLS", "BTCUSDT,ETHUSDT")
+            cfg = BacktestConfig(
+                bar=os.environ.get("EVOLVER_TUNE_BAR", "4H"),
+                lookback_bars=int(os.environ.get("EVOLVER_TUNE_LOOKBACK", "800")),
+                symbols=[s.strip() for s in syms.split(",") if s.strip()],
+            )
+            base = AgentState().strategy_params.copy()
+            max_c = int(os.environ.get("EVOLVER_TUNE_GRID_CAP", "480"))
+            bundles: list = []
+            for sym in cfg.symbols:
+                try:
+                    data = await fetch_ohlcv(
+                        sym, cfg.bar, cfg.lookback_bars, use_cache=True
+                    )
+                except Exception as e:
+                    log.warning("tune grid: skip %s — %s", sym, e)
+                    continue
+                if len(data) >= 100:
+                    bundles.append((sym, data))
+            if not bundles:
+                msg = "⛔ TUNE_STRATEGY: _data_cache 无足够离线 K 线（需 .npy / .parquet）"
+                log.error(msg)
+                if self._send:
+                    try:
+                        await self._send(msg)
+                    except Exception:
+                        pass
+                return
+
+            config_dict = dataclasses.asdict(cfg)
+            timeout_sec = float(os.environ.get("EVOLVER_TUNE_TIMEOUT_SEC", "900"))
+            results = await _asyncio.wait_for(
+                _asyncio.to_thread(
+                    _run_tune_grid_sync,
+                    bundles,
+                    config_dict,
+                    base,
+                    max_c,
+                ),
+                timeout=timeout_sec,
+            )
+            if not results:
+                return
+            best = max(
+                results, key=lambda d: float(d.get("total_return_pct", -1e18))
+            )
+            wp = best.get("_winning_grid_params")
+            if not wp:
+                log.error("TUNE_STRATEGY: missing _winning_grid_params in worker result")
+                return
+            await _asyncio.to_thread(_apply_tune_winner_hot, wp, best)
+            info = (
+                f"✅ TUNE_STRATEGY 离线穷举 (~{len(results)} 组)\n"
+                f"  最优测试PnL%={float(best.get('total_return_pct', 0)):.2f} "
+                f"Sharpe={float(best.get('sharpe_test', 0)):.3f} "
+                f"WR={float(best.get('win_rate', 0)):.1f}%\n"
+                f"  已写入 GLOBAL_BEST_STRATEGY / genetics / agent_state"
+            )
+            log.info(info.replace("\n", " "))
+            if self._send:
+                try:
+                    await self._send(info)
+                except Exception:
+                    pass
+        except _asyncio.TimeoutError:
+            log.error("TUNE_STRATEGY: grid timeout (EVOLVER_TUNE_TIMEOUT_SEC)")
+            if self._send:
+                try:
+                    await self._send(
+                        "⏱️ TUNE_STRATEGY 超时 — 增大 EVOLVER_TUNE_TIMEOUT_SEC 或减少 EVOLVER_TUNE_GRID_CAP"
+                    )
+                except Exception:
+                    pass
+        finally:
+            if prev is None:
+                os.environ.pop("EVOLVER_BACKTEST_OFFLINE_ONLY", None)
+            else:
+                os.environ["EVOLVER_BACKTEST_OFFLINE_ONLY"] = prev
+
     async def _sweep(self) -> None:
         """One full hypothesis → codegen OR V6-params-mutation → real backtest → promote cycle."""
+        if consume_tune_strategy_directive():
+            try:
+                await self._run_offline_tune_strategy_grid()
+            except Exception as e:
+                log.exception("TUNE_STRATEGY failed: %s", e)
+            return
+
         # Strategy 1: Mutate V6 params and test with real backtester
         try:
             await self._sweep_v6_mutation()

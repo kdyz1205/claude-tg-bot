@@ -131,6 +131,89 @@ def _rebuild_index():
     return index
 
 
+def register_or_update_factor_skill(
+    *,
+    skill_id: str,
+    title: str | None,
+    keywords: list[str],
+    user_request: str,
+    py_relpath: str,
+) -> None:
+    """
+    Register or merge metadata for a FACTOR_FORGE-generated ``skills/sk_*.py`` module
+    into ``.skill_library/skills/{id}.json`` and rebuild ``index.json``.
+    Preserves scores and usage counts when updating an existing record.
+    """
+    tid = (skill_id or "").strip()
+    if not tid.startswith("sk_"):
+        logger.warning("register_or_update_factor_skill: skip invalid id %r", skill_id)
+        return
+    rel = py_relpath.replace("\\", "/")
+    now = datetime.now().isoformat()
+    req_snip = (user_request or "").strip()[:500]
+
+    existing = _load_skill(tid)
+    merged_kw: list[str] = []
+    seen: set[str] = set()
+    for w in (existing or {}).get("keywords") or []:
+        s = str(w).strip().lower()
+        if s and s not in seen:
+            seen.add(s)
+            merged_kw.append(str(w).strip())
+    for w in keywords:
+        s = str(w).strip().lower()
+        if s and s not in seen:
+            seen.add(s)
+            merged_kw.append(str(w).strip())
+    merged_kw = merged_kw[:40]
+
+    disp_title = (title or "").strip() or (existing or {}).get("title") or tid
+
+    if existing:
+        skill = dict(existing)
+        skill["id"] = tid
+        skill["title"] = disp_title
+        skill["keywords"] = merged_kw
+        skill["task_type"] = "factor"
+        skill["summary"] = req_snip or skill.get("summary") or ""
+        fc = list(skill.get("files_created") or [])
+        if rel not in fc:
+            fc.append(rel)
+        skill["files_created"] = fc
+        skill["updated_at"] = now
+        skill.setdefault("created_at", now)
+        skill.setdefault("source", "factor_forge")
+    else:
+        skill = {
+            "id": tid,
+            "title": disp_title,
+            "summary": req_snip,
+            "task_type": "factor",
+            "function_signature": f"invoke_python_skill_async('skills.{tid}')",
+            "input_schema": "payload: dict (e.g. ohlcv bars, symbol, params)",
+            "output_schema": "dict with buy_confidence, sell_confidence in [0,1]",
+            "trigger_pattern": " ".join(merged_kw[:12]),
+            "keywords": merged_kw,
+            "generic_steps": [
+                "Subclass BaseSkill in skills/sk_*.py",
+                "_execute returns buy_confidence / sell_confidence",
+                "Run via invoke_python_skill_async or skill_runtime",
+            ],
+            "template_code": f"# import asyncio\n# from skill_library import invoke_python_skill_async\n"
+            f"# out = await invoke_python_skill_async('skills.{tid}.py', {{}})",
+            "files_modified": [],
+            "files_created": [rel],
+            "created_at": now,
+            "updated_at": now,
+            "source": "factor_forge",
+            "use_count": 0,
+            "usage_count": 0,
+            "score": 0,
+        }
+    _save_skill(skill)
+    _rebuild_index()
+
+
 # ─── Skill Matching ──────────────────────────────────────────────────────────
 
 def find_matching_skills(user_message: str, max_results: int = MAX_INJECT) -> list[dict]:

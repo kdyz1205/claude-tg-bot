@@ -80,13 +80,64 @@ def resample_1m_to_4h(arr_1m: np.ndarray) -> np.ndarray:
     return np.array(out_rows, dtype=np.float64)
 
 
+def _ohlcv_from_dataframe(df) -> np.ndarray | None:
+    """Build (N, 6) float array ts,o,h,l,c,vol from a pandas DataFrame."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+    if df is None or len(df) < 4:
+        return None
+    if not isinstance(df, pd.DataFrame):
+        return None
+    cols = {c.lower(): c for c in df.columns}
+    def col(*names: str):
+        for n in names:
+            if n in cols:
+                return df[cols[n]]
+        return None
+    ts = col("ts", "timestamp", "time")
+    o = col("open", "o")
+    h = col("high", "h")
+    lo = col("low", "l")
+    c = col("close", "c")
+    v = col("vol", "volume", "v")
+    if ts is None or o is None or h is None or lo is None or c is None:
+        return None
+    if v is None:
+        v = np.ones(len(df))
+    out = np.column_stack(
+        (
+            ts.astype("float64"),
+            o.astype("float64"),
+            h.astype("float64"),
+            lo.astype("float64"),
+            c.astype("float64"),
+            v.astype("float64"),
+        )
+    )
+    return out
+
+
 def load_offline_ohlcv(inst_id: str, bar: str, limit: int) -> np.ndarray | None:
     """
     Load OHLCV without network. Tries:
-    1) Exact cache ``{inst_id}_{bar}_{limit}.npy``
-    2) From ``live_*_1m.npy`` resampled to 4H when ``bar == '4H'``
+    1) Parquet ``{inst_id}_{bar}_{limit}.parquet`` (pandas)
+    2) Exact cache ``{inst_id}_{bar}_{limit}.npy``
+    3) From ``live_*_1m.npy`` resampled to 4H when ``bar == '4H'``
     """
     inst_id = inst_id.strip()
+    pq_path = _CACHE_DIR / f"{inst_id}_{bar}_{limit}.parquet"
+    if pq_path.exists():
+        try:
+            import pandas as pd
+
+            arr = _ohlcv_from_dataframe(pd.read_parquet(pq_path))
+            if arr is not None and len(arr) >= min(100, limit // 2):
+                return arr[-limit:] if len(arr) > limit else arr
+        except Exception as e:
+            log.debug("offline parquet load: %s", e)
+
     cache_file = _CACHE_DIR / f"{inst_id}_{bar}_{limit}.npy"
     if cache_file.exists():
         try:
