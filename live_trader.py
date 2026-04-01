@@ -98,6 +98,12 @@ DEFAULT_LIVE_CONFIG = {
     "poly_require_unrestricted": True,
     "poly_dedupe_hours": 24,
     "poly_max_orders_per_scan": 1,
+    # Kelly live sizing (see trading.portfolio_manager.PortfolioManager)
+    "kelly_fractional_scale": 0.25,
+    "kelly_min_edge_p": 0.52,
+    "kelly_max_equity_fraction": 0.35,
+    "kelly_signal_priors": {},
+    "kelly_default_win_p": None,
 }
 
 
@@ -363,6 +369,34 @@ async def _check_risk_controls(amount_sol: float, cfg: dict) -> tuple[bool, str]
     return True, "OK"
 
 
+async def _live_sol_equity_for_order() -> float:
+    """Fresh tradable SOL: portfolio snapshot (wallet leg) with RPC fallback."""
+    try:
+        from trading.portfolio_snapshot import fetch_tradable_sol_balance
+
+        bal, _src = await fetch_tradable_sol_balance()
+        if bal > 0:
+            return float(bal)
+    except Exception as e:
+        logger.debug("live equity via portfolio_snapshot: %s", e)
+    import secure_wallet
+
+    b = await secure_wallet.get_sol_balance()
+    return float(b or 0)
+
+
+async def _resolve_kelly_trade_sol(skill_id: str | None, cfg: dict) -> Optional[float]:
+    """Equity fetch + Kelly absolute SOL; None = abort (logged)."""
+    from trading.portfolio_manager import PortfolioManager, clamp_kelly_stake_to_balance
+
+    equity = await _live_sol_equity_for_order()
+    if equity <= 0:
+        logger.warning("Kelly 仓位建议不足或已熔断，放弃开火。")
+        return None
+    raw = PortfolioManager.get_kelly_position_size(skill_id, equity, cfg=cfg)
+    return clamp_kelly_stake_to_balance(raw, equity, cfg)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TRADE EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -377,6 +411,12 @@ async def buy_token(mint: str, amount_sol: float, symbol: str = "",
     cfg = _load_config()
 
     if not cfg.get("enabled"):
+        return None
+
+    from trading.portfolio_manager import KELLY_MIN_TRADE_SOL
+
+    if amount_sol <= 0 or amount_sol < KELLY_MIN_TRADE_SOL:
+        logger.warning("Kelly 仓位建议不足或已熔断，放弃开火。")
         return None
 
     try:
@@ -805,8 +845,10 @@ async def _run_delta_neutral_with_recovery(
                 "notional_usd": 0.0,
             }
         reserve = max(float(cfg.get("min_sol_reserve", 0.05)), GOD_GAS_RESERVE_SOL)
+        from trading.portfolio_manager import KELLY_MIN_TRADE_SOL as _kmin
+
         amount_sol = min(float(amount_sol), max(0.0, float(bal) - reserve))
-        if amount_sol < 0.01:
+        if amount_sol < _kmin:
             logger.warning(
                 "delta-neutral god: insufficient SOL after reserve (bal=%.4f reserve=%.4f)",
                 bal,
@@ -1095,22 +1137,9 @@ async def _neural_delta_neutral_once(send_func=None) -> None:
         if pred.get("confidence", 0) < thr or pred.get("action") != "long":
             return
 
-        import secure_wallet
-
-        balance = await secure_wallet.get_sol_balance()
-        if not balance:
+        trade_sol = await _resolve_kelly_trade_sol("strategy_brain_neural", cfg)
+        if trade_sol is None:
             return
-        trade_sol = min(
-            balance * cfg.get("max_trade_pct", 15.0) / 100.0,
-            balance - cfg.get("min_sol_reserve", 0.05),
-        )
-        cap = cfg.get("max_trade_sol")
-        if cap is not None:
-            try:
-                trade_sol = min(trade_sol, float(cap))
-            except (TypeError, ValueError):
-                pass
-        trade_sol = max(0.01, trade_sol)
         hedge_sym = cfg.get("neural_hedge_symbol") or "SOLUSDT"
         sigd = {
             "source": "strategy_brain_neural",
@@ -1497,21 +1526,13 @@ class LiveTrader:
                 if now_ts - _last_funding_delta_exec_ts.get(mint_dn, 0) < cooldown:
                     continue
 
-                balance = await secure_wallet.get_sol_balance()
-                if not balance:
+                skill_dn = (
+                    str(sig.get("skill_id") or "").strip()
+                    or str(sig.get("source") or "funding_delta_positive").strip()
+                )
+                trade_sol = await _resolve_kelly_trade_sol(skill_dn or "funding_delta_positive", cfg)
+                if trade_sol is None:
                     continue
-
-                regime_mult = float(sig.get("regime_mult", 1.0) or 1.0)
-                base_pct = cfg.get("max_trade_pct", 15.0) / 100
-                trade_sol = balance * base_pct * regime_mult
-                trade_sol = min(trade_sol, balance - cfg.get("min_sol_reserve", 0.05))
-                cap = cfg.get("max_trade_sol")
-                if cap is not None:
-                    try:
-                        trade_sol = min(trade_sol, float(cap))
-                    except (TypeError, ValueError):
-                        pass
-                trade_sol = max(trade_sol, 0.01)
 
                 sym_short = (sig.get("symbol") or "?").replace("-USDT", "").replace(
                     "-USDC", ""
@@ -1553,27 +1574,22 @@ class LiveTrader:
             if not mint:
                 continue
 
-            import secure_wallet
-            balance = await secure_wallet.get_sol_balance()
-            if not balance:
+            skill_scan = (
+                str(sig.get("skill_id") or "").strip()
+                or str(sig.get("source") or "live_scan").strip()
+            )
+            trade_sol = await _resolve_kelly_trade_sol(skill_scan or "live_scan", cfg)
+            if trade_sol is None:
                 continue
-
-            regime_mult = sig.get("regime_mult", 1.0)
-            confidence = min(score / 100, 1.0)
-            base_pct = cfg.get("max_trade_pct", 15.0) / 100
-            trade_sol = balance * base_pct * regime_mult * (0.5 + 0.5 * confidence)
-            trade_sol = min(trade_sol, balance - cfg.get("min_sol_reserve", 0.05))
-            cap = cfg.get("max_trade_sol")
-            if cap is not None:
-                try:
-                    trade_sol = min(trade_sol, float(cap))
-                except (TypeError, ValueError):
-                    pass
-            trade_sol = max(trade_sol, 0.01)
 
             result = await buy_token(
                 mint, trade_sol, symbol,
-                signal_data={"score": score, "direction": direction, "source": sig.get("source")},
+                signal_data={
+                    "score": score,
+                    "direction": direction,
+                    "source": sig.get("source"),
+                    "skill_id": skill_scan or None,
+                },
             )
 
             if result and self._send:

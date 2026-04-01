@@ -2,7 +2,7 @@
 God Loop — dual-rail scheduler: InfiniteEvolver (forge) + live delta-neutral radar.
 
 Bridges promoted backtest genes into ``GLOBAL_BEST_STRATEGY`` and drives
-``live_trader.execute_delta_neutral_buy`` with a fixed SOL notional while a
+``live_trader.execute_delta_neutral_buy`` with Kelly-sized SOL (optional ``GOD_TRADE_SOL`` cap) while a
 session loss fuse is armed.
 """
 
@@ -39,8 +39,19 @@ class GodOrchestrator:
 GOD_ORCHESTRATOR = GodOrchestrator()
 
 EVOLVE_INTERVAL_SEC = float(os.environ.get("GOD_EVOLVE_INTERVAL_SEC", "7200"))
-TRADE_NOTIONAL_SOL = float(os.environ.get("GOD_TRADE_SOL", "0.5"))
 MAX_SESSION_LOSS_SOL = float(os.environ.get("GOD_MAX_LOSS_SOL", "0.1"))
+
+
+def _optional_god_max_trade_sol_cap() -> float | None:
+    """Optional hard ceiling (SOL) for live legs; unset ``GOD_TRADE_SOL`` = Kelly-only cap from config."""
+    raw = (os.environ.get("GOD_TRADE_SOL") or "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except ValueError:
+        return None
 RADAR_POLL_SEC = float(os.environ.get("GOD_RADAR_POLL_SEC", "45"))
 DEFAULT_CONFIDENCE_FLOOR = float(os.environ.get("GOD_CONFIDENCE_FLOOR", "0.85"))
 
@@ -291,13 +302,27 @@ async def _god_radar_once() -> None:
     if float(pred.get("confidence", 0)) < thr or pred.get("action") != "long":
         return
 
-    import secure_wallet
+    from trading.portfolio_manager import (
+        KELLY_MIN_TRADE_SOL,
+        PortfolioManager,
+        clamp_kelly_stake_to_balance,
+    )
+    from trading.portfolio_snapshot import fetch_tradable_sol_balance
 
-    balance = await secure_wallet.get_sol_balance()
-    if not balance:
+    equity, _eq_src = await fetch_tradable_sol_balance()
+    if equity <= 0:
         return
-    gas_floor = max(float(cfg.get("min_sol_reserve", 0.05)), 0.015)
-    trade_sol = min(TRADE_NOTIONAL_SOL, max(0.01, balance - gas_floor))
+    skill_for_kelly = snap.get("skill_id") or "god_orchestrator"
+    raw_sol = PortfolioManager.get_kelly_position_size(skill_for_kelly, equity, cfg=cfg)
+    trade_sol = clamp_kelly_stake_to_balance(raw_sol, equity, cfg)
+    if trade_sol is None:
+        return
+    cap = _optional_god_max_trade_sol_cap()
+    if cap is not None:
+        trade_sol = min(trade_sol, cap)
+        if trade_sol < KELLY_MIN_TRADE_SOL:
+            logger.warning("Kelly 仓位建议不足或已熔断，放弃开火。")
+            return
 
     hedge_sym = cfg.get("neural_hedge_symbol") or "SOLUSDT"
     sigd = {
@@ -371,7 +396,9 @@ def _apply_live_config_for_god() -> None:
     cfg["enabled"] = True
     # God radar runs its own tensor → hedge path; disable built-in neural listener to avoid double fires.
     cfg["neural_execution_enabled"] = False
-    cfg["max_trade_sol"] = TRADE_NOTIONAL_SOL
+    cap = _optional_god_max_trade_sol_cap()
+    if cap is not None:
+        cfg["max_trade_sol"] = cap
     lt._save_config(cfg)
 
 
@@ -420,9 +447,9 @@ async def start_autonomous_engine(
     _bg_tasks = [t_forge, t_radar]
 
     logger.info(
-        "God autonomous engine started (paper_mode=%s trade_sol=%s loss_fuse=%s)",
+        "God autonomous engine started (paper_mode=%s kelly_cap_sol=%s loss_fuse=%s)",
         paper_mode,
-        TRADE_NOTIONAL_SOL,
+        _optional_god_max_trade_sol_cap(),
         MAX_SESSION_LOSS_SOL,
     )
     return True

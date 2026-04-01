@@ -140,6 +140,47 @@ def get_snapshot_for_gateway() -> dict[str, Any]:
     return get_snapshot()
 
 
+async def fetch_tradable_sol_balance(*, max_stale_sec: float = 75.0) -> tuple[float, str]:
+    """
+    SOL available for live spot swaps: prefer fresh ``wallet.sol_bal`` from this module's cache,
+    refresh once if stale/missing, then fall back to ``secure_wallet.get_sol_balance``.
+
+    Returns ``(balance_sol, provenance)`` where provenance is ``portfolio_snapshot``,
+    ``wallet_rpc``, or ``unavailable``.
+    """
+    now = time.time()
+    with _lock:
+        age = now - float(_data.get("updated_at") or 0)
+        w = _data.get("wallet") or {}
+        ok = bool(w.get("ok"))
+        bal = float(w.get("sol_bal") or 0) if ok else 0.0
+
+    need_refresh = (not ok) or age > max(5.0, float(max_stale_sec))
+    if need_refresh:
+        try:
+            await refresh_once()
+        except Exception as e:
+            logger.debug("fetch_tradable_sol_balance refresh_once: %s", e)
+        with _lock:
+            w2 = _data.get("wallet") or {}
+            if w2.get("ok"):
+                b2 = float(w2.get("sol_bal") or 0)
+                return max(0.0, b2), "portfolio_snapshot"
+
+    if ok and bal >= 0:
+        return max(0.0, bal), "portfolio_snapshot"
+
+    try:
+        import secure_wallet
+
+        rpc_bal = await asyncio.wait_for(secure_wallet.get_sol_balance(), timeout=6.0)
+        v = float(rpc_bal or 0)
+        return max(0.0, v), "wallet_rpc"
+    except Exception as e:
+        logger.debug("fetch_tradable_sol_balance RPC: %s", e)
+        return 0.0, "unavailable"
+
+
 def _publish_redis(blob: dict[str, Any]) -> None:
     global _redis_warned
     url = (os.getenv("REDIS_URL") or "").strip()
