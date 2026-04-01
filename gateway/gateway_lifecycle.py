@@ -23,34 +23,11 @@ BOT_DATA_AUTO_RESEARCH_TASK_KEY = "_gw_auto_research_task"
 
 def standard_bot_commands() -> list[BotCommand]:
     """
-    菜单文案与职责一一对应：命令走 CommandHandler，绝不与纯文本语义层混用。
-    描述控制在 Telegram 菜单可读长度内，并标明「非聊天语义」边界。
+    Gateway slash menu — **only** ``/start`` and ``/trade`` (Jarvis handles all other intents as text).
     """
     return [
-        BotCommand(
-            "start",
-            "面板：持仓·引擎·刷新（非闲聊）",
-        ),
-        BotCommand(
-            "trade",
-            "指引：自然语言买卖（非 /dev）",
-        ),
-        BotCommand(
-            "config",
-            "风控·纸/实盘（非造物）",
-        ),
-        BotCommand(
-            "help",
-            "命令清单·环境变量（只读）",
-        ),
-        BotCommand(
-            "feed",
-            "专用：链接/正文情绪",
-        ),
-        BotCommand(
-            "dev",
-            "专用：/dev 写代码·因子",
-        ),
+        BotCommand("start", "主控台·持仓·引擎·刷新"),
+        BotCommand("trade", "手动交易说明·自然语言下单"),
     ]
 
 

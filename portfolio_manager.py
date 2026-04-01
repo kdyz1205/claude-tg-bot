@@ -1,4 +1,16 @@
 """
+Core risk & dynamic sizing engine + live portfolio presentation.
+
+This module is the **canonical entry** for production DEX leg sizing: Kelly-style
+fractions per ``skill_id`` (persisted trade stats) are merged with
+``trading_skills.drawdown_guardian.DrawdownGuardian.scale_kelly_fraction`` so that
+drawdown, recovery mode, cooldown, and shutdown states shrink or zero the bet **before**
+converting USD notional to absolute SOL.
+
+The functions below (``calculate_kelly_position_size``, ``kelly_fraction_for_skill``, etc.)
+implement the risk engine. The remainder of the file preserves the original Telegram /
+dashboard formatters unchanged.
+
 Live portfolio summary for Telegram (MarkdownV2) and plain chain dashboard text.
 
 Uses trading.portfolio_snapshot for OKX + wallet + DEX; optional Jupiter prices for SPL.
@@ -10,8 +22,202 @@ OKX live vs local ledger sync: ``trading.reconciliation_daemon`` (default every 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
+import threading
 import time
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from trading_skills.drawdown_guardian import DrawdownGuardian
+
+logger = logging.getLogger(__name__)
+
+# Persisted per-skill stats for Kelly (wins/losses and gross PnL fractions).
+_STATS_LOCK = threading.Lock()
+_STATS_PATH = Path(
+    os.environ.get(
+        "PORTFOLIO_KELLY_STATS_PATH",
+        str(Path(__file__).resolve().parent / "_skill_kelly_stats.json"),
+    )
+)
+_MIN_TRADES_FOR_KELLY = max(3, int(os.environ.get("PORTFOLIO_KELLY_MIN_TRADES", "5")))
+_DEFAULT_FRACTION_NO_STATS = float(os.environ.get("PORTFOLIO_KELLY_DEFAULT_FRAC", "0.02"))
+_MAX_KELLY_CAP = float(os.environ.get("PORTFOLIO_KELLY_MAX_FRAC", "0.25"))
+_KELLY_SCALAR = float(os.environ.get("PORTFOLIO_KELLY_SCALAR", "0.5"))  # half-Kelly default
+
+
+def _load_kelly_stats() -> dict[str, Any]:
+    try:
+        if _STATS_PATH.is_file():
+            raw = _STATS_PATH.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Kelly stats load failed: %s", e)
+    return {}
+
+
+def _save_kelly_stats(obj: dict[str, Any]) -> None:
+    try:
+        _STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(_STATS_PATH) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(_STATS_PATH))
+    except OSError as e:
+        logger.error("Kelly stats save failed: %s", e)
+
+
+def _skill_bucket(stats: dict[str, Any], skill_id: str) -> dict[str, Any]:
+    skills = stats.setdefault("skills", {})
+    if not isinstance(skills, dict):
+        skills = {}
+        stats["skills"] = skills
+    sid = str(skill_id or "").strip() or "default"
+    cur = skills.get(sid)
+    if not isinstance(cur, dict):
+        cur = {"n_win": 0, "n_loss": 0, "sum_win": 0.0, "sum_loss": 0.0}
+        skills[sid] = cur
+    return cur
+
+
+def record_skill_trade_outcome(skill_id: str, pnl_fraction: float) -> None:
+    """
+    Feed realized PnL fraction (e.g. 0.03 = +3%) to update Kelly inputs for ``skill_id``.
+    Thread-safe; persists to ``_skill_kelly_stats.json`` (or ``PORTFOLIO_KELLY_STATS_PATH``).
+    """
+    try:
+        x = float(pnl_fraction)
+    except (TypeError, ValueError):
+        return
+    with _STATS_LOCK:
+        stats = _load_kelly_stats()
+        b = _skill_bucket(stats, skill_id)
+        if x >= 0:
+            b["n_win"] = int(b.get("n_win", 0)) + 1
+            b["sum_win"] = float(b.get("sum_win", 0.0)) + x
+        else:
+            b["n_loss"] = int(b.get("n_loss", 0)) + 1
+            b["sum_loss"] = float(b.get("sum_loss", 0.0)) + abs(x)
+        _save_kelly_stats(stats)
+
+
+def _half_kelly_fraction(p: float, avg_win: float, avg_loss: float) -> float:
+    """Classic Kelly f* = (p*b - q)/b with b = avg_win/avg_loss; return conservative scalar * f*."""
+    if p <= 0 or p >= 1:
+        return 0.0
+    if avg_win <= 0 or avg_loss <= 0:
+        return 0.0
+    b = avg_win / avg_loss
+    q = 1.0 - p
+    k = (p * b - q) / b if b > 1e-12 else 0.0
+    if k <= 0:
+        return 0.0
+    return max(0.0, min(_MAX_KELLY_CAP, k * _KELLY_SCALAR))
+
+
+def kelly_fraction_for_skill(skill_id: str) -> float:
+    """
+    Raw Kelly-based **fraction of equity** (before drawdown guardian), ∈ [0, _MAX_KELLY_CAP].
+    Uses persisted wins/losses; if below ``_MIN_TRADES_FOR_KELLY``, falls back to
+    ``_DEFAULT_FRACTION_NO_STATS``.
+    """
+    with _STATS_LOCK:
+        stats = _load_kelly_stats()
+        b = _skill_bucket(stats, skill_id)
+        nw = int(b.get("n_win", 0))
+        nl = int(b.get("n_loss", 0))
+        sw = float(b.get("sum_win", 0.0))
+        sl = float(b.get("sum_loss", 0.0))
+    n = nw + nl
+    if n < _MIN_TRADES_FOR_KELLY:
+        return max(0.0, min(_MAX_KELLY_CAP, _DEFAULT_FRACTION_NO_STATS))
+    p = nw / n if n else 0.0
+    avg_win = sw / nw if nw else 0.0
+    avg_loss = sl / nl if nl else 0.0
+    if nw == 0 or nl == 0:
+        # One-sided history: stay defensive
+        return max(0.0, min(_MAX_KELLY_CAP, _DEFAULT_FRACTION_NO_STATS))
+    return _half_kelly_fraction(p, avg_win, avg_loss)
+
+
+def calculate_kelly_position_size(
+    skill_id: str,
+    current_equity: float,
+    *,
+    drawdown_guardian: DrawdownGuardian | None = None,
+    sol_price_usd: float | None = None,
+) -> float:
+    """
+    Production sizing: Kelly fraction for ``skill_id`` → ``DrawdownGuardian.scale_kelly_fraction``
+    → USD notional → **absolute SOL** for the DEX leg.
+
+    Parameters
+    ----------
+    skill_id:
+        Key for persisted stats (e.g. ``sk_oib_momentum``).
+    current_equity:
+        Account equity in **USD** (same numeraire as Kelly fraction).
+    drawdown_guardian:
+        Live guardian updated on equity ticks; if ``None``, a fresh guardian is updated once
+        with ``current_equity`` (neutral multiplier when no history — tests / cold start).
+    sol_price_usd:
+        SOL/USD; if omitted, uses ``trading.portfolio_snapshot`` then env
+        ``PORTFOLIO_FALLBACK_SOL_PRICE_USD``.
+    """
+    try:
+        eq = float(current_equity)
+    except (TypeError, ValueError):
+        return 0.0
+    if eq <= 0:
+        return 0.0
+
+    base_f = kelly_fraction_for_skill(skill_id)
+    if drawdown_guardian is not None:
+        eff_f = drawdown_guardian.scale_kelly_fraction(base_f)
+    else:
+        from trading_skills.drawdown_guardian import DrawdownGuardian
+
+        g = DrawdownGuardian()
+        g.update(eq)
+        eff_f = g.scale_kelly_fraction(base_f)
+
+    notional_usd = eq * eff_f
+    px = _resolve_sol_price_usd(sol_price_usd)
+    if px <= 0:
+        logger.warning("calculate_kelly_position_size: invalid SOL/USD price, returning 0 SOL")
+        return 0.0
+    sol = notional_usd / px
+    return max(0.0, float(sol))
+
+
+def _resolve_sol_price_usd(hint: float | None) -> float:
+    if hint is not None:
+        try:
+            h = float(hint)
+            if h > 0:
+                return h
+        except (TypeError, ValueError):
+            pass
+    try:
+        from trading.portfolio_snapshot import get_snapshot
+
+        s = get_snapshot()
+        p = float(s.get("sol_price") or 0)
+        if p > 0:
+            return p
+    except Exception:
+        pass
+    try:
+        env = float(os.environ.get("PORTFOLIO_FALLBACK_SOL_PRICE_USD") or 0)
+        return env if env > 0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 try:
     from telegram.helpers import escape_markdown

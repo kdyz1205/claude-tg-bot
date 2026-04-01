@@ -56,7 +56,6 @@ from gateway.tg_front import (
     render_risk_settings_text,
 )
 from gateway.gateway_lifecycle import (
-    auto_research_env_enabled,
     cancel_auto_research_background,
     mark_gateway_user_activity,
     start_auto_research_background,
@@ -374,66 +373,9 @@ async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mark_gateway_user_activity()
     await update.message.reply_text(
         "⚔️ *手动交易*\n"
-        "• 直接发自然语言指令（买/卖/平仓等），Jarvis 会走交易意图通道。\n"
-        "• 或发送 `/start` 打开主控面板与引擎控制。\n"
-        "• 链接情绪分析可用 `/feed` 或单独一条 http(s) 链接。",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    uid = update.effective_user.id
-    if not _is_authorized(uid):
-        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
-        return
-    mark_gateway_user_activity()
-    global USER_MODE
-    store = await _session_store_async(context.application)
-    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
-    import live_trader
-
-    cfg = live_trader._load_config()
-    await update.message.reply_text(
-        render_risk_settings_text(USER_MODE, cfg),
-        reply_markup=build_risk_keyboard(USER_MODE),
-        parse_mode="MarkdownV2",
-    )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    uid = update.effective_user.id
-    if not _is_authorized(uid):
-        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
-        return
-    mark_gateway_user_activity()
-    ar_on = auto_research_env_enabled()
-    ar_line = (
-        "• 自主实验循环：`GATEWAY_AUTO_RESEARCH=1` 启动（与主 bot 同源 `auto_research`）；"
-        "可选 `GATEWAY_AUTO_RESEARCH_NOTIFY_CHAT_ID` 接收 TG 通知。\n"
-        if ar_on
-        else "• 自主实验：设环境变量 `GATEWAY_AUTO_RESEARCH=1` 可在本进程启动后台研究循环。\n"
-    )
-    await update.message.reply_text(
-        "📖 *Jarvis 网关速查*\n\n"
-        "/start — 主控面板（持仓、引擎启停、刷新）\n"
-        "/trade — 手动交易说明\n"
-        "/config — 风控与参数（纸/实盘模式切换）\n"
-        "/feed — 链接或正文情绪分析\n"
-        "/dev — 开发/因子造物任务\n\n"
-        f"{ar_line}"
-        "自然语言会按意图分流（策略/因子→造物引擎；买卖→交易提示）；"
-        "以 `/` 开头的消息只走命令处理器。\n"
-        "日志调试：分类结果带 `reasoning` 字段（见网关 debug 日志）。\n"
-        "• LLM 二次分流：`JARVIS_INTENT_LLM=1` + API Key，可减少「策略长文被判成闲聊」。\n"
-        "• 研发→桌面 Claude：`JARVIS_QUEUE_SESSION_COMMANDER=1` 入队；`jarvis-auto on` 或 "
-        "`SESSION_COMMANDER_JARVIS_AUTO=1` 后，`watch`/`monitor` 空闲时自动粘贴到目标会话。\n"
-        "`jarvis-queue` / `jarvis-peek` / `jarvis-pop` 手动查看与取出。\n"
-        "• 实验室：`AUTO_RESEARCH_LAB=1 AUTO_RESEARCH_SKIP_IDLE=1 python auto_research.py`；轮换知识域加 `AUTO_RESEARCH_LAB_ROTATE=1`。\n"
-        "• 路由：`session_commander_config.json` 里 `jarvis_drain_routes`（如 FACTOR_FORGE→会话名）；并行消费用 `jarvis-filter` 或环境变量 FILTER。",
+        "• 直接发自然语言（买/卖/平仓等），由 Jarvis 语义层路由到交易执行。\n"
+        "• 发送 `/start` 打开主控面板（引擎、刷新、纸/实盘与风控键盘）。\n"
+        "• 研发、情绪链接、混沌测试等同样用自然语言描述即可。",
         parse_mode="Markdown",
     )
 
@@ -459,118 +401,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-_DEV_CMD = re.compile(r"^/dev(?:@\w+)?\s*(.*)$", re.IGNORECASE | re.DOTALL)
-
-
-async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """喂养通道：链接或新闻正文 → 极速情绪 + 实体；极端看涨 + 流动性则事件小单。"""
-    global USER_MODE
-    if not update.effective_user or not update.message:
-        return
-    uid = update.effective_user.id
-    if not _is_authorized(uid):
-        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
-        return
-    mark_gateway_user_activity()
-    store = await _session_store_async(context.application)
-    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
-    from gateway.sentiment_feed import process_sentiment_feed
-
-    parts = context.args or []
-    blob = " ".join(parts).strip()
-    if not blob and update.message.reply_to_message:
-        blob = (update.message.reply_to_message.text or "").strip()
-    if not blob:
-        await update.message.reply_text(
-            "用法：/feed <推特/新闻链接 或 正文>\n"
-            "也可回复一条消息发送 /feed（引用原消息）。\n"
-            "单独发一条 http(s) 链接也会自动走本通道。"
-        )
-        return
-    await update.message.reply_text("⚡ Jarvis 极速模型分析中…")
-    try:
-        out = await process_sentiment_feed(blob, user_mode=USER_MODE)
-    except Exception as e:
-        logger.exception("cmd_feed: %s", e)
-        out = f"❌ 分析失败: {e!s}"
-    await update.message.reply_text(out[:4096])
-
-
-async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    uid = update.effective_user.id
-    if not _is_authorized(uid):
-        await update.message.reply_text("⛔ 未授权使用此网关机器人。")
-        return
-    mark_gateway_user_activity()
-    raw = (update.message.text or "").strip()
-    m = _DEV_CMD.match(raw)
-    prompt = (m.group(1) if m else "").strip()
-    if not prompt:
-        await update.message.reply_text(
-            "用法：`/dev <你的开发需求>`\n也可直接发自然语言，Jarvis 会自动识别开发意图。"
-        )
-        return
-
-    from gateway.jarvis_semantic import classify_intent
-
-    row = await classify_intent(prompt, uid=uid)
-    if str(row.get("intent") or "").upper() == "CHAOS_IMMUNITY":
-        await update.message.reply_text(
-            "🧪 已排队混沌抗压免疫任务（模拟盘 + 后台电池）。"
-            "断连模拟时长：CHAOS_API_BLACKOUT_SEC（默认 10s）。"
-        )
-        _gw_schedule(
-            context.application,
-            process_chaos_immunity_task(
-                bot=context.bot,
-                chat_id=update.message.chat_id,
-                uid=uid,
-                dev_timeout_sec=900,
-                min_interval_sec=3.0,
-            ),
-        )
-        return
-
-    if str(row.get("intent") or "").upper() == "WALLET_CLONE":
-        addr = row.get("extracted_address")
-        if not addr:
-            await update.message.reply_text("未识别到有效的 0x 钱包地址。")
-            return
-        await update.message.reply_text(
-            "🔭 已启动后台「对手盘行为克隆」：拉取近 100 笔交易与买入前窗口链上特征…"
-        )
-        _gw_schedule(
-            context.application,
-            process_wallet_clone_task(
-                bot=context.bot,
-                chat_id=update.message.chat_id,
-                wallet_address=str(addr),
-                timeout_sec=600,
-                min_interval_sec=3.0,
-            ),
-        )
-        return
-
-    sub_intent = row.get("sub_intent")
-
-    await update.message.reply_text(
-        "🧠 已理解您的战略意图，正在后台唤醒造物主引擎编写代码..."
-    )
-    _gw_schedule(
-        context.application,
-        process_dev_task(
-            bot=context.bot,
-            chat_id=update.message.chat_id,
-            prompt=prompt,
-            timeout_sec=600,
-            min_interval_sec=3.0,
-            sub_intent=sub_intent,
-        ),
-    )
-
-
 async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """非命令纯文本：CHAT / TRADE / AUTO_DEV。"""
     global USER_MODE
@@ -593,21 +423,10 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         execute_trade_from_user_text,
         user_semantic_lock,
     )
-    from gateway.sentiment_feed import is_single_url_message, process_sentiment_feed
 
     store = await _session_store_async(context.application)
     USER_MODE = _normalize_mode(store.get_trade_mode(uid))
     application = context.application
-
-    if is_single_url_message(text):
-        await update.message.reply_text("⚡ Jarvis 拉取链接并分析情绪…")
-        try:
-            out = await process_sentiment_feed(text, user_mode=USER_MODE)
-        except Exception as e:
-            logger.exception("sentiment_feed url shortcut: %s", e)
-            out = f"❌ 分析失败: {e!s}"
-        await update.message.reply_text(out[:4096])
-        return
 
     async with user_semantic_lock(uid):
         row = await classify_intent(text, uid=uid)
@@ -750,10 +569,6 @@ class TelegramBot:
         # CommandHandler 必须在全局 MessageHandler 之前注册，保证斜杠指令绝对优先
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("trade", cmd_trade))
-        app.add_handler(CommandHandler("config", cmd_config))
-        app.add_handler(CommandHandler("help", cmd_help))
-        app.add_handler(CommandHandler("feed", cmd_feed))
-        app.add_handler(CommandHandler("dev", cmd_dev))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text)
         )

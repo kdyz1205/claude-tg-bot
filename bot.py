@@ -25,7 +25,6 @@ import claude_agent
 import bridge
 from tg_registry import (
     START_FOOTER_COMMANDS,
-    format_help_message,
     register_command_handlers,
     telegram_menu_bot_commands,
 )
@@ -736,6 +735,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     try:
+        from tg_registry.catalog import format_help_message
+
         text = format_help_message()
         await update.message.reply_text(text[:4096])
     except Exception as e:
@@ -8179,86 +8180,61 @@ async def run_polling_lifecycle(app, on_system_ready=None):
             logger.debug("shutdown failed", exc_info=True)
 
 
+async def jarvis_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Physical /start → gateway Jarvis panel (MarkdownV2 + gw:* callbacks)."""
+    from gateway.telegram_bot import cmd_start
+
+    await cmd_start(update, context)
+
+
+async def jarvis_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Physical /trade → gateway trade hint."""
+    from gateway.telegram_bot import cmd_trade
+
+    await cmd_trade(update, context)
+
+
+async def jarvis_plain_text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Single text bus for authorized users: leak guard → ``handle_plain_text`` / Jarvis semantic router.
+    No legacy keyword shortcuts or Claude CLI side-doors on this path.
+    """
+    if not update.message or not update.effective_chat:
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    _words = text.strip().split()
+    _looks_like_seed = len(_words) in (12, 24) and all(
+        w.isalpha() and w.islower() for w in _words
+    )
+    _w0 = _words[0] if _words else ""
+    _looks_like_b58_key = (
+        len(_words) == 1 and 43 <= len(_w0) <= 88 and _w0.isalnum()
+    )
+    if _looks_like_seed or _looks_like_b58_key:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "🚨 检测到疑似私钥/助记词！已自动删除消息。\n\n"
+                "请用文字描述需求，由 Jarvis 引导；勿在聊天中直接发送密钥。"
+            ),
+        )
+        return
+    from gateway.telegram_bot import handle_plain_text
+
+    await handle_plain_text(update, context)
+
+
 def _telegram_command_handlers():
-    """Maps tg_registry.registration keys → coroutines (single source for CommandHandler wiring)."""
+    """Jarvis-only slash surface: /start + /trade (see tg_registry.registration)."""
     return {
-        "start": start,
-        "help_command": help_command,
-        "ping": ping,
-        "clear": clear,
-        "panel_command": panel_command,
-        "quick_action": quick_action,
-        "dev_command": dev_command,
-        "kill_command": kill_command,
-        "tasks_command": tasks_command,
-        "cancel_command": cancel_command,
-        "bridge_command": bridge_command,
-        "quick_screenshot": quick_screenshot,
-        "model_command": model_command,
-        "provider_command": provider_command,
-        "status_command": status_command,
-        "quota_command": quota_command,
-        "sessions_command": sessions_command,
-        "learn_command": learn_command,
-        "score_command": score_command,
-        "train_command": train_command,
-        "session_control_command": session_control_command,
-        "multi_session_command": multi_session_command,
-        "health_command": health_command,
-        "vital_command": vital_command,
-        "monitor_command": monitor_command,
-        "proactive_command": proactive_command,
-        "market_command": market_command,
-        "memory_command": memory_command,
-        "chain_command": chain_command,
-        "portfolio_command": portfolio_command,
-        "strategy_command": strategy_command,
-        "buy_command": buy_command,
-        "sell_command": sell_command,
-        "positions_command": positions_command,
-        "trade_settings_command": trade_settings_command,
-        "pnl_command": pnl_command,
-        "trade_dashboard_command": trade_dashboard_command,
-        "paper_command": paper_command,
-        "live_command": live_command,
-        "wallet_setup_command": wallet_setup_command,
-        "wallet_delete_command": wallet_delete_command,
-        "okx_command": okx_command,
-        "okx_account_command": okx_account_command,
-        "okx_trade_command": okx_trade_command,
-        "okx_backtest_command": okx_backtest_command,
-        "okx_top30_command": okx_top30_command,
-        "ma_ribbon_backtest_command": ma_ribbon_backtest_command,
-        "ma_ribbon_screener_command": ma_ribbon_screener_command,
-        "signal_command": signal_command,
-        "signal_stats_command": signal_stats_command,
-        "alpha_command": alpha_command,
-        "arb_command": arb_command,
-        "token_analyze_command": token_analyze_command,
-        "optimize_command": optimize_command,
-        "onchain_command": onchain_command,
-        "search_command": search_command,
-        "whales_command": whales_command,
-        "track_command": track_command,
-        "wallets_command": wallets_command,
-        "addwallet_command": addwallet_command,
-        "report_command": report_command,
-        "risk_command": risk_command,
-        "performance_command": performance_command,
-        "evolution_command": evolution_command,
-        "evolve_command": evolve_command,
-        "strategy_evolve_command": strategy_evolve_command,
-        "evostatus_command": evostatus_command,
-        "skills_command": skills_command,
-        "autonomy_command": autonomy_command,
-        "consciousness_command": consciousness_command,
-        "selfcheck_command": selfcheck_command,
-        "repairs_command": repairs_command,
-        "repair_status_command": repair_status_command,
-        "code_health_command": code_health_command,
-        "selfrepair_command": selfrepair_command,
-        "dashboard_command": dashboard_command,
-        "codex_command": codex_command,
+        "jarvis_start": jarvis_start,
+        "jarvis_trade": jarvis_trade,
     }
 
 
@@ -8283,80 +8259,38 @@ def create_application():
 
     register_command_handlers(app, auth_filter, _telegram_command_handlers())
 
-    # Callbacks — panel first, then DEX trading, then session control, then quick actions, then safety confirmations
-    app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^(panel_|pcmd_|qa_panel)"))
-    app.add_handler(CallbackQueryHandler(handle_boot_ui_callback, pattern="^boot_ui_"))
-    app.add_handler(CallbackQueryHandler(handle_chain_callback, pattern="^ch_"))
-    app.add_handler(CallbackQueryHandler(handle_trade_dashboard_callback, pattern="^td_"))
-    app.add_handler(CallbackQueryHandler(handle_sniper_callback, pattern="^snp_"))
-    app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern="^dex_"))
-    app.add_handler(CallbackQueryHandler(handle_session_control_callback, pattern="^sc_"))
-    app.add_handler(CallbackQueryHandler(handle_quick_action_callback, pattern="^qa_"))
+    # Jarvis 主控台 inline 按钮（gw:*）— 唯一保留的 Callback 表面
+    import re as _re_gw
+
+    from gateway.telegram_bot import handle_gateway_callback
+    from gateway.tg_front import GW_CB
+
+    _gw_cb_pat = _re_gw.compile(rf"^{_re_gw.escape(GW_CB)}:")
+    app.add_handler(CallbackQueryHandler(handle_gateway_callback, pattern=_gw_cb_pat))
+
+    # Safety confirmations (kill / trade ack) — still required for inline 确认键
     app.add_handler(CallbackQueryHandler(handle_confirmation_callback))
 
-    # Paste-to-buy: detect Solana CA pasted as plain text (group=1 so it doesn't block main handler)
-    app.add_handler(MessageHandler(
-        auth_filter & filters.TEXT & ~filters.COMMAND & filters.Regex(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$'),
-        handle_token_address,
-    ), group=1)
+    async def _non_text_notice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message:
+            await update.message.reply_text(
+                "请发送**文字**指令。\n"
+                "链上、研发、交易、情绪分析等请用自然语言描述，由 Jarvis 统一路由。",
+                parse_mode="Markdown",
+            )
 
-    # Messages
-    app.add_handler(MessageHandler(auth_filter & filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(auth_filter & filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(auth_filter & (filters.VOICE | filters.AUDIO), handle_voice))
-    app.add_handler(MessageHandler(auth_filter & filters.Document.ALL, handle_document))
-
-    # Stickers — acknowledge but don't process
-    async def _handle_sticker(u, c):
-        if u.message:
-            await u.message.reply_text("😄👍")
-    app.add_handler(MessageHandler(auth_filter & filters.Sticker.ALL, _handle_sticker))
-
-    # Video/animation — save and notify Claude
-    app.add_handler(MessageHandler(
-        auth_filter & (filters.VIDEO | filters.ANIMATION | filters.VIDEO_NOTE),
-        handle_video
-    ))
-
-    # Location — forward to Claude as text description
-    async def _handle_location(u, c):
-        if not u.message or not u.message.location:
-            return
-        loc = u.message.location
-        msg = f"用户分享了位置: 纬度 {loc.latitude}, 经度 {loc.longitude}"
-        try:
-            await u.message.reply_text(f"📍 位置已收到: ({loc.latitude}, {loc.longitude})")
-            await claude_agent.process_message(msg, u.effective_chat.id, c)
-        except Exception as e:
-            logger.error(f"Location handling error: {e}", exc_info=True)
-            try:
-                await u.message.reply_text(f"❌ 位置处理失败: {str(e)[:300]}")
-            except Exception:
-                pass
-    app.add_handler(MessageHandler(auth_filter & filters.LOCATION, _handle_location))
-
-    # Contact — forward to Claude as text
-    async def _handle_contact(u, c):
-        if not u.message or not u.message.contact:
-            return
-        ct = u.message.contact
-        msg = f"用户分享了联系人: {ct.first_name or ''} {ct.last_name or ''}, 电话: {ct.phone_number or 'N/A'}"
-        try:
-            await u.message.reply_text(f"👤 联系人已收到: {ct.first_name or ''} {ct.phone_number or ''}")
-            await claude_agent.process_message(msg, u.effective_chat.id, c)
-        except Exception as e:
-            logger.error(f"Contact handling error: {e}", exc_info=True)
-            try:
-                await u.message.reply_text(f"❌ 联系人处理失败: {str(e)[:300]}")
-            except Exception:
-                pass
-    app.add_handler(MessageHandler(auth_filter & filters.CONTACT, _handle_contact))
-
-    # Poll — acknowledge
-    async def _handle_poll(u, c):
-        if u.message:
-            await u.message.reply_text("📊 收到投票/问卷，暂不支持处理。")
-    app.add_handler(MessageHandler(auth_filter & filters.POLL, _handle_poll))
+    app.add_handler(
+        MessageHandler(
+            auth_filter & ~filters.COMMAND & ~filters.TEXT,
+            _non_text_notice,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            auth_filter & filters.TEXT & ~filters.COMMAND,
+            jarvis_plain_text_entry,
+        )
+    )
 
     # Unauthorized
     app.add_handler(MessageHandler(~auth_filter, handle_unauthorized))
@@ -8382,13 +8316,9 @@ def create_application():
                     chat_id=config.AUTHORIZED_USER_ID,
                     text=(
                         "🤖 Bot 已启动（进程重启）。\n\n"
-                        "请先选择链上面板默认视图：\n"
-                        "· 🔴 实盘 — 强调调度/Live\n"
-                        "· 📝 Paper — 强调模拟分段\n"
-                        "真实 OKX/钱包/DEX 快照在 /chain 内始终可见。\n\n"
-                        "也可随时发 /start 重新选择。"
+                        "请发 /start 打开 Jarvis 主控台（纸/实盘、引擎、快照刷新）。\n"
+                        "其他需求请用自然语言描述，由语义层统一路由。"
                     ),
-                    reply_markup=_boot_ui_keyboard(),
                 )
                 application.bot_data["_boot_ui_prompt_sent"] = True
                 _boot_ui_startup_mark_sent()
@@ -8932,7 +8862,7 @@ def create_application():
                 _okx_brain._send_callback = _brain_send
                 logger.info(
                     "OKX V6 Brain ready (mode=%s, equity=$%.2f). "
-                    "Say '开始okx' or /okx_trade start to begin.",
+                    "Control via Jarvis natural language or gw panel.",
                     _okx_brain.executor.state.mode,
                     _okx_brain.executor.state.equity,
                 )

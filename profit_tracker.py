@@ -14,10 +14,19 @@ import os
 import time
 import asyncio
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Optional, Callable, Coroutine
 
 logger = logging.getLogger(__name__)
+
+_failures_ledger_lock = threading.Lock()
+
+try:
+    from pipeline.net_gate import FAILURE_LEDGER, MAX_LEDGER_ENTRIES
+except ImportError:  # pragma: no cover
+    FAILURE_LEDGER = None  # type: ignore[misc,assignment]
+    MAX_LEDGER_ENTRIES = 1000  # type: ignore[misc,assignment]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SIGNAL_HISTORY_FILE = os.path.join(BASE_DIR, "_signal_history.json")
@@ -57,6 +66,87 @@ def _save_signals(signals: list) -> None:
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def _exit_price_from_signal(sig: dict) -> float:
+    cp = sig.get("checked_prices") or {}
+    if not isinstance(cp, dict) or not cp:
+        return 0.0
+    if "24" in cp:
+        try:
+            return float(cp["24"])
+        except (TypeError, ValueError):
+            pass
+    keys = [k for k in cp if str(k).isdigit()]
+    if not keys:
+        return 0.0
+    kmax = max(keys, key=lambda x: int(x))
+    try:
+        return float(cp[kmax])
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _append_signal_loss_to_failure_ledger(sig: dict, final_pnl_pct: float) -> None:
+    """
+    Mirror losing signal resolutions into ``intelligence_data/failures.json`` for
+    TradeMemoryGate / reflection (same list schema as ``pipeline.net_gate`` + extra trace fields).
+    """
+    if FAILURE_LEDGER is None:
+        return
+    path = FAILURE_LEDGER
+    trade_id = str(sig.get("id") or "")
+    skill_id = str(sig.get("skill_id") or sig.get("signal_type") or "")
+    entry = float(sig.get("entry_price") or 0)
+    row = {
+        "symbol": str(sig.get("symbol") or ""),
+        "reason": (
+            f"profit_tracker_signal_loss:{sig.get('signal_type', '?')} "
+            f"trade_id={trade_id} pnl_pct={final_pnl_pct:.4f}"
+        ),
+        "score_at_loss": float(sig.get("score_at_entry", 0) or 0),
+        "liquidity_usd": float(sig.get("liquidity_usd", 0) or 0),
+        "volume_24h_usd": float(sig.get("volume_24h_usd", 0) or 0),
+        "price_change_24h": float(final_pnl_pct),
+        "top10_concentration_pct": float(sig.get("top10_concentration_pct", 0) or 0),
+        "timestamp": time.time(),
+        "trade_id": trade_id,
+        "skill_id": skill_id,
+        "entry_price": entry,
+        "exit_price": _exit_price_from_signal(sig),
+        "final_pnl_pct": float(final_pnl_pct),
+        "direction": str(sig.get("direction") or ""),
+        "source": "profit_tracker",
+    }
+    with _failures_ledger_lock:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            existing: list = []
+            if path.is_file():
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        raw = json.load(f)
+                    if isinstance(raw, list):
+                        existing = raw
+                except (OSError, json.JSONDecodeError):
+                    existing = []
+            existing.append(row)
+            cap = int(MAX_LEDGER_ENTRIES) if MAX_LEDGER_ENTRIES else 1000
+            existing = existing[-cap:]
+            tmp = str(path) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, str(path))
+            logger.info(
+                "profit_tracker: appended loss to failures ledger trade_id=%s skill_id=%s pnl=%.4f%%",
+                trade_id,
+                skill_id,
+                final_pnl_pct,
+            )
+        except OSError as e:
+            logger.warning("profit_tracker: failure ledger append failed: %s", e)
+
 
 def record_arb_signal(pair: str, buy_exchange: str, sell_exchange: str,
                       spread_pct: float, buy_price: float) -> str:
@@ -129,15 +219,27 @@ def format_arb_stats(stats: dict = None) -> str:
     return result[:TG_MSG_LIMIT] if len(result) > TG_MSG_LIMIT else result
 
 
-def record_signal(symbol: str, direction: str, signal_type: str, entry_price: float) -> str:
+def record_signal(
+    symbol: str,
+    direction: str,
+    signal_type: str,
+    entry_price: float,
+    *,
+    skill_id: Optional[str] = None,
+    score_at_entry: Optional[float] = None,
+    liquidity_usd: Optional[float] = None,
+    volume_24h_usd: Optional[float] = None,
+    top10_concentration_pct: Optional[float] = None,
+) -> str:
     """Record a new signal. Returns signal ID.
 
     direction: "long" (profit when price rises) or "short" (profit when falls)
     signal_type: e.g. "breakout_high", "breakout_low", "momentum_1h"
+    skill_id: optional strategy/skill key for Kelly + failure ledger linkage
     """
     signals = _load_signals()
     sig_id = f"{symbol}_{signal_type}_{int(time.time())}"
-    signals.append({
+    row: dict = {
         "id": sig_id,
         "symbol": symbol,
         "direction": direction,
@@ -148,7 +250,18 @@ def record_signal(symbol: str, direction: str, signal_type: str, entry_price: fl
         "checked_prices": {},
         "pnl_pct": {},
         "status": "pending",
-    })
+    }
+    if skill_id:
+        row["skill_id"] = str(skill_id)
+    if score_at_entry is not None:
+        row["score_at_entry"] = float(score_at_entry)
+    if liquidity_usd is not None:
+        row["liquidity_usd"] = float(liquidity_usd)
+    if volume_24h_usd is not None:
+        row["volume_24h_usd"] = float(volume_24h_usd)
+    if top10_concentration_pct is not None:
+        row["top10_concentration_pct"] = float(top10_concentration_pct)
+    signals.append(row)
     _save_signals(signals[-MAX_SIGNALS:])
     return sig_id
 
@@ -200,6 +313,8 @@ async def update_pending_signals() -> None:
                 final_pnl = 0
             sig["final_pnl_pct"] = round(final_pnl, 3)
             sig["status"] = "win" if final_pnl > 0 else "loss"
+            if final_pnl < 0:
+                _append_signal_loss_to_failure_ledger(sig, float(sig["final_pnl_pct"]))
             changed = True
 
     if changed:

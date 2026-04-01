@@ -386,6 +386,21 @@ class DrawdownGuardian:
 
         return round(base_mult, 4)
 
+    def scale_kelly_fraction(self, base_fraction: float) -> float:
+        """
+        Fuse a base Kelly (or any fractional) bet size with drawdown / recovery / cooldown
+        penalties from ``get_position_size_multiplier``. Returns a capped effective fraction ∈ [0, 1].
+        """
+        try:
+            f = float(base_fraction)
+        except (TypeError, ValueError):
+            return 0.0
+        if f <= 0:
+            return 0.0
+        m = self.get_position_size_multiplier()
+        out = f * m
+        return max(0.0, min(1.0, out))
+
     def reset_daily(self) -> None:
         """Reset daily-loss tracking.  Call at the start of each trading day."""
         if len(self.equity_curve) > 0:
