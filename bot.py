@@ -1980,17 +1980,23 @@ async def vital_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show trading positions."""
+    """Show aggregated live portfolio (OKX + DEX + wallet)."""
     if not update.message or not update.effective_chat:
         return
     try:
-        await _send_portfolio(context, update.effective_chat.id)
+        import portfolio_manager as _pm
+
+        text = await _pm.get_live_portfolio_summary(refresh=True)
+        await _safe_reply(update.message, text, parse_mode="MarkdownV2")
     except Exception as e:
         logger.error(f"Portfolio command error: {e}", exc_info=True)
         try:
-            await update.message.reply_text(f"❌ Portfolio error: {str(e)[:300]}")
+            await _send_portfolio(context, update.effective_chat.id)
         except Exception:
-            pass
+            try:
+                await update.message.reply_text(f"❌ Portfolio error: {str(e)[:300]}")
+            except Exception:
+                pass
 
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2141,8 +2147,74 @@ async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _live_trader_instance = None
 _trade_scheduler_instance = None
 
+# Strategy panel: singularity daemon tasks (scheduler uses TradeScheduler._task)
+ACTIVE_STRATEGY_TASKS: dict[str, asyncio.Task] = {}
+# Per-user: use OKX hedge leg on sniper buy (live_trader.execute_atomic_hedge)
+_sniper_hedge_pref: dict[int, bool] = {}
+
 _wallet_setup_pending: dict[int, float] = {}
 _WALLET_SETUP_TIMEOUT = 120  # seconds
+
+
+async def _chain_start_live_scheduler(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> tuple[bool, str]:
+    """Start TradeScheduler in live mode; register background task for shutdown tracking."""
+    global _trade_scheduler_instance
+    if not _live_available or not _trade_scheduler:
+        return False, "❌ 实盘调度模块不可用"
+    if not _wallet or not _wallet.wallet_exists():
+        return False, "❌ 请先 /wallet_setup 配置钱包"
+    if _trade_scheduler_instance and _trade_scheduler_instance.running:
+        return False, "⚠️ 调度已在运行中"
+    async def _send(msg: str):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg[:4096])
+        except Exception:
+            pass
+    if not _trade_scheduler_instance:
+        _trade_scheduler_instance = _trade_scheduler.TradeScheduler(send_func=_send)
+    await _trade_scheduler_instance.start(mode="live")
+    t = getattr(_trade_scheduler_instance, "_task", None)
+    if t is not None:
+        _track_task(context.application.bot_data, t)
+    return True, "🚀 实盘调度已启动（LiveTrader 后台运行）"
+
+
+async def _chain_start_paper_scheduler(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> tuple[bool, str]:
+    """Start TradeScheduler in paper / pro-strategy mode."""
+    global _trade_scheduler_instance
+    if not _trade_scheduler:
+        return False, "❌ 调度模块不可用"
+    if _trade_scheduler_instance and _trade_scheduler_instance.running:
+        return False, "⚠️ 请先停止当前调度再切换模式"
+    async def _send(msg: str):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg[:4096])
+        except Exception:
+            pass
+    if not _trade_scheduler_instance:
+        _trade_scheduler_instance = _trade_scheduler.TradeScheduler(send_func=_send)
+    try:
+        await _trade_scheduler_instance.start(mode="paper")
+    except Exception as e:
+        return False, f"❌ 模拟引擎启动失败: {str(e)[:200]}"
+    t = getattr(_trade_scheduler_instance, "_task", None)
+    if t is not None:
+        _track_task(context.application.bot_data, t)
+    return True, "📝 低频模拟引擎已启动（Paper / ProStrategy）"
+
+
+def _build_strategy_control_keyboard() -> InlineKeyboardMarkup:
+    back_btn = InlineKeyboardButton("⬅️ 返回链上面板", callback_data="ch_back")
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("▶️ 启动实盘 (高频调度)", callback_data="ch_strat_live")],
+            [InlineKeyboardButton("▶️ 启动模拟 (低频引擎)", callback_data="ch_strat_paper")],
+            [InlineKeyboardButton("▶️ 奇点训练守护 (1h)", callback_data="ch_strat_singularity")],
+            [InlineKeyboardButton("⏹ 停止当前策略", callback_data="ch_strat_stop")],
+            [back_btn],
+        ]
+    )
+
 
 async def wallet_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set up wallet for live trading. /wallet_setup <private_key_or_seed>"""
@@ -3189,6 +3261,15 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
             f"SL{s.get('default_sl_pct', -30)} {mev}"
         )
 
+    if ui_mode == "live" and ps.get("updated_at"):
+        try:
+            import portfolio_manager as _pm
+
+            L.append("")
+            L.append(_pm.format_portfolio_plain(ps))
+        except Exception:
+            pass
+
     L.append("━━━━━━━━━━━━━━━━━━━━━━━")
     if is_live:
         L.append("📡 简报=详情 | 🔄 刷新=同步链上 | 约30分钟推送简报")
@@ -3244,6 +3325,9 @@ def _build_chain_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("🔍 扫描机会", callback_data="ch_scan"),
+            InlineKeyboardButton("🧠 策略总控", callback_data="ch_strategy"),
+        ],
+        [
             InlineKeyboardButton("🧬 进化详情", callback_data="ch_evolution"),
         ],
     ]
@@ -3292,6 +3376,89 @@ async def handle_chain_callback(update: Update, context: ContextTypes.DEFAULT_TY
         text = await _build_chain_dashboard(uid_cb)
         try:
             await query.edit_message_text(text, reply_markup=_build_chain_keyboard(uid_cb))
+        except Exception:
+            pass
+        return
+
+    if data == "ch_strategy":
+        await query.answer()
+        hdr = (
+            "🧠 策略总控\n\n"
+            "▶️ 高频：Solana 实盘调度 + LiveTrader\n"
+            "▶️ 低频：TradeScheduler paper（ProStrategy）\n"
+            "▶️ 奇点：singularity_engine 守护（约 1h 周期）\n\n"
+            "⏹ 停止：取消奇点后台任务并停止 TradeScheduler。"
+        )
+        try:
+            await query.edit_message_text(hdr, reply_markup=_build_strategy_control_keyboard())
+        except Exception:
+            pass
+        return
+
+    if data == "ch_strat_live":
+        await query.answer()
+        ok, msg = await _chain_start_live_scheduler(context, chat_id)
+        try:
+            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[back_btn]]))
+        except Exception:
+            pass
+        return
+
+    if data == "ch_strat_paper":
+        await query.answer()
+        ok, msg = await _chain_start_paper_scheduler(context, chat_id)
+        try:
+            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[back_btn]]))
+        except Exception:
+            pass
+        return
+
+    if data == "ch_strat_singularity":
+        await query.answer()
+        existing = ACTIVE_STRATEGY_TASKS.get("singularity")
+        if existing is not None and not existing.done():
+            try:
+                await query.edit_message_text(
+                    "⚠️ 奇点守护已在运行。",
+                    reply_markup=InlineKeyboardMarkup([[back_btn]]),
+                )
+            except Exception:
+                pass
+            return
+
+        async def _sing_daemon():
+            from singularity_engine import run_daemon
+
+            await run_daemon(3600.0)
+
+        t = asyncio.create_task(_sing_daemon(), name="singularity_daemon")
+        ACTIVE_STRATEGY_TASKS["singularity"] = t
+        _track_task(context.application.bot_data, t)
+        try:
+            await query.edit_message_text(
+                "✅ 奇点训练守护已启动（约 1h 周期）。\n使用「⏹ 停止当前策略」可取消。",
+                reply_markup=InlineKeyboardMarkup([[back_btn]]),
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "ch_strat_stop":
+        await query.answer("正在停止…", show_alert=False)
+        for _k, t in list(ACTIVE_STRATEGY_TASKS.items()):
+            if t is not None and not t.done():
+                t.cancel()
+        ACTIVE_STRATEGY_TASKS.clear()
+        try:
+            if _trade_scheduler_instance and _trade_scheduler_instance.running:
+                await _trade_scheduler_instance.stop()
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text(
+                "⏹ 已停止奇点任务与交易调度器（若之前在运行）。",
+                reply_markup=InlineKeyboardMarkup([[back_btn]]),
+            )
         except Exception:
             pass
         return

@@ -235,7 +235,7 @@ if _flask_available:
 <div class="section">
   <h2>Trading snapshot (后台轮询)</h2>
   <table id="pf-table">
-    <thead><tr><th>来源</th><th>明细</th></tr></thead>
+    <thead><tr><th>来源</th><th>明细</th><th>浮动</th></tr></thead>
     <tbody id="pf-body"></tbody>
   </table>
 </div>
@@ -353,19 +353,21 @@ async function refresh() {
     const pbody = document.getElementById('pf-body');
     pbody.innerHTML = '';
     const rows = [];
-    (pf.okx && pf.okx.positions || []).slice(0, 6).forEach(p => {
-      rows.push(['OKX', esc(p.instId || '') + '  $' + (p.notionalUsd || 0)]);
+    (pf.okx && pf.okx.positions || []).slice(0, 8).forEach(p => {
+      const upl = p.upl != null ? (p.upl >= 0 ? '+' : '') + Number(p.upl).toFixed(2) + ' USDT' : '—';
+      rows.push(['OKX', esc(p.instId || '') + '  $' + (p.notionalUsd || 0), esc(upl)]);
     });
-    (pf.dex && pf.dex.positions || []).slice(0, 6).forEach(p => {
-      rows.push(['DEX', esc(p.symbol || '') + '  ' + (p.amount_sol || 0) + ' SOL']);
+    (pf.dex && pf.dex.positions || []).slice(0, 8).forEach(p => {
+      const pnl = p.pnl_pct != null ? (p.pnl_pct >= 0 ? '+' : '') + Number(p.pnl_pct).toFixed(1) + '%' : '—';
+      rows.push(['DEX', esc(p.symbol || '') + '  ' + (p.amount_sol || 0) + ' SOL', esc(pnl)]);
     });
     (pf.wallet && pf.wallet.tokens || []).slice(0, 6).forEach(t => {
-      rows.push(['链上', esc(t.label || '') + '  ' + t.amount]);
+      rows.push(['链上', esc(t.label || '') + '  ' + t.amount, '—']);
     });
     if (!rows.length) {
-      rows.push(['—', pf.last_error ? esc(String(pf.last_error).slice(0, 120)) : '等待后台同步…']);
+      rows.push(['—', pf.last_error ? esc(String(pf.last_error).slice(0, 120)) : '等待后台同步…', '—']);
     }
-    rows.forEach(([a, b]) => { pbody.innerHTML += `<tr><td>${a}</td><td>${b}</td></tr>`; });
+    rows.forEach(([a, b, c]) => { pbody.innerHTML += `<tr><td>${a}</td><td>${b}</td><td>${c}</td></tr>`; });
   } catch(e) {
     document.getElementById('ts').textContent = 'Error: ' + e.message;
   }
