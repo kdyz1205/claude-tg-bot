@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,11 @@ _data: dict[str, Any] = {
         "positions": [],
         "total_invested_sol": 0.0,
         "total_value_sol": 0.0,
+    },
+    "poly": {
+        "configured": False,
+        "oracle_enabled": False,
+        "recent": [],
     },
     "last_error": "",
 }
@@ -78,8 +84,17 @@ def _empty() -> dict[str, Any]:
             "total_invested_sol": 0.0,
             "total_value_sol": 0.0,
         },
+        "poly": {
+            "configured": False,
+            "oracle_enabled": False,
+            "recent": [],
+        },
         "last_error": "",
     }
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
 
 
 def get_snapshot() -> dict[str, Any]:
@@ -266,6 +281,51 @@ async def _leg_dex() -> tuple[dict[str, Any], list[str]]:
     return block, errs
 
 
+async def _leg_poly() -> tuple[dict[str, Any], list[str]]:
+    """Polymarket CLOB (Polygon) — separate from Solana/OKX/DEX; no on-chain Solana calls."""
+    errs: list[str] = []
+    block: dict[str, Any] = {
+        "configured": False,
+        "oracle_enabled": False,
+        "recent": [],
+    }
+    try:
+        pk = (os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY") or "").strip()
+        block["configured"] = bool(pk)
+    except Exception:
+        pass
+    try:
+        cfg_path = _repo_root() / "_live_config.json"
+        if cfg_path.exists():
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                block["oracle_enabled"] = bool(cfg.get("poly_enabled"))
+    except Exception as e:
+        errs.append(f"poly_cfg:{e}")
+    try:
+        pf = _repo_root() / "_poly_executions.json"
+        if pf.exists():
+            with open(pf, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                for row in data[-4:]:
+                    if not isinstance(row, dict):
+                        continue
+                    tid = str(row.get("token_id") or "")
+                    block["recent"].append(
+                        {
+                            "ts": float(row.get("ts") or 0),
+                            "stake_usd": float(row.get("stake_usd") or 0),
+                            "ok": bool(row.get("ok")),
+                            "token_id": tid[:24] + ("…" if len(tid) > 24 else ""),
+                        }
+                    )
+    except Exception as e:
+        errs.append(f"poly_log:{e}")
+    return block, errs
+
+
 async def refresh_once() -> None:
     """One full refresh — concurrent legs, then merge into global snapshot."""
     global _data
@@ -278,6 +338,7 @@ async def refresh_once() -> None:
         _leg_wallet(),
         _leg_okx(),
         _leg_dex(),
+        _leg_poly(),
         return_exceptions=True,
     )
 
@@ -313,6 +374,14 @@ async def refresh_once() -> None:
         dblk, e3 = results[3]
         snap["dex"] = dblk
         err_parts.extend(e3)
+
+    if isinstance(results[4], BaseException):
+        err_parts.append(f"poly:{results[4]}")
+        snap["poly"]["error"] = str(results[4])[:200]
+    else:
+        pblk, e4 = results[4]
+        snap["poly"] = pblk
+        err_parts.extend(e4)
 
     snap["sol_price"] = sol_p
     snap["sol_chg_pct"] = sol_c

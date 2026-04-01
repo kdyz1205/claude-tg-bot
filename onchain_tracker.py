@@ -1,15 +1,17 @@
 """
 onchain_tracker.py — On-chain smart money / whale tracker.
 
-Monitors known whale addresses on ETH, BSC, and Solana using free public APIs:
-- Etherscan (free tier, optional API key from ETHERSCAN_API_KEY env var)
-- BSCScan  (free tier, optional API key from BSCSCAN_API_KEY env var)
-- Solscan  public API (no key required)
-- CoinGecko public API for prices (no key required)
+Chain activity uses **WebSocket subscriptions** (see ``onchain_ws_listen``):
+- EVM (ETH/BSC): AsyncWeb3 + ``wss://`` ``eth_subscribe`` on ERC-20 ``Transfer`` logs and
+  ``newHeads`` for native transfers; automatic reconnect (``while True`` + try/except).
+- Solana: ``logs_subscribe`` (mentions) over WSS + per-event ``get_transaction`` for amounts.
 
-Scans every 10 minutes for large transfers (>$100k USD).
-Emits high-confidence signals when whale activity aligns with technical indicators.
-Signals saved to .whale_signals.json.
+Spot prices still come from CoinGecko over HTTP on a slow refresh (not used as a chain poll).
+
+Configure RPC endpoints via ``ONCHAIN_ETH_WSS``, ``ONCHAIN_BSC_WSS``, ``ONCHAIN_SOL_WSS``,
+and ``SOLANA_RPC_HTTP`` in ``config`` / environment.
+
+Whale threshold: large transfers (>$100k USD). Signals saved to .whale_signals.json.
 """
 
 import asyncio
@@ -25,19 +27,26 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_httpx_json(resp: httpx.Response) -> dict | list | None:
+    try:
+        out = resp.json()
+        return out if isinstance(out, (dict, list)) else None
+    except json.JSONDecodeError:
+        logger.debug("onchain_tracker: JSON decode failed url=%s", getattr(resp, "url", ""))
+        return None
+
+
 # HTTP: reuse one client per scan wave to reduce connection churn and timeout risk.
 _HTTP_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 _HTTP_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
-_SCAN_CONCURRENCY = asyncio.Semaphore(6)
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SIGNALS_FILE = os.path.join(BASE_DIR, ".whale_signals.json")
 ADDRESSES_FILE = os.path.join(BASE_DIR, ".whale_addresses.json")
 
 MIN_TRANSFER_USD = 100_000   # $100k threshold
 TG_MSG_LIMIT = 4096          # Telegram message character limit
-SCAN_INTERVAL = 600          # 10 minutes
-LOOKBACK_SECONDS = 700       # how far back to check per scan
+SCAN_INTERVAL = 600          # legacy constant (WS mode: no scan interval)
 
 # ── Default whale addresses ───────────────────────────────────────────────────
 
@@ -108,7 +117,9 @@ async def _get_prices(client: httpx.AsyncClient) -> dict:
         params = {"ids": "ethereum,binancecoin,solana", "vs_currencies": "usd"}
         resp = await client.get(url, params=params)
         resp.raise_for_status()
-        data = resp.json()
+        data = _safe_httpx_json(resp)
+        if not isinstance(data, dict):
+            raise ValueError("coingecko: invalid JSON")
         # Cap price cache size
         if len(_PRICE_CACHE) > _MAX_PRICE_CACHE_ENTRIES:
             _PRICE_CACHE.clear()
@@ -123,78 +134,6 @@ async def _get_prices(client: httpx.AsyncClient) -> dict:
         if "ETH" not in _PRICE_CACHE:
             _PRICE_CACHE.update({"ETH": 3000.0, "BNB": 400.0, "SOL": 150.0, "_ts": 0})
     return _PRICE_CACHE
-
-
-# ── Blockchain API calls ──────────────────────────────────────────────────────
-
-def _etherscan_result_rows(data: dict) -> list:
-    """Etherscan/BSCScan often returns result=str on rate limit; only accept list rows."""
-    res = data.get("result")
-    if not isinstance(res, list):
-        return []
-    return res
-
-
-async def _etherscan_txlist(
-    client: httpx.AsyncClient, address: str, api_key: str, base_url: str
-) -> list:
-    params = {
-        "module": "account", "action": "txlist",
-        "address": address, "sort": "desc", "offset": 20, "page": 1,
-    }
-    if api_key:
-        params["apikey"] = api_key
-    try:
-        resp = await client.get(base_url, params=params)
-        data = resp.json()
-        if data.get("status") == "1":
-            min_ts = int(time.time()) - LOOKBACK_SECONDS
-            rows = _etherscan_result_rows(data)
-            return [tx for tx in rows
-                    if isinstance(tx, dict) and int(tx.get("timeStamp") or 0) >= min_ts]
-    except Exception as e:
-        logger.debug("txlist %s: %s", address[:8], e)
-    return []
-
-
-async def _etherscan_tokentx(
-    client: httpx.AsyncClient, address: str, api_key: str, base_url: str
-) -> list:
-    params = {
-        "module": "account", "action": "tokentx",
-        "address": address, "sort": "desc", "offset": 20, "page": 1,
-    }
-    if api_key:
-        params["apikey"] = api_key
-    try:
-        resp = await client.get(base_url, params=params)
-        data = resp.json()
-        if data.get("status") == "1":
-            min_ts = int(time.time()) - LOOKBACK_SECONDS
-            rows = _etherscan_result_rows(data)
-            return [tx for tx in rows
-                    if isinstance(tx, dict) and int(tx.get("timeStamp") or 0) >= min_ts]
-    except Exception as e:
-        logger.debug("tokentx %s: %s", address[:8], e)
-    return []
-
-
-async def _solscan_txs(client: httpx.AsyncClient, address: str) -> list:
-    try:
-        url = "https://public-api.solscan.io/account/transactions"
-        params = {"account": address, "limit": 20}
-        headers = {"accept": "application/json"}
-        resp = await client.get(url, params=params, headers=headers)
-        if resp.status_code == 200:
-            body = resp.json()
-            if not isinstance(body, list):
-                return []
-            min_ts = int(time.time()) - LOOKBACK_SECONDS
-            return [tx for tx in body
-                    if isinstance(tx, dict) and tx.get("blockTime", 0) >= min_ts]
-    except Exception as e:
-        logger.debug("solscan %s: %s", address[:8], e)
-    return []
 
 
 # ── Transaction classifiers ───────────────────────────────────────────────────
@@ -298,11 +237,12 @@ class OnchainTracker:
     def __init__(self, send_func=None):
         self._send = send_func
         self._running = False
-        self._task: Optional[asyncio.Task] = None
+        self._ws_tasks: list[asyncio.Task] = []
+        self._price_task: Optional[asyncio.Task] = None
+        self._signal_lock = asyncio.Lock()
+        self._prices_live: dict = {"ETH": 3000.0, "BNB": 400.0, "SOL": 150.0, "_ts": 0.0}
         self._signals: list = []
         self._addresses: dict = {}
-        self._etherscan_key = os.getenv("ETHERSCAN_API_KEY", "")
-        self._bscscan_key = os.getenv("BSCSCAN_API_KEY", "")
         self._load_addresses()
 
     # ── Address management ────────────────────────────────────────────────
@@ -394,117 +334,81 @@ class OnchainTracker:
             return
         self._load_signals()
         self._running = True
-        self._task = asyncio.create_task(self._loop(), name="onchain_tracker")
-        self._task.add_done_callback(self._on_done)
-        logger.info("OnchainTracker started, monitoring %d addresses", len(self._addresses))
+        import onchain_ws_listen
+
+        self._price_task = asyncio.create_task(self._price_refresh_loop(), name="onchain_prices")
+        self._price_task.add_done_callback(self._ws_task_done)
+        self._ws_tasks = onchain_ws_listen._schedule_ws_runners_whale(self)
+        for t in self._ws_tasks:
+            t.add_done_callback(self._ws_task_done)
+        if not self._ws_tasks:
+            logger.warning(
+                "OnchainTracker: no WS runners (set ONCHAIN_ETH_WSS / ONCHAIN_BSC_WSS / "
+                "ONCHAIN_SOL_WSS + SOLANA_RPC_HTTP in .env). Tracker will idle except price refresh."
+            )
+        logger.info("OnchainTracker started (WebSocket mode), %d addresses", len(self._addresses))
 
     async def stop(self):
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
+        if self._price_task and not self._price_task.done():
+            self._price_task.cancel()
             try:
-                await self._task
+                await self._price_task
             except asyncio.CancelledError:
                 pass
-
-    def _on_done(self, task: asyncio.Task):
-        if not task.cancelled():
+        for t in self._ws_tasks:
+            if not t.done():
+                t.cancel()
+        for t in self._ws_tasks:
             try:
-                task.result()
-            except Exception as e:
-                logger.error("OnchainTracker loop crashed: %s", e, exc_info=True)
+                await t
+            except asyncio.CancelledError:
+                pass
+        self._ws_tasks.clear()
 
-    async def _loop(self):
-        await asyncio.sleep(30)  # initial warm-up delay
+    def _ws_task_done(self, task: asyncio.Task):
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as e:
+            logger.error("OnchainTracker background task crashed: %s", e, exc_info=True)
+
+    async def _price_refresh_loop(self):
+        await asyncio.sleep(5)
+        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/onchain_tracker"}
         while self._running:
             try:
-                await self._scan_all()
+                async with httpx.AsyncClient(
+                    timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
+                ) as client:
+                    p = await _get_prices(client)
+                    self._prices_live = p
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("OnchainTracker scan error: %s", e)
+                logger.debug("OnchainTracker price refresh: %s", e)
             try:
-                await asyncio.sleep(SCAN_INTERVAL)
+                await asyncio.sleep(_PRICE_CACHE_TTL)
             except asyncio.CancelledError:
                 break
 
-    # ── Scanning ──────────────────────────────────────────────────────────
-
-    async def _scan_all(self):
-        headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/onchain_tracker"}
-        async with httpx.AsyncClient(
-            timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
-        ) as client:
-            prices = await _get_prices(client)
-            new_signals = []
-
-            async def _one(addr: str, meta: dict) -> list:
-                async with _SCAN_CONCURRENCY:
-                    try:
-                        return await self._scan_address(client, addr, meta, prices)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        logger.debug("scan_address %s error: %s", addr[:8], e)
-                        return []
-
-            pairs = list(self._addresses.items())
-            batch_results = await asyncio.gather(
-                *[_one(a, m) for a, m in pairs],
-                return_exceptions=True,
-            )
-            for r in batch_results:
-                if isinstance(r, list):
-                    new_signals.extend(r)
-                elif isinstance(r, Exception):
-                    logger.debug("scan batch error: %s", r)
-            await asyncio.sleep(0.3)
-
-        if new_signals:
-            # Dedup by tx_hash to avoid recording same transaction twice
-            existing_hashes = {s.get("tx_hash") for s in self._signals if s.get("tx_hash")}
-            new_signals = [s for s in new_signals if s.get("tx_hash") not in existing_hashes]
-        if new_signals:
-            self._signals.extend(new_signals)
+    async def _push_whale_signal_from_classified(
+        self, classified: dict, address: str, label: str, network: str
+    ) -> None:
+        sig = self._build_signal(classified, address, label, network)
+        async with self._signal_lock:
+            h = sig.get("tx_hash") or ""
+            existing = {s.get("tx_hash") for s in self._signals if s.get("tx_hash")}
+            if h and h in existing:
+                return
+            self._signals.append(sig)
             self._save_signals()
-            for sig in new_signals:
-                if self._send:
-                    try:
-                        await self._send(self._format_signal(sig))
-                    except Exception:
-                        pass
-
-    async def _scan_address(
-        self, client: httpx.AsyncClient, address: str, meta: dict, prices: dict
-    ) -> list:
-        network = meta.get("network", "eth")
-        label = meta.get("label", address[:8])
-        found = []
-
-        if network == "sol":
-            for tx in await _solscan_txs(client, address):
-                c = _classify_sol(tx, address, prices)
-                if c:
-                    found.append(self._build_signal(c, address, label, "sol"))
-
-        elif network in ("eth", "bsc"):
-            eth_url = "https://api.etherscan.io/api"
-            bsc_url = "https://api.bscscan.com/api"
-            base_url = eth_url if network == "eth" else bsc_url
-            api_key = self._etherscan_key if network == "eth" else self._bscscan_key
-
-            for tx in await _etherscan_txlist(client, address, api_key, base_url):
-                c = _classify_native(tx, address, prices, network)
-                if c:
-                    found.append(self._build_signal(c, address, label, network))
-
-            await asyncio.sleep(0.5)
-            for tx in await _etherscan_tokentx(client, address, api_key, base_url):
-                c = _classify_erc20(tx, address)
-                if c:
-                    found.append(self._build_signal(c, address, label, network))
-
-        return found
+        if self._send:
+            try:
+                await self._send(self._format_signal(sig))
+            except Exception:
+                pass
 
     def _build_signal(self, classified: dict, address: str, label: str, network: str) -> dict:
         token = classified.get("token", "unknown")
@@ -620,8 +524,7 @@ whale_tracker = OnchainTracker()
 SMART_WALLETS_FILE = os.path.join(BASE_DIR, ".smart_wallets.json")
 SMART_MIN_BUY_USD = 50_000    # $50k threshold for ETH/BSC
 SMART_MIN_SOL = 10            # 10 SOL minimum for Solana buys
-SMART_SCAN_INTERVAL = 300     # 5 minutes
-SMART_LOOKBACK_SECONDS = 360  # slightly more than scan interval
+SMART_SCAN_INTERVAL = 300     # housekeeping interval (seconds)
 SMART_PERF_FILE = os.path.join(BASE_DIR, ".smart_signal_perf.json")
 
 # ── v2 Smart Money constants ────────────────────────────────────────────────
@@ -667,7 +570,9 @@ async def _dexscreener_token_info(
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}"
         resp = await client.get(url)
-        data = resp.json()
+        data = _safe_httpx_json(resp)
+        if not isinstance(data, dict):
+            return {}
         pairs = data.get("pairs") or []
         if pairs:
             p = pairs[0]
@@ -684,44 +589,19 @@ async def _dexscreener_token_info(
     return {}
 
 
-async def _solscan_spl_transfers(
-    client: httpx.AsyncClient, address: str, lookback: int
-) -> list:
-    """Fetch recent SPL token transfers for a Solana address."""
-    try:
-        url = "https://public-api.solscan.io/account/splTransfers"
-        params = {"account": address, "limit": 25, "offset": 0}
-        headers = {"accept": "application/json"}
-        resp = await client.get(url, params=params, headers=headers)
-        if resp.status_code == 200:
-            data = resp.json()
-            items = (
-                data.get("data", []) if isinstance(data, dict)
-                else (data if isinstance(data, list) else [])
-            )
-            min_ts = int(time.time()) - lookback
-            return [
-                tx for tx in items
-                if isinstance(tx, dict) and tx.get("blockTime", 0) >= min_ts
-            ]
-    except Exception as e:
-        logger.debug("solscan_spl %s: %s", address[:8], e)
-    return []
-
-
 class SmartMoneyTracker:
-    """Track known profitable wallets every 2 min. Alert on buys >$50k."""
+    """Track known profitable wallets via WebSocket chain feeds; alert on large buys."""
 
     def __init__(self, send_func=None):
         self._send = send_func
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._ws_tasks: list[asyncio.Task] = []
+        self._signal_lock = asyncio.Lock()
         self._wallets: dict = {}
         self._recent_activity: list = []
         self._seen_hashes: set = set()
         self._perf_records: list = []   # [{tx_hash, token, entry_price, contract, timestamp, result}]
-        self._etherscan_key = os.getenv("ETHERSCAN_API_KEY", "")
-        self._bscscan_key = os.getenv("BSCSCAN_API_KEY", "")
         # ── v2 state ──
         self._token_price_cache: dict = {}          # {contract: {price, ts, info}}
         self._new_token_discoveries: dict = {}      # {contract: {wallets, first_seen, price_at_discovery, checkpoints}}
@@ -1287,8 +1167,13 @@ class SmartMoneyTracker:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(url, params=params)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    return [w.get("address", "") for w in data if w.get("address")]
+                    data = _safe_httpx_json(resp)
+                    if isinstance(data, list):
+                        return [
+                            w.get("address", "")
+                            for w in data
+                            if isinstance(w, dict) and w.get("address")
+                        ]
         except Exception as e:
             logger.debug("helius top wallets: %s", e)
         return []
@@ -1362,9 +1247,19 @@ class SmartMoneyTracker:
         if self._running:
             return
         self._running = True
-        self._task = asyncio.create_task(self._loop(), name="smart_money_tracker")
+        import onchain_ws_listen
+
+        self._ws_tasks = onchain_ws_listen._schedule_ws_runners_smart(self)
+        for t in self._ws_tasks:
+            t.add_done_callback(self._on_done)
+        self._task = asyncio.create_task(self._housekeeping_loop(), name="smart_money_housekeeping")
         self._task.add_done_callback(self._on_done)
-        logger.info("SmartMoneyTracker started, watching %d wallets", len(self._wallets))
+        if not self._ws_tasks:
+            logger.warning(
+                "SmartMoneyTracker: no WS runners; set ONCHAIN_*_WSS and SOLANA_RPC_HTTP. "
+                "Housekeeping only."
+            )
+        logger.info("SmartMoneyTracker started (WebSocket mode), %d wallets", len(self._wallets))
 
     async def stop(self):
         self._running = False
@@ -1375,147 +1270,89 @@ class SmartMoneyTracker:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        for t in self._ws_tasks:
+            if not t.done():
+                t.cancel()
+        for t in self._ws_tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        self._ws_tasks.clear()
 
     def _on_done(self, task: asyncio.Task):
-        if not task.cancelled():
-            try:
-                task.result()
-            except Exception as e:
-                logger.error("SmartMoneyTracker loop crashed: %s", e, exc_info=True)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as e:
+            logger.error("SmartMoneyTracker background task crashed: %s", e, exc_info=True)
 
-    async def _loop(self):
-        await asyncio.sleep(15)  # short warm-up
+    async def _housekeeping_loop(self):
+        await asyncio.sleep(15)
         _perf_check_counter = 0
         _wallet_refresh_counter = 0
         while self._running:
             try:
-                await self._scan_all()
                 self._prune_activity()
                 self._maybe_save_cache()
                 _perf_check_counter += 1
                 _wallet_refresh_counter += 1
-                # Evaluate outcomes + resolve wallet scores every 6 cycles (~30 min)
                 if _perf_check_counter % 6 == 0:
                     await self._evaluate_pending_signals()
                     await self._resolve_pending_outcomes()
                     await self._check_all_discoveries()
-                # Refresh wallet list every 72 cycles (~6h)
                 if _wallet_refresh_counter % 72 == 0:
                     await self._refresh_wallet_list()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("SmartMoneyTracker scan error: %s", e)
+                logger.error("SmartMoneyTracker housekeeping error: %s", e)
             try:
                 await asyncio.sleep(SMART_SCAN_INTERVAL)
             except asyncio.CancelledError:
                 break
 
-    # ── Scanning ──────────────────────────────────────────────────────────
+    async def _ingest_smart_signal(self, sig: dict) -> None:
+        address = sig.get("address", "")
+        tx_hash = sig.get("tx_hash", "")
+        async with self._signal_lock:
+            if tx_hash and tx_hash in self._seen_hashes:
+                return
+            if tx_hash:
+                self._seen_hashes.add(tx_hash)
+            self._recent_activity.append(sig)
 
-    async def _scan_all(self):
+        self._register_signal_for_perf(sig)
+        contract = sig.get("contract_address", "")
+        token = sig.get("token", "UNKNOWN")
+        entry_price = sig.get("entry_price", 0)
+        amount_usd = sig.get("amount_usd", 0)
+        self._record_pending_outcome(address, contract, entry_price, token)
+        self._update_consensus_window(contract, address, amount_usd, token)
+        await self._check_consensus(contract, token)
+        await self._handle_new_token_discovery(contract, token, address, entry_price)
+
         headers = {"Accept": "application/json", "User-Agent": "claude-tg-bot/smart_money"}
         async with httpx.AsyncClient(
             timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS, headers=headers
         ) as client:
             prices = await _get_prices(client)
+        is_whale = False
+        if sig.get("network") == "sol":
+            sol_price = prices.get("SOL", 150)
+            sol_amount = amount_usd / sol_price if sol_price else 0
+            if sol_amount >= WHALE_SOL_THRESHOLD and self._is_new_position(address, contract):
+                is_whale = True
 
-            async def _one_wallet(addr: str, meta: dict) -> list:
-                async with _SCAN_CONCURRENCY:
-                    try:
-                        return await self._scan_address(client, addr, meta, prices)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        logger.debug("smart_scan %s: %s", addr[:8], e)
-                        return []
-
-            pairs = list(self._wallets.items())
-            batches = await asyncio.gather(
-                *[_one_wallet(a, m) for a, m in pairs],
-                return_exceptions=True,
-            )
-            for i, item in enumerate(batches):
-                if isinstance(item, Exception):
-                    logger.debug("smart batch error: %s", item)
-                    continue
-                if not isinstance(item, list) or i >= len(pairs):
-                    continue
-                address, _meta = pairs[i]
-                for sig in item:
-                    tx_hash = sig.get("tx_hash", "")
-                    if tx_hash and tx_hash not in self._seen_hashes:
-                        self._seen_hashes.add(tx_hash)
-                        self._recent_activity.append(sig)
-                        self._register_signal_for_perf(sig)
-
-                        contract = sig.get("contract_address", "")
-                        token = sig.get("token", "UNKNOWN")
-                        entry_price = sig.get("entry_price", 0)
-                        amount_usd = sig.get("amount_usd", 0)
-
-                        self._record_pending_outcome(address, contract, entry_price, token)
-
-                        self._update_consensus_window(contract, address, amount_usd, token)
-                        await self._check_consensus(contract, token)
-
-                        await self._handle_new_token_discovery(
-                            contract, token, address, entry_price
-                        )
-
-                        is_whale = False
-                        if sig.get("network") == "sol":
-                            sol_price = prices.get("SOL", 150)
-                            sol_amount = amount_usd / sol_price if sol_price else 0
-                            if (
-                                sol_amount >= WHALE_SOL_THRESHOLD
-                                and self._is_new_position(address, contract)
-                            ):
-                                is_whale = True
-
-                        if self._send:
-                            try:
-                                if is_whale:
-                                    await self._send(self._format_whale_alert(sig))
-                                else:
-                                    await self._send(self._format_buy_signal(sig))
-                            except Exception:
-                                pass
-            await asyncio.sleep(0.3)
-
-    async def _scan_address(
-        self, client: httpx.AsyncClient, address: str, meta: dict, prices: dict
-    ) -> list:
-        network = meta.get("network", "eth")
-        label = meta.get("label", address[:8])
-        found = []
-
-        if network == "sol":
-            for tx in await _solscan_spl_transfers(
-                client, address, SMART_LOOKBACK_SECONDS
-            ):
-                sig = await self._classify_sol_buy(
-                    client, tx, address, label, prices
-                )
-                if sig:
-                    found.append(sig)
-
-        elif network in ("eth", "bsc"):
-            base_url = (
-                "https://api.etherscan.io/api" if network == "eth"
-                else "https://api.bscscan.com/api"
-            )
-            api_key = self._etherscan_key if network == "eth" else self._bscscan_key
-            for tx in await _etherscan_tokentx(client, address, api_key, base_url):
-                if tx.get("to", "").lower() != address.lower():
-                    continue  # only receives (buys)
-                sig = await self._classify_erc20_buy(
-                    client, tx, address, label, network, prices
-                )
-                if sig:
-                    found.append(sig)
-
-        return found
+        if self._send:
+            try:
+                if is_whale:
+                    await self._send(self._format_whale_alert(sig))
+                else:
+                    await self._send(self._format_buy_signal(sig))
+            except Exception:
+                pass
 
     async def _classify_erc20_buy(
         self,
@@ -1602,6 +1439,8 @@ class SmartMoneyTracker:
             amount_usd = 0.0
             current_price = 0.0
 
+            sol_price = prices.get("SOL", 150)
+
             if token_address:
                 info = await self._cached_token_info(client, token_address)
                 if info.get("price_usd"):
@@ -1609,8 +1448,14 @@ class SmartMoneyTracker:
                     amount_usd = token_amount * current_price
                     token_name = info.get("token_name") or token_name
                     token_symbol = info.get("token_symbol") or token_symbol
+                else:
+                    return None
+            elif str(token_symbol).upper() == "SOL":
+                current_price = float(sol_price)
+                amount_usd = token_amount * current_price
+            else:
+                return None
 
-            sol_price = prices.get("SOL", 150)
             min_usd = SMART_MIN_SOL * sol_price
             if amount_usd < min_usd:
                 return None

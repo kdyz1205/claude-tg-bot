@@ -160,6 +160,8 @@ class OKXExecutor:
         self._price_cache: dict[str, float] = {}
         self._price_cache_ts: dict[str, float] = {}
         self._lock = asyncio.Lock()
+        # Live opens reserve notional while REST I/O runs so concurrent hedges don't oversubscribe.
+        self._pending_live_open_usd: float = 0.0
         self._aio_session: Optional["aiohttp.ClientSession"] = None
         self._aio_session_lock = asyncio.Lock()
         self._okx_http_spacing_lock = asyncio.Lock()
@@ -316,7 +318,10 @@ class OKXExecutor:
             return False, self.state.shutdown_reason
         if len(self.state.positions) >= self.risk.max_positions and symbol not in self.state.positions:
             return False, f"Max positions ({self.risk.max_positions}) reached"
-        total_exp = sum(p.size for p in self.state.positions.values())
+        total_exp = (
+            sum(p.size for p in self.state.positions.values())
+            + self._pending_live_open_usd
+        )
         max_exp = self.risk.max_total_exposure_pct * self.state.equity
         if total_exp >= max_exp:
             return False, f"Max total exposure reached ({total_exp:.0f}/{max_exp:.0f})"
@@ -328,42 +333,200 @@ class OKXExecutor:
 
     # ── Open / Close ──────────────────────────────────────────────────────
 
-    async def open_position(self, symbol: str, side: str, size_usd: float) -> dict:
-        async with self._lock:
-            can, reason = self.can_trade(symbol)
-            if not can:
-                return {"ok": False, "reason": reason}
-            max_size = self.state.equity * self.risk.max_position_pct
-            size_usd = min(size_usd, max_size)
-            current_exp = sum(p.size for p in self.state.positions.values())
-            remaining = self.risk.max_total_exposure_pct * self.state.equity - current_exp
-            if remaining <= 0:
-                return {"ok": False, "reason": "Max total exposure reached"}
-            size_usd = min(size_usd, remaining)
-            if size_usd < 1.0:
-                return {"ok": False, "reason": f"Position size too small: ${size_usd:.2f}"}
+    def _open_size_after_risk_clamp(self, symbol: str, size_usd: float) -> tuple[float | None, str]:
+        """Under lock: clamp size_usd; return (None, err) or (size, '')."""
+        can, reason = self.can_trade(symbol)
+        if not can:
+            return None, reason
+        max_size = self.state.equity * self.risk.max_position_pct
+        size_usd = min(size_usd, max_size)
+        current_exp = (
+            sum(p.size for p in self.state.positions.values())
+            + self._pending_live_open_usd
+        )
+        remaining = self.risk.max_total_exposure_pct * self.state.equity - current_exp
+        if remaining <= 0:
+            return None, "Max total exposure reached"
+        size_usd = min(size_usd, remaining)
+        if size_usd < 1.0:
+            return None, f"Position size too small: ${size_usd:.2f}"
+        return size_usd, ""
 
+    async def open_position(self, symbol: str, side: str, size_usd: float) -> dict:
+        # Paper: single critical section (no long-lived I/O vs delta-neutral gather).
+        if self.state.mode != "live":
+            async with self._lock:
+                sz, err = self._open_size_after_risk_clamp(symbol, size_usd)
+                if sz is None:
+                    return {"ok": False, "reason": err}
+                size_usd = sz
+                if self.state.cash < size_usd:
+                    return {"ok": False, "reason": f"Insufficient cash: {self.state.cash:.2f} < {size_usd:.2f}"}
             price = await self.get_price(symbol)
             if price is None:
                 return {"ok": False, "reason": f"Cannot get price for {symbol}"}
-
-            if self.state.mode == "live":
-                result = await self._place_order_live(symbol, side, size_usd, price)
-                if not result.get("ok"):
-                    return result
-            else:
+            async with self._lock:
                 if self.state.cash < size_usd:
-                    return {"ok": False, "reason": f"Insufficient cash: {self.state.cash:.2f} < {size_usd:.2f}"}
+                    return {"ok": False, "reason": "Insufficient cash after price fetch (race)"}
+                pos = Position(
+                    symbol=symbol, side=side, size=size_usd,
+                    entry_price=price, entry_time=time.time(),
+                )
+                self.state.positions[symbol] = pos
+                self.state.cash -= size_usd
+                self.state.equity = self.state.cash + sum(p.size for p in self.state.positions.values())
+                self.state.last_trade_time[symbol] = time.time()
+                return {"ok": True, "price": price, "size": size_usd, "side": side}
 
+        # Live: reserve notional, release lock during price + REST so DEX leg can run in parallel.
+        async with self._lock:
+            sz, err = self._open_size_after_risk_clamp(symbol, size_usd)
+            if sz is None:
+                return {"ok": False, "reason": err}
+            size_usd = sz
+            self._pending_live_open_usd += size_usd
+
+        result: dict = {"ok": False, "reason": "aborted"}
+        price: float | None = None
+        try:
+            price = await self.get_price(symbol)
+            if price is None:
+                result = {"ok": False, "reason": f"Cannot get price for {symbol}"}
+            else:
+                result = await self._place_order_live(symbol, side, size_usd, price)
+        finally:
+            async with self._lock:
+                self._pending_live_open_usd = max(
+                    0.0, self._pending_live_open_usd - size_usd
+                )
+
+        if not result.get("ok"):
+            return result
+
+        async with self._lock:
+            ep = float(price or 0.0)
+            if ep <= 0:
+                ep = await self.get_price(symbol) or 0.0
             pos = Position(
                 symbol=symbol, side=side, size=size_usd,
-                entry_price=price, entry_time=time.time(),
+                entry_price=ep, entry_time=time.time(),
             )
             self.state.positions[symbol] = pos
             self.state.cash -= size_usd
             self.state.equity = self.state.cash + sum(p.size for p in self.state.positions.values())
             self.state.last_trade_time[symbol] = time.time()
-            return {"ok": True, "price": price, "size": size_usd, "side": side}
+            return {"ok": True, "price": ep, "size": size_usd, "side": side}
+
+    async def exchange_position_net_contracts(self, symbol: str) -> float | None:
+        """Live: signed contract net for SWAP inst (positive=long, negative=short). None if unknown."""
+        if self.state.mode != "live" or not self.has_api_keys():
+            return None
+        inst_id = self._inst_id(symbol)
+        rows = await self.get_exchange_positions()
+        for r in rows:
+            if r.get("instId") != inst_id:
+                continue
+            try:
+                return float(r.get("pos", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+        return 0.0
+
+    async def is_exchange_flat(self, symbol: str, *, eps: float = 1e-8) -> bool:
+        if self.state.mode != "live":
+            return True
+        if not self.has_api_keys():
+            return False
+        net = await self.exchange_position_net_contracts(symbol)
+        if net is None:
+            return False
+        return abs(net) <= eps
+
+    async def force_reduce_live_net(self, symbol: str) -> dict:
+        """Best-effort market reduce-only from exchange-reported position (no local state)."""
+        if not self.has_api_keys() or self.state.mode != "live":
+            return {"ok": False, "reason": "not_live_or_no_keys"}
+        inst_id = self._inst_id(symbol)
+        pos_data = await self._okx_request("GET", f"/api/v5/account/positions?instId={inst_id}")
+        if pos_data.get("code") != "0" or not pos_data.get("data"):
+            return {"ok": False, "reason": pos_data.get("msg", "no_position_data")}
+        pos = pos_data["data"][0]
+        try:
+            raw = float(pos.get("pos", 0) or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "bad_pos_field"}
+        pos_amt = abs(raw)
+        if pos_amt <= 1e-12:
+            return {"ok": True, "reason": "already_flat"}
+        close_side = "sell" if raw > 0 else "buy"
+        pos_side = "long" if raw > 0 else "short"
+        fb_body = json.dumps({
+            "instId": inst_id, "tdMode": "cross",
+            "side": close_side, "posSide": pos_side,
+            "ordType": "market", "sz": str(pos_amt),
+            "reduceOnly": "true",
+        })
+        close_data = await self._okx_request("POST", "/api/v5/trade/order", fb_body)
+        if close_data.get("code") == "0":
+            return {"ok": True, "reason": "reduce_sent"}
+        return {"ok": False, "reason": close_data.get("msg", "reduce_failed")}
+
+    async def emergency_flatten_short_verified(
+        self,
+        symbol: str,
+        reason: str = "leg_risk_rollback",
+        *,
+        max_rounds: int = 6,
+    ) -> dict:
+        """
+        'Limping leg' recovery: close local short hedge and verify exchange is flat,
+        retrying close-position + reduce-only fallback until verified or exhausted.
+        """
+        inst_id = self._inst_id(symbol)
+        last: dict = {"ok": False, "reason": "no_attempt"}
+        for i in range(max(1, max_rounds)):
+            if self.state.mode != "live":
+                last = await self.close_position(symbol, reason=f"{reason}_r{i}")
+                return {**last, "verified": bool(last.get("ok")), "rounds": i + 1}
+
+            if await self.is_exchange_flat(symbol):
+                async with self._lock:
+                    self.state.positions.pop(symbol, None)
+                self.save_state()
+                return {"ok": True, "verified": True, "rounds": i + 1, "instId": inst_id}
+
+            async with self._lock:
+                has_local = symbol in self.state.positions
+            if has_local:
+                last = await self.close_position(symbol, reason=f"{reason}_r{i}")
+            else:
+                last = await self._close_order_live(symbol, "short")
+
+            if not await self.is_exchange_flat(symbol):
+                last_force = await self.force_reduce_live_net(symbol)
+                log.warning(
+                    "OKX leg-risk round %s/%s %s close=%s force=%s",
+                    i + 1,
+                    max_rounds,
+                    inst_id,
+                    last.get("reason"),
+                    last_force,
+                )
+
+            if await self.is_exchange_flat(symbol):
+                async with self._lock:
+                    self.state.positions.pop(symbol, None)
+                self.save_state()
+                return {"ok": True, "verified": True, "rounds": i + 1, "last_close": last}
+
+            await asyncio.sleep(min(2.0, 0.4 * (i + 1)))
+
+        return {
+            "ok": False,
+            "verified": False,
+            "reason": last.get("reason", "max_rounds_exhausted"),
+            "instId": inst_id,
+        }
 
     async def close_position(self, symbol: str, reason: str = "SIGNAL") -> dict:
         async with self._lock:
@@ -741,6 +904,13 @@ class OKXDeltaNeutralExecutor:
         if pos.side != "short":
             return {"ok": False, "reason": f"position_not_short:{pos.side}"}
         return await self._ex.close_position(symbol, reason=reason)
+
+    async def emergency_flatten_short_verified(
+        self, symbol: str, reason: str = "emergency", *, max_rounds: int = 6
+    ) -> dict[str, Any]:
+        return await self._ex.emergency_flatten_short_verified(
+            symbol, reason=reason, max_rounds=max_rounds
+        )
 
     async def close(self) -> None:
         await self._ex.aclose()

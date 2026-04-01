@@ -383,7 +383,7 @@ async def handle_boot_ui_callback(update: Update, context: ContextTypes.DEFAULT_
         try:
             await query.edit_message_text(
                 "✅ 已选择 **实盘视图**\n\n"
-                "/chain 将强调调度与 Live 段；上方「真实持仓聚合」仍含 OKX+钱包+DEX。\n"
+                "/chain 按市场分栏：OKX、Solana 链上、DEX 跟踪、Polymarket（Polygon）互不混读。\n"
                 "可随时在 /chain 里点 [模拟盘]/[实盘] 再切换。",
                 parse_mode="Markdown",
             )
@@ -3115,6 +3115,7 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
             "wallet": {},
             "okx": {},
             "dex": {},
+            "poly": {},
             "last_error": "",
         }
 
@@ -3204,49 +3205,51 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
             pass
 
     # ═══════════════════════════════════════
-    # BUILD THE DASHBOARD TEXT
+    # BUILD THE DASHBOARD TEXT（单层快照 + 分块引擎/模拟，避免重复）
     # ═══════════════════════════════════════
     L = []
     se = "🟢" if sol_chg >= 0 else "🔴"
-
-    if is_live:
-        mode_tag = "🔴 LIVE"
-    elif paper_on:
-        mode_tag = "📝 PAPER"
-    else:
-        mode_tag = "⚪ OFF"
-
-    if is_live:
-        L.append("━━━━━ 🔴 实盘监控 ━━━━━")
-    else:
-        L.append("━━━━━ SOLANA DEX ━━━━━")
-    if sol_price > 0:
-        L.append(f"{se} SOL ${sol_price:.2f} ({sol_chg:+.1f}%)  |  {mode_tag}")
-    else:
-        L.append(f"SOL $-- | {mode_tag}")
     age_s = float(ps.get("age_sec", 0) or 0)
     snap_note = f"{age_s:.0f}s前" if ps.get("updated_at") else "未就绪"
-    if ui_mode == "live":
-        L.append(f"🎚 界面: ✅[实盘] · 快照 {snap_note}")
+    sched_lbl = "🔴实盘调度" if is_live else ("📝模拟交易开" if paper_on else "⚪未跑调度")
+    ui_lbl = "界面强调·实盘" if ui_mode == "live" else "界面强调·模拟"
+
+    L.append("━━━━ /chain ━━━━")
+    if sol_price > 0:
+        L.append(
+            f"{se} SOL ${sol_price:.2f} ({sol_chg:+.1f}%)  ·  {sched_lbl}  ·  {ui_lbl}  ·  数据{snap_note}"
+        )
     else:
-        L.append(f"🎚 界面: ✅[模拟盘] · 快照 {snap_note}")
-    L.append("💡 下方「真实持仓聚合」= OKX+钱包+DEX 轮询，与 [模拟] 纸面仓无关")
+        L.append(f"SOL $--  ·  {sched_lbl}  ·  {ui_lbl}  ·  {snap_note}")
+    L.append("（上方状态：调度=是否跑 live_trader；界面=面板排版偏好；与 paper 假仓无关）")
     if not ps.get("updated_at"):
-        L.append("⏳ 后台正在首次同步链上/OKX/DEX…（约10–15s）")
+        L.append("⏳ 首次同步约10–15s → 点 🔄 刷新")
     err_ps = (ps.get("last_error") or "").strip()
     if err_ps:
-        L.append(f"⚠ 同步: {err_ps[:120]}")
+        L.append(f"⚠ {err_ps[:100]}")
     L.append("")
 
-    if ps.get("updated_at"):
+    snap_ok = bool(ps.get("updated_at"))
+    if snap_ok:
         try:
             import portfolio_manager as _pm
 
-            L.append("━━ 📡 真实持仓聚合（OKX · 钱包 · DEX）━━")
-            L.append(_pm.format_portfolio_plain(ps))
+            L.append("【资金快照】OKX · Solana 链上 · DEX · Polymarket（分栏）")
+            L.append(_pm.format_chain_snapshot(ps))
             L.append("")
         except Exception:
-            pass
+            try:
+                import portfolio_manager as _pm
+
+                L.append(_pm.format_portfolio_plain(ps))
+                L.append("")
+            except Exception:
+                pass
+    elif wallet_ok:
+        usd = sol_bal * sol_price if sol_price > 0 else 0
+        L.append("【钱包】")
+        L.append(f"{pubkey[:6]}…{pubkey[-4:]}  {sol_bal:.4f} SOL ≈ ${usd:,.2f}")
+        L.append("")
 
     if is_live:
         st0 = sched_state.get("start_time") or 0
@@ -3288,70 +3291,23 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
             L.append("🔴 自动引擎仓: 无 (扫信号中)")
             L.append("")
 
-    # Wallet
-    if wallet_ok:
-        usd = sol_bal * sol_price if sol_price > 0 else 0
-        L.append(f"💼 {pubkey[:6]}...{pubkey[-4:]}")
-        L.append(f"   {sol_bal:.4f} SOL ≈ ${usd:,.2f}")
-        if token_count > 0:
-            L.append(f"   🪙 {token_count} tokens")
-    else:
+    if not snap_ok and not wallet_ok:
         L.append("💼 钱包未连接 → /wallet_setup")
-    L.append("")
+        L.append("")
 
-    if is_live:
-        if dex_positions:
-            total_sol = sum(p.get("amount_sol", 0) or 0 for p in dex_positions)
-            total_usd = total_sol * sol_price if sol_price > 0 else 0
-            L.append(f"📌 dex_trader 跟踪 [DEX] ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
-            for p in sorted(dex_positions, key=lambda x: x.get("amount_sol", 0) or 0, reverse=True)[:6]:
-                name = p.get("name") or p.get("symbol", "?")
-                sym = p.get("symbol", "?")
-                display = name if name != sym else sym
-                pnl = p.get("pnl_pct", 0) or 0
-                em = "🟢" if pnl > 1 else "🔴" if pnl < -1 else "⚪"
-                L.append(
-                    f" {em} {str(display)[:12]:<12} {p.get('amount_sol', 0):.2f}SOL {pnl:+.1f}% [DEX]"
-                )
-            L.append("")
-        else:
-            L.append("📌 dex_trader 跟踪 [DEX]: 无")
-            L.append("")
-
-        if paper_on or paper_closed > 0:
-            pp = "🟢" if paper_pnl >= 0 else "🔴"
-            L.append(
-                f"📝 模拟盘(参考): {len(paper_trades_open)}仓/{paper_closed}平 "
-                f"WR{paper_wr:.0f}% {pp}{paper_pnl:+.3f}SOL"
-            )
-            L.append("")
-
-        try:
-            recent = _live_trader.get_recent_closed_trades(4) if _live_trader else []
-        except Exception:
-            recent = []
-        if recent:
-            L.append("📜 最近引擎平仓")
-            for c in recent:
-                sym = (c.get("symbol") or "?")[:12]
-                pnl = c.get("pnl_pct", 0) or 0
-                ps = c.get("pnl_sol", 0) or 0
-                rs = (c.get("close_reason") or "")[:10]
-                L.append(f"   {sym} {pnl:+.1f}% ({ps:+.4f} SOL) · {rs}")
-            L.append("")
-    else:
+    if not is_live:
         pm = "模拟开" if paper_on else "模拟关"
-        L.append(f"⚙️ 📝{pm} · 链上/DEX/模拟分栏（互不混写）")
+        L.append(f"⚙️ 📝{pm}（非实盘调度）")
         lst_scan = sched_state.get("last_scan_time") or 0
         if lst_scan:
             L.append(f"📡 上次调度扫描 {time.strftime('%m-%d %H:%M', time.localtime(lst_scan))}")
         else:
-            L.append("📡 调度: 暂无记录（🚀启动实盘后周期扫描+引擎）")
+            L.append("📡 调度: 暂无（🚀启动实盘后周期扫描）")
         L.append("")
 
         disp_onchain = _chain_cache.get("chain_tokens_display") or []
-        if wallet_ok and disp_onchain:
-            L.append(f"🔗 链上钱包 SPL · 真实余额 ({len(disp_onchain)})")
+        if not snap_ok and wallet_ok and disp_onchain:
+            L.append(f"🔗 链上 SPL · 真实余额 ({len(disp_onchain)})")
             for row in disp_onchain[:8]:
                 a = float(row.get("amount") or 0)
                 if a >= 1e6:
@@ -3364,15 +3320,17 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
                     as_ = f"{a:.6g}"
                 L.append(f"   · {str(row.get('label', '?'))[:14]:<14} {as_} [链上]")
             L.append("")
-        elif wallet_ok:
-            L.append("🔗 链上 SPL: 仅 SOL 或无可见代币（买入后此处列出真实铸币）")
+        elif not snap_ok and wallet_ok:
+            L.append("🔗 链上 SPL: 仅 SOL 或无可见代币")
             L.append("")
 
+    if not snap_ok:
         if dex_positions:
             total_sol = sum(p.get("amount_sol", 0) or 0 for p in dex_positions)
             total_usd = total_sol * sol_price if sol_price > 0 else 0
-            L.append(f"📌 dex_trader 跟踪 [DEX] ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
-            for p in sorted(dex_positions, key=lambda x: x.get("amount_sol", 0) or 0, reverse=True)[:8]:
+            cap = 8 if not is_live else 6
+            L.append(f"📌 dex_trader [DEX] ({len(dex_positions)}) · {total_sol:.3f} SOL (~${total_usd:.0f})")
+            for p in sorted(dex_positions, key=lambda x: x.get("amount_sol", 0) or 0, reverse=True)[:cap]:
                 name = p.get("name") or p.get("symbol", "?")
                 sym = p.get("symbol", "?")
                 display = name if name != sym else sym
@@ -3383,36 +3341,51 @@ async def _build_chain_dashboard(user_id: int | None = None) -> str:
                 )
             L.append("")
         else:
-            L.append("📌 dex_trader 跟踪 [DEX]: 无")
+            L.append("📌 dex_trader [DEX]: 无（或等快照）")
             L.append("")
 
-        if paper_trades_open:
-            L.append(f"📝 paper_trader 模拟仓 [模拟] ({len(paper_trades_open)})")
-            for t in sorted(paper_trades_open, key=lambda x: x.get("position_sol", 0) or 0, reverse=True)[:8]:
-                name = t.get("name", "")
-                sym = t.get("symbol", "?")
-                display = (name if name and name != "?" and name != sym else sym)[:12]
-                pnl = t.get("pnl_pct", 0) or 0
-                sol_t = t.get("position_sol", 0) or 0
-                em = "🟢" if pnl > 1 else "🔴" if pnl < -1 else "⚪"
-                L.append(f" {em} {display:<12} {sol_t:.2f}SOL {pnl:+.1f}% [模拟]")
-            L.append("")
-        elif paper_on:
-            L.append("📝 模拟持仓: 当前无开仓")
-            L.append("")
+    if paper_trades_open:
+        L.append(f"📝 paper [模拟] ({len(paper_trades_open)})")
+        for t in sorted(paper_trades_open, key=lambda x: x.get("position_sol", 0) or 0, reverse=True)[:8]:
+            name = t.get("name", "")
+            sym = t.get("symbol", "?")
+            display = (name if name and name != "?" and name != sym else sym)[:12]
+            pnl = t.get("pnl_pct", 0) or 0
+            sol_t = t.get("position_sol", 0) or 0
+            em = "🟢" if pnl > 1 else "🔴" if pnl < -1 else "⚪"
+            L.append(f" {em} {display:<12} {sol_t:.2f}SOL {pnl:+.1f}% [模拟]")
+        L.append("")
+    elif paper_on:
+        L.append("📝 paper [模拟]: 当前无开仓")
+        L.append("")
 
-        if paper_on or paper_closed > 0:
-            pp = "🟢" if paper_pnl >= 0 else "🔴"
-            grad = ""
-            if paper_closed >= 100 and paper_wr >= 55:
-                grad = " 🎓毕业→实盘"
-            elif paper_closed > 0:
-                pct_done = min(paper_closed / 100 * 100, 100)
-                grad = f" ({pct_done:.0f}%毕业)"
-            L.append(
-                f"📝 {len(paper_trades_open)}持仓/{paper_closed}平 WR:{paper_wr:.0f}% "
-                f"{pp}{paper_pnl:+.3f}SOL{grad}"
-            )
+    if paper_on or paper_closed > 0:
+        pp = "🟢" if paper_pnl >= 0 else "🔴"
+        grad = ""
+        if paper_closed >= 100 and paper_wr >= 55:
+            grad = " 🎓毕业→实盘"
+        elif paper_closed > 0:
+            pct_done = min(paper_closed / 100 * 100, 100)
+            grad = f" ({pct_done:.0f}%毕业)"
+        L.append(
+            f"📝 汇总 {len(paper_trades_open)}仓/{paper_closed}平 WR{paper_wr:.0f}% "
+            f"{pp}{paper_pnl:+.3f}SOL{grad}"
+        )
+        L.append("")
+
+    if is_live:
+        try:
+            recent = _live_trader.get_recent_closed_trades(4) if _live_trader else []
+        except Exception:
+            recent = []
+        if recent:
+            L.append("📜 最近引擎平仓")
+            for c in recent:
+                sym = (c.get("symbol") or "?")[:12]
+                pnl_c = c.get("pnl_pct", 0) or 0
+                pnl_sol_c = c.get("pnl_sol", 0) or 0
+                rs = (c.get("close_reason") or "")[:10]
+                L.append(f"   {sym} {pnl_c:+.1f}% ({pnl_sol_c:+.4f} SOL) · {rs}")
             L.append("")
 
     evo_bar_len = 8

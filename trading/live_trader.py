@@ -1,6 +1,9 @@
 """
-Canonical implementation: repository root ``live_trader.py``.
-Re-export full API for ``from trading.live_trader import …``.
+Canonical live trader: re-exports the repository root ``live_trader.py``.
+
+Delta-neutral hedge uses ``asyncio.gather`` (DEX ∥ OKX); OKX live orders in
+``trading/okx_executor`` release the asyncio lock during REST. Verified
+``emergency_flatten_short_verified`` handles limping hedge legs.
 """
 
 from __future__ import annotations

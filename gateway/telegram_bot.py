@@ -1,7 +1,7 @@
 """
 Telegram Gateway — PTB entry with two UI modes:
 
-1. **panel** (default) — dashboard MarkdownV2 templates + `GW_CB:*` callbacks;
+1. **panel** (default) — MarkdownV2 templates + `GW_CB:*` callbacks from `gateway.tg_panel`;
    秒回占位后 `asyncio.create_task` 拉取链上/刷新持仓，禁止在 CallbackQuery 协程内 await 耗时 IO。
 
 2. **terminal** — Bloomberg-style state machine: `ConversationHandler`, global
@@ -22,9 +22,8 @@ import asyncio
 import logging
 import os
 import re
-import threading
 from dataclasses import dataclass
-from typing import Callable, Awaitable
+from typing import Awaitable, Callable
 
 from telegram import Update
 from telegram.ext import (
@@ -34,7 +33,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from dashboard import (
+from gateway.tg_panel import (
     GW_CB,
     tg_gw_build_back_keyboard,
     tg_gw_build_main_keyboard,
@@ -86,7 +85,20 @@ def _allowed_user_ids() -> set[int]:
 _ALLOWED = _allowed_user_ids()
 
 _STORE: SessionStore | None = None
-_STORE_INIT_LOCK = threading.Lock()
+
+
+def _session_store_lock(application: Application) -> asyncio.Lock:
+    return application.bot_data.setdefault("_gw_session_store_init_lock", asyncio.Lock())
+
+
+async def _session_store_async(application: Application) -> SessionStore:
+    """Lazy SessionStore; constructor does disk IO — keep off the event loop."""
+    global _STORE
+    lock = _session_store_lock(application)
+    async with lock:
+        if _STORE is None:
+            _STORE = await asyncio.to_thread(SessionStore)
+        return _STORE
 
 
 def _is_authorized(user_id: int) -> bool:
@@ -95,21 +107,16 @@ def _is_authorized(user_id: int) -> bool:
     return int(user_id) in _ALLOWED
 
 
-def _session_store() -> SessionStore:
-    """Single process-wide store so prefs are not re-read from disk on every tap."""
-    global _STORE
-    with _STORE_INIT_LOCK:
-        if _STORE is None:
-            _STORE = SessionStore()
-        return _STORE
-
-
 def _gw_pos_refresh_lock(app: Application, chat_id: int, message_id: int) -> asyncio.Lock:
     locks: dict[tuple[int, int], asyncio.Lock] = app.bot_data.setdefault("_gw_pos_locks", {})
     key = (chat_id, message_id)
     if key not in locks:
         locks[key] = asyncio.Lock()
     return locks[key]
+
+
+def _gw_portfolio_refresh_sem(application: Application) -> asyncio.Semaphore:
+    return application.bot_data.setdefault("_gw_portfolio_refresh_sem", asyncio.Semaphore(1))
 
 
 def _parse_gw_callback(data: str) -> tuple[str, str] | None:
@@ -176,7 +183,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(uid):
         await update.message.reply_text("⛔ 未授权使用此网关机器人。")
         return
-    store = _session_store()
+    store = await _session_store_async(context.application)
     mode = store.get_trade_mode(uid)
     text = tg_gw_render_home_text(mode)
     kb = tg_gw_build_main_keyboard(mode)
@@ -245,6 +252,37 @@ def _gw_pending_markup(action: str, mode: str):
     return tg_gw_build_main_keyboard(mode)
 
 
+async def _followup_positions_refresh(
+    application: Application,
+    bot,
+    chat_id: int,
+    message_id: int,
+    uid: int,
+) -> None:
+    """Single-flight portfolio refresh; second edit when data is fresh."""
+    from trading import portfolio_snapshot
+
+    sem = _gw_portfolio_refresh_sem(application)
+    store = await _session_store_async(application)
+    try:
+        async with sem:
+            await portfolio_snapshot.refresh_once()
+    except Exception:
+        logger.exception("gateway positions background refresh")
+    m = store.get_trade_mode(uid)
+    try:
+        snap = portfolio_snapshot.get_snapshot()
+        await _bot_edit_markdown_v2(
+            bot,
+            chat_id,
+            message_id,
+            tg_gw_render_positions_text(m, snap, refreshing=False),
+            tg_gw_build_positions_keyboard(),
+        )
+    except Exception as e:
+        logger.warning("gateway positions follow-up edit failed: %s", e)
+
+
 async def handle_gateway_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -262,7 +300,7 @@ async def handle_gateway_callback(
         return
 
     action, arg = parsed
-    store = _session_store()
+    store = await _session_store_async(context.application)
     mode = store.get_trade_mode(uid)
 
     await query.answer()
@@ -283,7 +321,7 @@ async def handle_gateway_callback(
         try:
             if action == "mode":
                 new_mode = "live" if arg == "live" else "paper"
-                store.set_trade_mode(uid, new_mode)
+                await asyncio.to_thread(store.set_trade_mode, uid, new_mode)
                 m = new_mode
                 await _bot_edit_markdown_v2(
                     bot,
@@ -320,21 +358,21 @@ async def handle_gateway_callback(
                 lock = _gw_pos_refresh_lock(application, chat_id, message_id)
                 async with lock:
                     m = store.get_trade_mode(uid)
-                    try:
-                        from trading import portfolio_snapshot
+                    from trading import portfolio_snapshot
 
-                        await portfolio_snapshot.refresh_once()
-                        snap = portfolio_snapshot.get_snapshot()
-                    except Exception as e:
-                        logger.exception("gateway positions refresh: %s", e)
-                        snap = None
+                    snap = await asyncio.to_thread(portfolio_snapshot.get_snapshot)
                     await _bot_edit_markdown_v2(
                         bot,
                         chat_id,
                         message_id,
-                        tg_gw_render_positions_text(m, snap),
+                        tg_gw_render_positions_text(m, snap, refreshing=True),
                         tg_gw_build_positions_keyboard(),
                     )
+                asyncio.create_task(
+                    _followup_positions_refresh(
+                        application, bot, chat_id, message_id, uid
+                    )
+                )
                 return
         except Exception as e:
             logger.exception("gateway panel work: %s", e)

@@ -3,7 +3,10 @@ dispatcher/llm_filter.py — Zero-Trust LLM output interceptor.
 
 ANY trade directive from an agent/LLM must pass through
 LLMHallucinationFilter.sanitize_trade_directive() before reaching the
-execution layer.  Rejects:
+execution layer. Trade JSON repair rounds use ``reask_trade_json_via_http``
+(aiohttp to Ollama / Anthropic / OpenAI per ``config``), not subprocess CLI.
+
+Rejects:
   - Non-whitelisted trading pairs
   - Notional value > MAX_NOTIONAL_USD
   - Missing / unparse-able fields
@@ -66,6 +69,31 @@ TRADE_JSON_REMINDERS: tuple[str, ...] = (
 )
 
 TradeJsonReaskFn = Callable[[int, str], Awaitable[str]]
+
+
+async def reask_trade_json_via_http(round_idx: int, previous_output: str) -> str:
+    """
+    Ask the configured HTTP LLM to emit a single trade JSON object (bounded timeout, semaphore in client).
+    """
+    reminder = TRADE_JSON_REMINDERS[round_idx % len(TRADE_JSON_REMINDERS)]
+    import config as _cfg
+
+    import llm_http_client
+
+    user = (
+        f"{reminder}\n\n"
+        "先前输出无法通过交易 JSON 校验。请只输出一个对象，键为 action, pair, amount, price。\n\n"
+        f"{str(previous_output)[:3800]}"
+    )
+    timeout = float(getattr(_cfg, "API_REQUEST_TIMEOUT_SEC", 60))
+    text, err = await llm_http_client.complete_stateless(
+        system_prompt="Reply with a single JSON object only. Keys: action, pair, amount, price. No markdown.",
+        user_text=user,
+        model_hint=getattr(_cfg, "TASK_TIER_FAST_CLAUDE", None),
+        timeout_sec=min(90.0, max(15.0, timeout)),
+        state_key=-450 - (round_idx % 40),
+    )
+    return (text or err or "").strip()
 
 
 class TradeDirectiveModel(BaseModel):

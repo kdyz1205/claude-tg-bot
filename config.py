@@ -64,6 +64,25 @@ try:
 except ValueError:
     CLAUDE_CLI_TIMEOUT = 1800
 
+# ─── HTTP LLM (aiohttp: Ollama / Anthropic / OpenAI) — replaces Claude CLI subprocess ──
+LLM_HTTP_BACKEND = os.getenv("LLM_HTTP_BACKEND", "auto").strip().lower()
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+try:
+    LLM_HTTP_MAX_CONCURRENT = max(1, int(os.getenv("LLM_HTTP_MAX_CONCURRENT", "8")))
+except ValueError:
+    LLM_HTTP_MAX_CONCURRENT = 8
+try:
+    MAX_HTTP_LLM_HISTORY_MSGS = max(4, int(os.getenv("MAX_HTTP_LLM_HISTORY_MSGS", "40")))
+except ValueError:
+    MAX_HTTP_LLM_HISTORY_MSGS = 40
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+ANTHROPIC_API_BASE = os.getenv("ANTHROPIC_API_BASE", "https://api.anthropic.com").rstrip("/")
+try:
+    ANTHROPIC_MAX_TOKENS = max(256, int(os.getenv("ANTHROPIC_MAX_TOKENS", "8192")))
+except ValueError:
+    ANTHROPIC_MAX_TOKENS = 8192
+
 # ─── Conversation & Processing ────────────────────────────────────────────────
 MAX_CONVERSATION_HISTORY = 80
 MAX_TOOL_ITERATIONS = 25
@@ -134,6 +153,13 @@ PROACTIVE_AGENT_ENABLED = os.getenv("PROACTIVE_AGENT_ENABLED", "true").lower() =
 
 # ─── Market Monitor ───────────────────────────────────────────────────────────
 MARKET_MONITOR_ENABLED = os.getenv("MARKET_MONITOR_ENABLED", "true").lower() == "true"
+
+# ─── On-chain WebSocket RPCs (onchain_tracker / onchain_ws_listen) ────────────
+# Public defaults; override with your own Alchemy/Infura/QuickNode WSS if needed.
+ONCHAIN_ETH_WSS = os.getenv("ONCHAIN_ETH_WSS", "wss://ethereum-rpc.publicnode.com").strip()
+ONCHAIN_BSC_WSS = os.getenv("ONCHAIN_BSC_WSS", "wss://bsc-rpc.publicnode.com").strip()
+ONCHAIN_SOL_WSS = os.getenv("ONCHAIN_SOL_WSS", "wss://api.mainnet-beta.solana.com").strip()
+SOLANA_RPC_HTTP = os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com").strip()
 
 # ─── Never-Die Fallback Chain ────────────────────────────────────────────────
 # The bot should NEVER stop responding. When one provider fails, switch to next.

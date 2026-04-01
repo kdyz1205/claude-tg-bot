@@ -1,0 +1,493 @@
+"""
+Flask web dashboard for bot performance monitoring (http://localhost:8080).
+
+Separated from ``gateway.tg_panel`` so the Telegram gateway does not import Flask.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+from collections import deque
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+EVOLUTION_QUEUE_FILE = os.path.join(BOT_DIR, "_evolution_queue.json")
+
+_recent_messages: deque = deque(maxlen=10)
+
+_stats = {
+    "total": 0,
+    "success": 0,
+    "failed": 0,
+    "total_ms": 0.0,
+}
+_stats_lock = threading.Lock()
+
+_server_started = False
+_server_thread = None
+
+
+def record_message(text: str, success: bool, duration_ms: float, response: str = "") -> None:
+    """Record a processed message. Call from bot.py after each message."""
+    with _stats_lock:
+        _stats["total"] += 1
+        if success:
+            _stats["success"] += 1
+        else:
+            _stats["failed"] += 1
+        _stats["total_ms"] += duration_ms
+        _recent_messages.append({
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "text": text[:80],
+            "success": success,
+            "duration_ms": round(duration_ms),
+            "response": response[:100],
+        })
+
+
+def _get_evolution_progress() -> dict:
+    default: dict = {"tasks": [], "completed_count": 0, "total": 7, "current_index": 0}
+    try:
+        with open(EVOLUTION_QUEUE_FILE, "r", encoding="utf-8") as f:
+            raw = f.read()
+        if not raw.strip():
+            return default
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.debug("evolution queue JSON invalid or empty")
+            return default
+        if not isinstance(data, dict):
+            return default
+        tasks_in = data.get("tasks") or []
+        if not isinstance(tasks_in, list):
+            tasks_in = []
+        completed = data.get("completed_tasks") or []
+        if not isinstance(completed, list):
+            completed = []
+        return {
+            "tasks": [
+                {
+                    "id": str(t.get("id", "?")) if isinstance(t, dict) else "?",
+                    "name": str(t.get("name", "?")) if isinstance(t, dict) else "?",
+                    "status": str(t.get("status", "unknown")) if isinstance(t, dict) else "unknown",
+                }
+                for t in tasks_in
+                if isinstance(t, dict)
+            ],
+            "completed_count": len(completed),
+            "total": len(tasks_in),
+            "current_index": int(data.get("current_task_index") or 0),
+        }
+    except OSError:
+        return default
+
+
+try:
+    from flask import Flask, jsonify, render_template_string
+
+    _flask_available = True
+except ImportError:
+    _flask_available = False
+    Flask = None  # type: ignore[misc, assignment]
+
+if _flask_available:
+    app = Flask(__name__)
+
+    def _get_system_stats() -> dict:
+        try:
+            from self_monitor import self_monitor
+
+            h = self_monitor._last_health or {}
+            checks = h.get("checks", {})
+            bot_info = checks.get("bot", {})
+            return {
+                "cpu_pct": checks.get("cpu", {}).get("usage_pct", -1),
+                "mem_pct": checks.get("memory", {}).get("usage_pct", -1),
+                "mem_used_gb": checks.get("memory", {}).get("used_gb", -1),
+                "mem_total_gb": checks.get("memory", {}).get("total_gb", -1),
+                "disk_pct": checks.get("disk", {}).get("usage_pct", -1),
+                "disk_free_gb": checks.get("disk", {}).get("free_gb", -1),
+                "uptime": bot_info.get("uptime_human", "?"),
+                "process_rss_mb": bot_info.get("process_rss_mb", -1),
+                "overall_state": self_monitor.get_overall_state(),
+                "error_rate_1h": self_monitor._error_rate_last_hour(),
+                "consecutive_failures": self_monitor._consecutive_msg_failures,
+                "telegram_ok": checks.get("network", {}).get("reachable", None),
+            }
+        except Exception:
+            return {}
+
+    def _get_recent_messages_safe() -> list:
+        with _stats_lock:
+            return list(_recent_messages)
+
+    @app.route("/api/stats")
+    def api_stats():
+        with _stats_lock:
+            stats_snap = dict(_stats)
+
+        total = stats_snap.get("total", 0)
+        success_rate = round(stats_snap.get("success", 0) / total * 100, 1) if total > 0 else 0.0
+        avg_ms = round(stats_snap.get("total_ms", 0) / total) if total > 0 else 0
+
+        sys_stats = _get_system_stats()
+        evolution = _get_evolution_progress()
+
+        portfolio = {}
+        try:
+            from trading.portfolio_snapshot import get_snapshot as _pf_snap
+
+            portfolio = _pf_snap()
+        except Exception:
+            portfolio = {}
+
+        return jsonify({
+            "timestamp": datetime.now().isoformat(),
+            "messages": {
+                "total": total,
+                "success": stats_snap.get("success", 0),
+                "failed": stats_snap.get("failed", 0),
+                "success_rate": success_rate,
+                "avg_ms": avg_ms,
+            },
+            "system": sys_stats,
+            "recent_messages": _get_recent_messages_safe(),
+            "evolution": evolution,
+            "portfolio": portfolio,
+        })
+
+    _HTML = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bot Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', monospace; font-size: 14px; }
+  header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 18px; color: #58a6ff; }
+  #ts { font-size: 12px; color: #8b949e; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; padding: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+  .card h2 { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 10px; }
+  .big { font-size: 28px; font-weight: 700; color: #e6edf3; }
+  .sub { font-size: 12px; color: #8b949e; margin-top: 2px; }
+  .ok { color: #3fb950; } .warn { color: #d29922; } .bad { color: #f85149; }
+  .bar-wrap { background: #21262d; border-radius: 4px; height: 8px; margin-top: 8px; }
+  .bar { height: 8px; border-radius: 4px; transition: width .5s; }
+  .section { padding: 0 16px 16px; }
+  .section h2 { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { padding: 6px 8px; text-align: left; border-bottom: 1px solid #21262d; font-size: 13px; }
+  th { color: #8b949e; font-weight: 500; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .badge.done { background: #1f6feb; color: #fff; }
+  .badge.pending { background: #21262d; color: #8b949e; }
+  .badge.ip { background: #388bfd22; color: #58a6ff; border: 1px solid #388bfd; }
+  .msg-ok { color: #3fb950; } .msg-fail { color: #f85149; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 Bot Performance Dashboard</h1>
+  <span id="ts">Loading…</span>
+</header>
+
+<div class="grid" id="cards">
+  <div class="card">
+    <h2>Messages Processed</h2>
+    <div class="big" id="msg-total">—</div>
+    <div class="sub">Total since startup</div>
+  </div>
+  <div class="card">
+    <h2>Success Rate</h2>
+    <div class="big" id="msg-rate">—</div>
+    <div class="bar-wrap"><div class="bar ok" id="rate-bar" style="width:0%"></div></div>
+    <div class="sub" id="msg-ok-fail">— ok / — failed</div>
+  </div>
+  <div class="card">
+    <h2>Avg Response Time</h2>
+    <div class="big" id="avg-ms">—</div>
+    <div class="sub">milliseconds</div>
+  </div>
+  <div class="card">
+    <h2>Errors (1h)</h2>
+    <div class="big" id="err-rate">—</div>
+    <div class="sub">error events</div>
+  </div>
+  <div class="card">
+    <h2>Memory Usage</h2>
+    <div class="big" id="mem-pct">—</div>
+    <div class="bar-wrap"><div class="bar" id="mem-bar" style="width:0%"></div></div>
+    <div class="sub" id="mem-detail">—</div>
+  </div>
+  <div class="card">
+    <h2>CPU</h2>
+    <div class="big" id="cpu-pct">—</div>
+    <div class="bar-wrap"><div class="bar" id="cpu-bar" style="width:0%"></div></div>
+    <div class="sub" id="bot-uptime">Uptime: —</div>
+  </div>
+  <div class="card">
+    <h2>Process Memory</h2>
+    <div class="big" id="proc-mem">—</div>
+    <div class="sub">MB RSS</div>
+  </div>
+  <div class="card">
+    <h2>Bot State</h2>
+    <div class="big" id="bot-state">—</div>
+    <div class="sub" id="bot-sub">—</div>
+  </div>
+  <div class="card">
+    <h2>Portfolio (cached)</h2>
+    <div class="big" id="pf-age">—</div>
+    <div class="sub" id="pf-total">OKX+DEX 参考 —</div>
+  </div>
+  <div class="card">
+    <h2>SOL / Wallet</h2>
+    <div class="big" id="pf-sol">—</div>
+    <div class="sub" id="pf-wallet">—</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Trading snapshot (后台轮询)</h2>
+  <table id="pf-table">
+    <thead><tr><th>来源</th><th>明细</th><th>浮动</th></tr></thead>
+    <tbody id="pf-body"></tbody>
+  </table>
+</div>
+
+<div class="section">
+  <h2>Evolution Progress (7 Tasks)</h2>
+  <table id="evo-table">
+    <thead><tr><th>#</th><th>Task</th><th>Status</th></tr></thead>
+    <tbody id="evo-body"></tbody>
+  </table>
+</div>
+
+<div class="section">
+  <h2>Recent Messages (last 10)</h2>
+  <table>
+    <thead><tr><th>Time</th><th>Message</th><th>Result</th><th>Duration</th></tr></thead>
+    <tbody id="msg-body"></tbody>
+  </table>
+</div>
+
+<script>
+function colorPct(pct) {
+  if (pct < 0) return 'ok';
+  if (pct < 70) return 'ok';
+  if (pct < 90) return 'warn';
+  return 'bad';
+}
+function barColor(pct) {
+  if (pct < 70) return '#3fb950';
+  if (pct < 90) return '#d29922';
+  return '#f85149';
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+async function refresh() {
+  try {
+    const r = await fetch('/api/stats');
+    const d = await r.json();
+
+    document.getElementById('ts').textContent = 'Updated: ' + new Date(d.timestamp).toLocaleTimeString();
+
+    // Messages
+    const m = d.messages;
+    document.getElementById('msg-total').textContent = m.total;
+    document.getElementById('msg-rate').textContent = m.success_rate + '%';
+    document.getElementById('msg-rate').className = 'big ' + (m.success_rate >= 90 ? 'ok' : m.success_rate >= 70 ? 'warn' : 'bad');
+    document.getElementById('rate-bar').style.width = m.success_rate + '%';
+    document.getElementById('rate-bar').style.background = barColor(m.success_rate);
+    document.getElementById('msg-ok-fail').textContent = m.success + ' ok / ' + m.failed + ' failed';
+    document.getElementById('avg-ms').textContent = m.avg_ms > 0 ? m.avg_ms + 'ms' : '—';
+
+    // System
+    const s = d.system;
+    document.getElementById('err-rate').textContent = s.error_rate_1h !== undefined ? s.error_rate_1h : '—';
+    document.getElementById('err-rate').className = 'big ' + (s.error_rate_1h > 20 ? 'bad' : s.error_rate_1h > 5 ? 'warn' : 'ok');
+
+    if (s.mem_pct >= 0) {
+      document.getElementById('mem-pct').textContent = s.mem_pct + '%';
+      document.getElementById('mem-pct').className = 'big ' + colorPct(s.mem_pct);
+      document.getElementById('mem-bar').style.width = s.mem_pct + '%';
+      document.getElementById('mem-bar').style.background = barColor(s.mem_pct);
+      document.getElementById('mem-detail').textContent = s.mem_used_gb > 0 ? s.mem_used_gb + ' / ' + s.mem_total_gb + ' GB' : '';
+    }
+    if (s.cpu_pct >= 0) {
+      document.getElementById('cpu-pct').textContent = s.cpu_pct + '%';
+      document.getElementById('cpu-pct').className = 'big ' + colorPct(s.cpu_pct);
+      document.getElementById('cpu-bar').style.width = s.cpu_pct + '%';
+      document.getElementById('cpu-bar').style.background = barColor(s.cpu_pct);
+    }
+    document.getElementById('bot-uptime').textContent = 'Uptime: ' + (s.uptime || '—');
+    document.getElementById('proc-mem').textContent = s.process_rss_mb > 0 ? s.process_rss_mb : '—';
+
+    const state = s.overall_state || 'healthy';
+    const stateEl = document.getElementById('bot-state');
+    stateEl.textContent = state.toUpperCase();
+    stateEl.className = 'big ' + (state === 'healthy' ? 'ok' : state === 'degraded' ? 'warn' : 'bad');
+    document.getElementById('bot-sub').textContent = s.telegram_ok === false ? '❌ Telegram unreachable' : s.consecutive_failures > 0 ? s.consecutive_failures + ' consecutive failures' : 'All systems normal';
+
+    // Evolution
+    const evo = d.evolution;
+    const tbody = document.getElementById('evo-body');
+    tbody.innerHTML = '';
+    (evo.tasks || []).forEach(t => {
+      const cls = t.status === 'completed' ? 'done' : t.status === 'in_progress' ? 'ip' : 'pending';
+      const label = t.status === 'completed' ? '✅ Done' : t.status === 'in_progress' ? '🔄 Active' : '⏳ Pending';
+      tbody.innerHTML += `<tr><td>${t.id}</td><td>${esc(t.name)}</td><td><span class="badge ${cls}">${label}</span></td></tr>`;
+    });
+
+    // Recent messages
+    const mbody = document.getElementById('msg-body');
+    mbody.innerHTML = '';
+    const msgs = (d.recent_messages || []).slice().reverse();
+    msgs.forEach(msg => {
+      const cls = msg.success ? 'msg-ok' : 'msg-fail';
+      const icon = msg.success ? '✓' : '✗';
+      mbody.innerHTML += `<tr>
+        <td>${esc(msg.ts)}</td>
+        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(msg.text)}</td>
+        <td class="${cls}">${icon}</td>
+        <td>${msg.duration_ms}ms</td>
+      </tr>`;
+    });
+
+    const pf = d.portfolio || {};
+    const age = pf.age_sec != null ? Math.round(pf.age_sec) + 's' : '—';
+    document.getElementById('pf-age').textContent = age;
+    const sp = pf.sol_price || 0;
+    const okxEq = (pf.okx && pf.okx.total_equity_usd) || 0;
+    const dexV = (pf.dex && pf.dex.total_value_sol) || 0;
+    const dexUsd = sp > 0 ? dexV * sp : 0;
+    document.getElementById('pf-total').textContent = '≈ $' + (okxEq + dexUsd).toLocaleString(undefined, {maximumFractionDigits: 0});
+    document.getElementById('pf-sol').textContent = sp > 0 ? ('$' + sp.toFixed(2)) : '—';
+    const w = pf.wallet || {};
+    document.getElementById('pf-wallet').textContent = w.sol_bal != null ? (w.sol_bal + ' SOL · ' + (w.token_count || 0) + ' tok') : '—';
+
+    const pbody = document.getElementById('pf-body');
+    pbody.innerHTML = '';
+    const rows = [];
+    (pf.okx && pf.okx.positions || []).slice(0, 8).forEach(p => {
+      const upl = p.upl != null ? (p.upl >= 0 ? '+' : '') + Number(p.upl).toFixed(2) + ' USDT' : '—';
+      rows.push(['OKX', esc(p.instId || '') + '  $' + (p.notionalUsd || 0), esc(upl)]);
+    });
+    (pf.dex && pf.dex.positions || []).slice(0, 8).forEach(p => {
+      const pnl = p.pnl_pct != null ? (p.pnl_pct >= 0 ? '+' : '') + Number(p.pnl_pct).toFixed(1) + '%' : '—';
+      rows.push(['DEX', esc(p.symbol || '') + '  ' + (p.amount_sol || 0) + ' SOL', esc(pnl)]);
+    });
+    (pf.wallet && pf.wallet.tokens || []).slice(0, 6).forEach(t => {
+      rows.push(['链上', esc(t.label || '') + '  ' + t.amount, '—']);
+    });
+    if (!rows.length) {
+      rows.push(['—', pf.last_error ? esc(String(pf.last_error).slice(0, 120)) : '等待后台同步…', '—']);
+    }
+    rows.forEach(([a, b, c]) => { pbody.innerHTML += `<tr><td>${a}</td><td>${b}</td><td>${c}</td></tr>`; });
+  } catch(e) {
+    document.getElementById('ts').textContent = 'Error: ' + e.message;
+  }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>"""
+
+    @app.route("/")
+    def index():
+        return render_template_string(_HTML)
+
+else:
+    app = None  # type: ignore[assignment]
+
+
+def start_dashboard(host: str = "127.0.0.1", port: int = 8080) -> bool:
+    """Start Flask dashboard in a background thread. Returns True if started."""
+    global _server_started, _server_thread
+
+    if not _flask_available:
+        logger.warning(
+            "dashboard: Flask not installed. Run: pip install flask"
+        )
+        return False
+
+    if _server_started:
+        return True
+
+    import logging as _logging
+
+    _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+
+    def _run():
+        try:
+            app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+        except Exception as e:
+            global _server_started
+            _server_started = False
+            logger.error("Dashboard failed to start: %s", e)
+
+    _server_thread = threading.Thread(target=_run, name="dashboard-server", daemon=True)
+    _server_thread.start()
+    _server_started = True
+
+    logger.info("Dashboard started at http://localhost:%d", port)
+    return True
+
+
+def get_stats_text() -> str:
+    """Return formatted text stats for Telegram /dashboard command."""
+    with _stats_lock:
+        total = _stats.get("total", 0)
+        success = _stats.get("success", 0)
+        failed = _stats.get("failed", 0)
+        total_ms = _stats.get("total_ms", 0)
+
+    success_rate = round(success / total * 100, 1) if total > 0 else 0.0
+    avg_ms = round(total_ms / total) if total > 0 else 0
+
+    try:
+        from self_monitor import self_monitor
+
+        sys_info = self_monitor.get_status_report()
+        state = self_monitor.get_overall_state()
+        err_1h = self_monitor._error_rate_last_hour()
+    except Exception:
+        sys_info = ""
+        state = "unknown"
+        err_1h = 0
+
+    evo = _get_evolution_progress()
+
+    lines = [
+        "📊 **Performance Dashboard**\n",
+        f"**Messages:** {total} total | {success_rate}% success",
+        f"**Avg Response:** {avg_ms}ms",
+        f"**Errors (1h):** {err_1h}",
+        f"**Bot State:** {state.upper()}\n",
+        f"**Evolution:** {evo.get('completed_count', 0)}/{evo.get('total', 7)} tasks done",
+        f"**Dashboard URL:** http://localhost:8080\n",
+    ]
+
+    with _stats_lock:
+        recent_snap = list(_recent_messages)
+    if recent_snap:
+        lines.append("**Recent Messages:**")
+        for msg in recent_snap[-5:]:
+            icon = "✅" if msg.get("success") else "❌"
+            lines.append(
+                f"  {icon} [{msg.get('ts', '?')}] {str(msg.get('text', ''))[:50]} ({msg.get('duration_ms', 0)}ms)"
+            )
+
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:4000] + "\n... (truncated)"
+    return result

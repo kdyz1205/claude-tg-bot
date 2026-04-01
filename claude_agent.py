@@ -25,6 +25,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 import config
+import llm_http_client
 import harness_learn
 import skill_library
 import auto_research
@@ -215,11 +216,6 @@ async def _send_extracted_media(chat_id: int, context, response: str):
             logger.warning(f"Failed to send media {fpath}: {e}")
 
 
-# Full path to claude CLI (npm global install)
-CLAUDE_CMD = os.path.join(
-    os.path.expanduser("~"), "AppData", "Roaming", "npm", "claude.cmd"
-)
-
 # Bot project directory (for self-awareness)
 BOT_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -358,7 +354,7 @@ Never report failure until 2+ approaches tried.
 {vital_signs.ALIVE_PROMPT}
 """
 
-# Write system prompt to file (read by CLI via --append-system-prompt-file)
+# Write system prompt to file (read by HTTP LLM layer via llm_http_client)
 # ALWAYS overwrite — prompt may have been updated in code
 _PROMPT_FILE = Path(BOT_PROJECT_DIR) / ".system_prompt.txt"
 try:
@@ -381,57 +377,6 @@ for _f in os.listdir(_TG_SCREENSHOT_DIR):
         os.remove(os.path.join(_TG_SCREENSHOT_DIR, _f))
     except Exception:
         pass
-
-# ─── Clean Subprocess Environment ─────────────────────────────────────────────
-
-# Strip sensitive keys from environment passed to Claude CLI subprocesses.
-# Claude CLI uses its own auth (Plan tokens) — don't leak bot's API keys.
-_SENSITIVE_ENV_KEYS = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
-                       "TELEGRAM_BOT_TOKEN", "CLAUDE_API_KEY"}
-
-
-def _clean_env() -> dict:
-    """Return os.environ minus sensitive API keys."""
-    return {k: v for k, v in os.environ.items() if k not in _SENSITIVE_ENV_KEYS}
-
-
-# ─── Process Tree Killer (Windows) ────────────────────────────────────────────
-import subprocess as _sp
-
-
-async def _kill_process_tree(proc):
-    """Kill a subprocess and its entire process tree on Windows.
-    proc.kill() only kills the .cmd wrapper — node.exe children survive."""
-    if proc is None:
-        return
-    pid = proc.pid
-    try:
-        # taskkill /T kills the entire tree, /F forces it
-        _sp.run(
-            ["taskkill", "/T", "/F", "/PID", str(pid)],
-            capture_output=True, timeout=10,
-        )
-    except Exception:
-        pass
-    # Fallback: also try proc.kill() in case taskkill didn't work
-    try:
-        proc.kill()
-        await proc.wait()
-    except Exception:
-        pass
-
-
-# Kill any orphaned Claude CLI node processes from previous bot instance
-try:
-    _sp.run(
-        ["powershell", "-NoProfile", "-Command",
-         "Get-WmiObject Win32_Process -Filter \"Name='node.exe'\" | "
-         "Where-Object { $_.CommandLine -like '*claude-code*' -and $_.CommandLine -like '*-p*' } | "
-         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
-        timeout=10, capture_output=True,
-    )
-except Exception:
-    pass
 
 # ─── Session Persistence ─────────────────────────────────────────────────────
 
@@ -514,16 +459,7 @@ def get_task_status() -> dict:
     running = dict(_running_tasks)
     queued = {cid: list(msgs) for cid, msgs in _pending_messages.items() if msgs}
     workers = {cid: not t.done() for cid, t in _chat_workers.items() if not t.done()}
-    sem = _cli_semaphore
-    try:
-        sem_available = sem._value if sem else MAX_CONCURRENT_CLI
-    except AttributeError:
-        sem_available = MAX_CONCURRENT_CLI
-    concurrent_slots = {
-        "max": MAX_CONCURRENT_CLI,
-        "available": sem_available,
-        "in_use": MAX_CONCURRENT_CLI - sem_available,
-    }
+    concurrent_slots = llm_http_client.concurrency_snapshot()
     return {"running": running, "queued": queued, "workers": workers, "concurrent": concurrent_slots}
 
 
@@ -604,19 +540,7 @@ _rate_limited_until: float = 0.0
 _rate_limit_resume_task: asyncio.Task | None = None
 _rate_limit_consecutive: int = 0  # For exponential backoff: 0→60s, 1→120s, 2→300s
 
-# ─── Global CLI Concurrency Limiter ──────────────────────────────────────────
-# Limit simultaneous Claude CLI subprocesses to prevent system overload.
-# Tasks beyond this limit wait in their per-chat queue (already implemented).
-MAX_CONCURRENT_CLI = 3
-_cli_semaphore: asyncio.Semaphore | None = None  # lazy-init (needs event loop)
-
-
-def _get_cli_semaphore() -> asyncio.Semaphore:
-    """Return (or lazily create) the global CLI concurrency semaphore."""
-    global _cli_semaphore
-    if _cli_semaphore is None:
-        _cli_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CLI)
-    return _cli_semaphore
+# HTTP LLM concurrency is limited inside llm_http_client (aiohttp, LLM_HTTP_MAX_CONCURRENT).
 _RATE_LIMIT_BACKOFF = [60, 120, 300]  # Exponential backoff schedule (seconds)
 
 def is_rate_limited() -> bool:
@@ -908,19 +832,19 @@ async def _run_queued_tasks(chat_id: int, context) -> None:
         _chat_workers.pop(chat_id, None)
 
 
-# ─── Claude CLI Runner ────────────────────────────────────────────────────────
+# ─── HTTP LLM Runner (aiohttp: Ollama / Anthropic / OpenAI via llm_http_client) ─
 
 async def _run_claude_cli(
     user_message: str, chat_id: int, context,
     timeout: int = None,
 ) -> tuple[str, str | None, list, str]:
-    """Run claude CLI and return (response_text, session_id, matched_skill_ids, tool_output_text)."""
+    """Run primary LLM turn over HTTP and return (response_text, session_id, matched_skill_ids, tool_output_text)."""
     global _rate_limited_until, _rate_limit_consecutive
     _ERROR_PATTERNS = {
         "credit": ["credit balance", "insufficient credit", "billing"],
         "auth": ["not logged in", "not authenticated", "auth failed", "login required", "invalid x-api-key",
                  "环境变量丢失", "环境变量", "api key 发给", "api_key", "请把你的"],
-        "rate": ["hit your limit", "rate limit", "rate_limit", "quota exceeded", "usage limit", "too many requests"],
+        "rate": ["hit your limit", "rate limit", "rate_limit", "quota exceeded", "usage limit", "too many requests", "429"],
     }
     if timeout is None:
         timeout = getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
@@ -1037,50 +961,68 @@ async def _run_claude_cli(
     else:
         cli_prompt = user_message
 
-    args = [
-        CLAUDE_CMD,
-        "-p", cli_prompt,
-        "--output-format", "json",
-        "--dangerously-skip-permissions",
-        "--model", model,
-        "--append-system-prompt-file", prompt_file,
-    ]
+    if session_id and not str(session_id).startswith("http:"):
+        await llm_http_client.clear_history(chat_id)
+        logger.info(f"Chat {chat_id}: dropped legacy CLI session id; HTTP LLM history reset")
+
     if session_id:
-        args.extend(["--resume", session_id])
-        # NOTE: do NOT use --bare here — --bare disables OAuth/keychain auth, which breaks
-        # subscription-based logins ("Not logged in" error on every --resume).
-        logger.info(f"Chat {chat_id}: resuming session {session_id[:12]}... (model: {model})")
+        logger.info(f"Chat {chat_id}: HTTP LLM turn (model: {model})")
     else:
-        logger.info(f"Chat {chat_id}: new session (model: {model})")
+        logger.info(f"Chat {chat_id}: new HTTP LLM thread (model: {model})")
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_keep_typing(chat_id, context, stop_typing))
-    proc = None
-    stdout_data = b""
     stderr_data = b""
+    new_session_id = None
+    response = None
 
     try:
-        async with _get_cli_semaphore():
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=BOT_PROJECT_DIR,  # CRITICAL: set to bot dir so Claude can find pc_control.py, tg_direct.py, etc.
-                env=_clean_env(),
-            )
+        from pathlib import Path as _Path
 
-            stdout_data, stderr_data = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout,
+        if _msg_file_path:
+            user_text = await asyncio.to_thread(
+                _Path(_msg_file_path).read_text, encoding="utf-8"
             )
+        else:
+            user_text = cli_prompt
+
+        system_text = await asyncio.to_thread(
+            _Path(prompt_file).read_text, encoding="utf-8"
+        )
+
+        try:
+            r_text, sid, err = await llm_http_client.complete_turn(
+                chat_id=chat_id,
+                system_prompt=system_text,
+                user_text=user_text[:200_000],
+                model_hint=model,
+                timeout_sec=float(timeout),
+            )
+        except Exception as http_e:
+            logger.exception("HTTP LLM call failed: %s", http_e)
+            r_text, sid, err = "", None, str(http_e)[:600]
+
+        stderr_data = (err or "").encode("utf-8", errors="replace")
+        if err and "timeout" in err.lower():
+            raise asyncio.TimeoutError()
+        new_session_id = sid
+        response = (r_text or "").strip()
+
+        if not response:
+            r2, sid2, err2 = await llm_http_client.complete_turn(
+                chat_id=chat_id,
+                system_prompt=system_text,
+                user_text="Summarize in 2-3 sentences in the user's language.",
+                model_hint=model,
+                timeout_sec=min(90.0, float(timeout)),
+            )
+            new_session_id = sid2 or new_session_id
+            response = (r2 or "").strip()
+            if err2:
+                stderr_data = err2.encode("utf-8", errors="replace")
 
     except asyncio.TimeoutError:
-        logger.warning(f"Claude CLI timed out after {timeout}s")
-        await _kill_process_tree(proc)
-        raise
-
-    except FileNotFoundError:
-        logger.error(f"Claude CLI not found at: {CLAUDE_CMD}")
+        logger.warning("HTTP LLM timed out after %ss", timeout)
         raise
 
     finally:
@@ -1090,7 +1032,6 @@ async def _run_claude_cli(
             await typing_task
         except asyncio.CancelledError:
             pass
-        # Clean up temp files
         if _mem_prompt_path:
             try:
                 os.unlink(_mem_prompt_path)
@@ -1102,229 +1043,64 @@ async def _run_claude_cli(
             except Exception:
                 pass
 
-    if proc and proc.returncode != 0:
-        logger.warning(f"Claude CLI exited with code {proc.returncode}")
+    if response:
+        resp_lower = response.lower()
+        if any(p in resp_lower for p in _ERROR_PATTERNS["auth"]):
+            logger.error("HTTP LLM auth error: %s", response[:200])
+            await llm_http_client.clear_history(chat_id)
+            _claude_sessions.pop(chat_id, None)
+            _session_timestamps.pop(chat_id, None)
+            _save_sessions()
+            response = "__AUTH_ERROR__"
+            new_session_id = None
+        elif len(response) < 300 and any(p in resp_lower for p in _ERROR_PATTERNS["credit"]):
+            logger.error("HTTP LLM credit error: %s", response[:200])
+            response = "❌ LLM 额度或账单问题。请检查 API 密钥与账户。"
+            new_session_id = None
+        if (
+            response
+            and response != "__AUTH_ERROR__"
+            and len(response) < 200
+            and any(p in response.lower() for p in _ERROR_PATTERNS["rate"])
+        ):
+            logger.warning("HTTP LLM rate limit in short response: %s", response[:200])
+            cooldown = _get_rate_limit_cooldown()
+            _rate_limit_consecutive += 1
+            _rate_limited_until = time.time() + cooldown
+            _schedule_rate_limit_resume(cooldown)
+            response = f"⏳ LLM 限速中，{cooldown}s 后自动恢复。"
+            new_session_id = None
 
-    # Parse JSON response — extract full conversation including tool outputs
-    raw = stdout_data.decode("utf-8", errors="replace").strip()
-    new_session_id = None
-    response = None
-
-    if raw:
-        try:
-            data = json.loads(raw)
-            new_session_id = data.get("session_id")
-
-            # Primary: get the "result" field (final assistant text)
-            response = data.get("result", "").strip()
-
-            # Enhanced: also extract tool use summaries from conversation turns
-            # Claude CLI --output-format json may include conversation messages
-            tool_summaries = []  # capped below
-            _all_tool_output_parts = []  # Collect ALL tool output for media path scanning (capped below)
-            messages = data.get("messages", [])
-            if not messages and isinstance(data.get("content"), list):
-                # Some CLI versions put content blocks at top level
-                messages = [{"role": "assistant", "content": data["content"]}]
-
-            for msg in messages:
-                role = msg.get("role")
-                content = msg.get("content", [])
-                if isinstance(content, str):
-                    continue
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    block_type = block.get("type")
-                    # Tool use blocks (in assistant messages) — record what tools were called
-                    if role == "assistant" and block_type == "tool_use":
-                        tool_name = block.get("name", "unknown")
-                        tool_input = block.get("input", {})
-                        if tool_name == "Bash" or tool_name == "bash":
-                            cmd = tool_input.get("command", "")
-                            if cmd and len(tool_summaries) < 50:
-                                tool_summaries.append(f"[Ran: {cmd[:120]}]")
-                        elif tool_name in ("Edit", "Write", "Read"):
-                            path = tool_input.get("file_path", "")
-                            if len(tool_summaries) < 50:
-                                tool_summaries.append(f"[{tool_name}: {path}]")
-                    # Tool result blocks (in user messages) — collect outputs
-                    elif block_type == "tool_result":
-                        content_val = block.get("content", "")
-                        if isinstance(content_val, list):
-                            # Content can be a list of {type: "text", text: "..."} blocks
-                            content_val = "\n".join(
-                                b.get("text", "") for b in content_val
-                                if isinstance(b, dict) and b.get("type") == "text"
-                            )
-                        if isinstance(content_val, str) and content_val.strip():
-                            # Collect all tool output for media scanning (cap total size)
-                            if len(_all_tool_output_parts) < 100:
-                                _all_tool_output_parts.append(content_val.strip()[:2000])
-                            # Keep short tool results (errors, confirmations)
-                            if len(content_val) < 500 and len(tool_summaries) < 50:
-                                tool_summaries.append(content_val.strip())
-
-            # Store tool output for media extraction by _send_extracted_media (cap at 100KB)
-            _tool_output_text = "\n".join(_all_tool_output_parts)[:100_000]
-
-            # If we have tool summaries but no text response, build one
-            if tool_summaries and not response:
-                response = "\n".join(tool_summaries[:10])
-                logger.info(f"Chat {chat_id}: built response from {len(tool_summaries)} tool outputs")
-
-            if not response:
-                if data.get("is_error"):
-                    response = f"Error: {data.get('error', 'Unknown error')}"
-                elif new_session_id:
-                    # Claude did tool use but gave no text response — ask for summary
-                    logger.info(f"Chat {chat_id}: empty result, requesting follow-up summary")
-                    fu_proc = None
-                    try:
-                        followup_args = [
-                            CLAUDE_CMD, "-p",
-                            "Summarize what you just did in 2-3 sentences. Reply in the user's language.",
-                            "--output-format", "json",
-                            "--dangerously-skip-permissions",
-                            "--model", model,
-                            "--resume", new_session_id,
-                        ]
-                        fu_proc = await asyncio.create_subprocess_exec(
-                            *followup_args,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            cwd=BOT_PROJECT_DIR,
-                            env=_clean_env(),
-                        )
-                        fu_out, _ = await asyncio.wait_for(fu_proc.communicate(), timeout=60)
-                        fu_raw = fu_out.decode("utf-8", errors="replace").strip()
-                        fu_data = json.loads(fu_raw)
-                        fu_text = fu_data.get("result", "").strip()
-                        if fu_text:
-                            response = fu_text
-                            # Update session from follow-up
-                            fu_sid = fu_data.get("session_id")
-                            if fu_sid:
-                                new_session_id = fu_sid
-                    except asyncio.TimeoutError:
-                        logger.debug("Follow-up summary timed out")
-                        await _kill_process_tree(fu_proc)
-                    except Exception as e:
-                        logger.debug(f"Follow-up summary failed: {e}")
-                        if fu_proc and fu_proc.returncode is None:
-                            await _kill_process_tree(fu_proc)
-                if not response:
-                    response = "Done (no text output from tool execution)."
-
-            # Auth detection — CLI not logged in → signal caller to retry
-            if response:
-                resp_lower = response.lower()
-                if any(p in resp_lower for p in _ERROR_PATTERNS["auth"]):
-                    logger.error(f"Claude CLI auth error: {response[:200]}")
-                    _claude_sessions.pop(chat_id, None)
-                    _session_timestamps.pop(chat_id, None)
-                    _save_sessions()
-                    response = "__AUTH_ERROR__"
-                    new_session_id = None
-                # Credit/billing detection — ONLY if response is VERY short (real error, not conversation)
-                elif len(response) < 300 and any(p in resp_lower for p in _ERROR_PATTERNS["credit"]):
-                    logger.error(f"Claude CLI credit error: {response[:200]}")
-                    response = "❌ Claude API 额度不足或账单问题。请检查你的 Anthropic 账户。"
-                    new_session_id = None
-                # Rate limit detection in SHORT responses only (< 200 chars = definitely a CLI error, not conversation)
-                if len(response) < 200 and any(p in resp_lower for p in _ERROR_PATTERNS["rate"]):
-                    logger.warning(f"Claude CLI rate limit detected in short response: {response[:200]}")
-                    cooldown = _get_rate_limit_cooldown()
-                    _rate_limit_consecutive += 1
-                    _rate_limited_until = time.time() + cooldown
-                    _schedule_rate_limit_resume(cooldown)
-                    response = f"⏳ Claude CLI 限速中，{cooldown}s后自动恢复。"
-                    new_session_id = None
-
-        except json.JSONDecodeError:
-            # CLI may output warnings before JSON — search from the end
-            json_end = raw.rfind('}')
-            json_start = -1
-            if json_end >= 0:
-                # Find matching opening brace by scanning backwards
-                depth = 0
-                for i in range(json_end, -1, -1):
-                    if raw[i] == '}':
-                        depth += 1
-                    elif raw[i] == '{':
-                        depth -= 1
-                    if depth == 0:
-                        json_start = i
-                        break
-            if json_start >= 0:
-                try:
-                    data = json.loads(raw[json_start:json_end + 1])
-                    response = data.get("result", "").strip()
-                    new_session_id = data.get("session_id")
-                    if not response:
-                        response = raw[:json_start].strip() or "✅ 任务已执行。"
-                except json.JSONDecodeError:
-                    response = raw
-            else:
-                response = raw
-
-    # ── Check stderr for critical errors BEFORE falling back ──
     if stderr_data:
         err_text = stderr_data.decode("utf-8", errors="replace").strip()
         if err_text:
-            logger.debug(f"Claude CLI stderr (chat {chat_id}): {err_text[:500]}")
             err_lower = err_text.lower()
-            # Check for credit/billing errors
-            if any(p in err_lower for p in _ERROR_PATTERNS["credit"]):
-                logger.error(f"Claude CLI credit error detected in stderr: {err_text[:300]}")
-                response = "❌ Claude API 额度不足或账单问题。请检查你的 Anthropic 账户。"
-                new_session_id = None
-            # Check for auth errors — signal caller to retry (token may auto-refresh)
-            elif any(p in err_lower for p in _ERROR_PATTERNS["auth"]):
-                logger.error(f"Claude CLI auth error in stderr: {err_text[:300]}")
+            logger.debug("HTTP LLM transport (chat %s): %s", chat_id, err_text[:500])
+            if "auth failed" in err_lower or "not set" in err_lower or "401" in err_text or "403" in err_text:
+                await llm_http_client.clear_history(chat_id)
                 _claude_sessions.pop(chat_id, None)
                 _session_timestamps.pop(chat_id, None)
                 _save_sessions()
                 response = "__AUTH_ERROR__"
                 new_session_id = None
-            # Check for stale session ID — clear it so next call starts fresh
-            elif "no conversation found" in err_lower or ("session" in err_lower and "not found" in err_lower):
-                logger.warning(f"Chat {chat_id}: stale session detected in stderr, clearing")
-                _claude_sessions.pop(chat_id, None)
-                _session_timestamps.pop(chat_id, None)
-                _save_sessions()
-                # Signal caller to retry by returning a sentinel response
-                response = "__STALE_SESSION__"
-                new_session_id = None
-            # Check for rate limit errors (stderr is reliable — this is a real error from CLI)
-            elif any(p in err_lower for p in _ERROR_PATTERNS["rate"]):
-                # Parse reset time from error message if available
-                reset_match = re.search(r'(\d+)\s*(second|minute|sec|min|s\b|m\b)', err_lower)
-                parsed_val = None
-                if reset_match:
-                    val = int(reset_match.group(1))
-                    unit = reset_match.group(2)
-                    parsed_val = val * 60 if unit.startswith('min') or unit == 'm' else val
-                # Exponential backoff: 60s → 120s → 300s on consecutive rate limits
-                cooldown = _get_rate_limit_cooldown(parsed_val)
+            elif "rate limit" in err_lower or "429" in err_text:
+                cooldown = _get_rate_limit_cooldown()
                 _rate_limit_consecutive += 1
                 _rate_limited_until = time.time() + cooldown
-                logger.warning(f"Claude CLI rate limited (stderr): cooldown={cooldown}s, consecutive={_rate_limit_consecutive}, msg={err_text[:300]}")
-                response = f"⏳ 遇到限速，等待{cooldown}s后继续..."
-                new_session_id = None
-                # Schedule auto-resume task
                 _schedule_rate_limit_resume(cooldown)
+                response = f"⏳ 遇到限速，等待 {cooldown}s 后继续…"
+                new_session_id = None
+            elif any(p in err_lower for p in _ERROR_PATTERNS["credit"]):
+                response = "❌ LLM 额度或账单问题。请检查 API 密钥与账户。"
+                new_session_id = None
 
     if not response:
         err = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else ""
         if err:
-            logger.error(f"Claude CLI stderr: {err[:500]}")
-            if "error" in err.lower():
-                response = f"⚠️ {err[:500]}"
-            else:
-                response = "✅ 任务已执行。"
+            logger.error("HTTP LLM error: %s", err[:500])
+            response = f"⚠️ {err[:500]}"
         else:
-            response = "✅ 任务已执行（无输出）。"
+            response = "✅ 已处理（无文本输出）。"
 
     return response, new_session_id, _matched_skill_ids, _tool_output_text
 
@@ -1500,6 +1276,7 @@ async def _self_heal_inner(user_message: str, chat_id: int, context, error: Exce
     # Session corrupted → clear and retry
     if "session" in err_str or "resume" in err_str or "invalid" in err_str:
         logger.info("Self-heal: clearing corrupted session")
+        await llm_http_client.clear_history(chat_id)
         _claude_sessions.pop(chat_id, None)
         _session_timestamps.pop(chat_id, None)
         _save_sessions()
@@ -1515,65 +1292,30 @@ async def _self_heal_inner(user_message: str, chat_id: int, context, error: Exce
             logger.error(f"Self-heal retry failed: {e2}")
             return False
 
-    # Encoding / input error → retry with simpler message
+    # Encoding / input error → retry over HTTP (no subprocess)
     if "input must be provided" in err_str or "encoding" in err_str or "charmap" in err_str:
-        logger.info("Self-heal: encoding issue, retrying via temp file")
-        import tempfile
+        logger.info("Self-heal: encoding issue, retrying via HTTP LLM")
         await _send_response(chat_id, "🔧 编码问题，正在重试...", context)
-        msg_tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", encoding="utf-8", delete=False, dir=BOT_PROJECT_DIR,
-        )
         try:
-            msg_tmp.write(user_message)
-            msg_tmp.close()
-            session_id = _claude_sessions.get(chat_id)
             model = _pick_model(user_message)
-            # Pass user message via -p referencing the temp file; keep real system prompt
-            args = [
-                CLAUDE_CMD,
-                "-p", f"Read and respond to the user's message in this file: {msg_tmp.name}",
-                "--output-format", "json",
-                "--dangerously-skip-permissions",
-                "--model", model,
-                "--append-system-prompt-file", str(_PROMPT_FILE),
-            ]
-            if session_id:
-                args.extend(["--resume", session_id])
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=BOT_PROJECT_DIR,
-                env=_clean_env(),
+            system_text = await asyncio.to_thread(_PROMPT_FILE.read_text, encoding="utf-8")
+            r_text, sid, err = await llm_http_client.complete_turn(
+                chat_id=chat_id,
+                system_prompt=system_text,
+                user_text=user_message[:200_000],
+                model_hint=model,
+                timeout_sec=120.0,
             )
-            try:
-                stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-            except (asyncio.TimeoutError, Exception) as comm_err:
-                await _kill_process_tree(proc)
-                logger.debug(f"Self-heal subprocess error: {comm_err}")
-                return False
-            raw = stdout_data.decode("utf-8", errors="replace").strip()
-            response = raw
-            sid = None
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    response = data.get("result", "").strip() or raw
-                    sid = data.get("session_id")
-                except json.JSONDecodeError:
-                    pass
+            if err:
+                logger.debug("Self-heal HTTP error: %s", err)
             if sid:
                 _set_session(chat_id, sid)
                 _save_sessions()
-            await _send_response(chat_id, response, context)
-            return True
+            out = (r_text or "").strip() or (err or "⚠️ 重试失败")
+            await _send_response(chat_id, out, context)
+            return bool((r_text or "").strip())
         except Exception:
             return False
-        finally:
-            try:
-                os.unlink(msg_tmp.name)
-            except Exception:
-                pass
 
     # ── Layer 2: Claude self-diagnosis (for unknown errors) ──
     try:
@@ -1751,7 +1493,8 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
                 _self_monitor.record_service_failure("cli", "auth_error")
                 await _send_response(
                     chat_id,
-                    "⚠️ CLI 认证过期。请在电脑上运行 claude login 重新登录。",
+                    "⚠️ LLM 认证失败。请检查 .env 中 ANTHROPIC_API_KEY / OPENAI_API_KEY，"
+                    "或启动本地 Ollama 并设置 LLM_HTTP_BACKEND=ollama。",
                     context,
                 )
                 return True  # We responded — do NOT trigger fallback chain
@@ -1768,7 +1511,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
                 _self_monitor.record_service_failure("cli", "auth_error")
                 await _send_response(
                     chat_id,
-                    "⚠️ CLI 配置问题，正在自动修复中。请稍后重试。",
+                    "⚠️ LLM 配置问题，正在自动修复中。请检查 API 密钥或 Ollama 地址。",
                     context,
                 )
                 return True  # We responded — do NOT trigger fallback chain
@@ -1849,6 +1592,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
     except asyncio.TimeoutError:
         _self_monitor.record_service_failure("cli", "timeout")
         # Self-heal: clear session and notify
+        await llm_http_client.clear_history(chat_id)
         _claude_sessions.pop(chat_id, None)
         _session_timestamps.pop(chat_id, None)
         _save_sessions()
@@ -1859,18 +1603,9 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
         )
         return False  # Let fallback chain (API, web AI) handle it
 
-    except FileNotFoundError:
-        _self_monitor.record_service_failure("cli", "not_found")
-        await _send_response(
-            chat_id,
-            "❌ Claude CLI 未找到。请运行: npm install -g @anthropic-ai/claude-code",
-            context,
-        )
-        return False
-
     except Exception as e:
         _self_monitor.record_service_failure("cli", str(e)[:200])
-        logger.error(f"Claude CLI error: {e}", exc_info=True)
+        logger.error(f"HTTP LLM error: {e}", exc_info=True)
         # ── Self-Healing: attempt auto-recovery ──
         healed = await _self_heal(user_message, chat_id, context, e)
         if not healed:
@@ -2595,72 +2330,21 @@ async def _run_claude_cli_direct(
     model: str = "claude-sonnet-4-6",
     timeout: int = 120,
 ) -> tuple[str, str | None]:
-    """Lightweight CLI call for training/internal use. No chat_id, no typing indicator."""
-    import tempfile as _tmpmod
-
-    cli_prompt = f"[Training task] {prompt}"
-    _direct_msg_file = None
-
-    # For long prompts, write to temp file to avoid Windows CLI limits
-    if len(cli_prompt) > 8000:
-        try:
-            _dtmp = _tmpmod.NamedTemporaryFile(
-                mode="w", suffix=".txt", encoding="utf-8", delete=False, dir=BOT_PROJECT_DIR,
-            )
-            _dtmp.write(cli_prompt)
-            _dtmp.close()
-            _direct_msg_file = _dtmp.name
-            cli_prompt = f"Read and follow the training task in this file: {_direct_msg_file}"
-        except OSError:
-            cli_prompt = cli_prompt[:8000]
-
-    args = [
-        CLAUDE_CMD,
-        "-p", cli_prompt,
-        "--output-format", "json",
-        "--dangerously-skip-permissions",
-        "--model", model,
-        "--append-system-prompt-file", str(_PROMPT_FILE),
-    ]
-
-    sem = _get_cli_semaphore()
-    await sem.acquire()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=BOT_PROJECT_DIR,
-            env=_clean_env(),
-        )
-
-        try:
-            stdout_data, stderr_data = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            await _kill_process_tree(proc)
-            return "Timed out", None
-        finally:
-            if _direct_msg_file:
-                try:
-                    os.unlink(_direct_msg_file)
-                except Exception:
-                    pass
-
-        raw = stdout_data.decode("utf-8", errors="replace").strip()
-        if not raw:
-            return "No output", None
-
-        try:
-            data = json.loads(raw)
-            response = data.get("result", "").strip() or "Done."
-            session_id = data.get("session_id")
-            return response, session_id
-        except json.JSONDecodeError:
-            return raw[:1000], None
-    finally:
-        sem.release()
+    """Single-shot HTTP LLM for training/internal use (aiohttp via llm_http_client)."""
+    user_body = f"[Training task] {prompt}"
+    if len(user_body) > 8000:
+        user_body = user_body[:8000]
+    system_text = await asyncio.to_thread(_PROMPT_FILE.read_text, encoding="utf-8")
+    text, err = await llm_http_client.complete_stateless(
+        system_prompt=system_text,
+        user_text=user_body,
+        model_hint=model,
+        timeout_sec=float(timeout),
+        state_key=-301,
+    )
+    if err:
+        return f"Error: {err[:500]}", None
+    return (text or "Done.").strip(), None
 
 
 async def _run_claude_raw(
@@ -2668,80 +2352,24 @@ async def _run_claude_raw(
     model: str = "claude-haiku-4-5-20251001",
     timeout: int = 30,
 ) -> str:
-    """Clean CLI call WITHOUT bot system prompt. For judge/meta tasks.
-    Writes prompt to a temp file used as --system-prompt, with a short -p trigger."""
-    import tempfile
-
-    # Write the full prompt to a temp file, pass as system prompt
-    # This avoids Windows CLI encoding issues with long/Chinese -p args
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", encoding="utf-8", delete=False, dir=BOT_PROJECT_DIR,
+    """Stateless HTTP LLM for judge/meta tasks (full instruction in user message)."""
+    text, err = await llm_http_client.complete_stateless(
+        system_prompt="Follow the user message exactly. Output only what is requested, no preamble.",
+        user_text=(prompt or "")[:120_000],
+        model_hint=model,
+        timeout_sec=float(timeout),
+        state_key=-302,
     )
-    try:
-        tmp.write(prompt)
-        tmp.close()
-
-        args = [
-            CLAUDE_CMD,
-            "-p", "Read your system prompt carefully and follow every instruction in it. Output exactly what it asks for.",
-            "--append-system-prompt-file", tmp.name,
-            "--output-format", "json",
-            "--dangerously-skip-permissions",
-            "--model", model,
-        ]
-
-        sem = _get_cli_semaphore()
-        await sem.acquire()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=BOT_PROJECT_DIR,
-                env=_clean_env(),
-            )
-
-            try:
-                stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                await _kill_process_tree(proc)
-                return ""
-
-            raw = stdout_data.decode("utf-8", errors="replace").strip()
-            if not raw:
-                return ""
-
-            try:
-                data = json.loads(raw)
-                return data.get("result", "").strip()
-            except json.JSONDecodeError:
-                return raw[:2000]
-        finally:
-            sem.release()
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except Exception:
-            pass
+    if err:
+        return ""
+    return (text or "").strip()[:2000]
 
 
 async def _repair_trade_json_via_haiku(round_idx: int, bad_snippet: str) -> str:
-    """Re-prompt Haiku with one of 20 rotating JSON-only reminders (dispatcher.llm_filter)."""
-    from dispatcher.llm_filter import TRADE_JSON_REMINDERS
+    """Re-prompt fast tier via HTTP (aiohttp); rotating reminders live in dispatcher.llm_filter."""
+    from dispatcher.llm_filter import reask_trade_json_via_http
 
-    reminder = TRADE_JSON_REMINDERS[round_idx % len(TRADE_JSON_REMINDERS)]
-    prompt = (
-        f"{reminder}\n\n"
-        "先前输出无法通过交易 JSON 校验。请只输出一个对象，键为 action, pair, amount, price。\n\n"
-        f"{bad_snippet[:3800]}"
-    )
-    return (
-        await _run_claude_raw(
-            prompt=prompt,
-            model="claude-haiku-4-5-20251001",
-            timeout=40,
-        )
-    ).strip()
+    return await reask_trade_json_via_http(round_idx, bad_snippet)
 
 
 async def sanitize_llm_trade_output_with_retries(raw_llm_text: str, max_retries: int = 3):
@@ -2783,6 +2411,7 @@ async def _forward_new_screenshots_direct(send_photo):
 
 def clear_history(chat_id: int):
     """Clear all state for a chat."""
+    llm_http_client.clear_history_sync(chat_id)
     _claude_sessions.pop(chat_id, None)
     _session_timestamps.pop(chat_id, None)
     _save_sessions()

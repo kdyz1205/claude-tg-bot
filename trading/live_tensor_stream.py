@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from collections import deque
 from typing import Any, Optional
@@ -108,10 +109,14 @@ class WebSocketTensorStream:
             log.error("aiohttp required for WebSocketTensorStream")
             return
 
+        backoff_s = 2.0
+        max_backoff_s = 60.0
         while self._running:
             try:
-                async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=90)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.ws_connect(OKX_WS_PUBLIC, heartbeat=25) as ws:
+                        backoff_s = 2.0
                         sub = {
                             "op": "subscribe",
                             "args": [
@@ -149,8 +154,10 @@ class WebSocketTensorStream:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.warning("OKX WS disconnected (%s), reconnect in 3s", e)
-                await asyncio.sleep(3)
+                log.warning("OKX WS disconnected (%s), reconnect in %.1fs", e, backoff_s)
+                jitter = random.uniform(0, backoff_s * 0.25)
+                await asyncio.sleep(min(max_backoff_s, backoff_s) + jitter)
+                backoff_s = min(max_backoff_s, backoff_s * 1.8)
 
     def get_ohlcv_numpy(self) -> np.ndarray:
         """[N, 6] ts, o, h, l, c, vol — snapshot under caller sync (use lock outside)."""

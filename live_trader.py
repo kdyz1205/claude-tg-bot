@@ -15,6 +15,19 @@ import dex_trader
 
 logger = logging.getLogger(__name__)
 
+
+def _httpx_response_json(resp: httpx.Response):
+    try:
+        return resp.json()
+    except json.JSONDecodeError:
+        logger.warning(
+            "JSON decode failed status=%s body=%s",
+            resp.status_code,
+            (resp.text or "")[:160],
+        )
+        return None
+
+
 BASE_DIR = Path(__file__).parent
 POSITIONS_FILE = BASE_DIR / "_live_positions.json"
 LIVE_CONFIG_FILE = BASE_DIR / "_live_config.json"
@@ -143,7 +156,8 @@ async def _get_jupiter_quote(input_mint: str, output_mint: str, amount_lamports:
             if resp.status_code != 200:
                 logger.error(f"Jupiter quote failed: {resp.status_code} {resp.text[:200]}")
                 return None
-            return resp.json()
+            out = _httpx_response_json(resp)
+            return out if isinstance(out, dict) else None
     except Exception as e:
         logger.error(f"Jupiter quote error: {e}")
         return None
@@ -166,7 +180,9 @@ async def _execute_jupiter_swap(quote: dict, user_pubkey: str) -> Optional[str]:
                 logger.error(f"Jupiter swap failed: {resp.status_code} {resp.text[:200]}")
                 return None
 
-            swap_data = resp.json()
+            swap_data = _httpx_response_json(resp)
+            if not isinstance(swap_data, dict):
+                return None
             tx_base64 = swap_data.get("swapTransaction")
             if not tx_base64:
                 logger.error("No swapTransaction in Jupiter response")
@@ -202,7 +218,9 @@ async def _get_token_price_usd(mint: str) -> Optional[float]:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(JUPITER_PRICE_URL, params={"ids": mint})
             if resp.status_code == 200:
-                data = resp.json()
+                data = _httpx_response_json(resp)
+                if not isinstance(data, dict):
+                    return None
                 price_data = data.get("data", {}).get(mint, {})
                 return float(price_data.get("price", 0))
     except Exception:
@@ -232,7 +250,9 @@ async def _validate_token(mint: str, cfg: dict) -> tuple[bool, str]:
             # Check Jupiter strict list
             resp = await client.get(f"https://api.jup.ag/tokens/v1/strict")
             if resp.status_code == 200:
-                tokens = resp.json()
+                tokens = _httpx_response_json(resp)
+                if not isinstance(tokens, list):
+                    tokens = []
                 found = None
                 for t in tokens:
                     if t.get("address") == mint:
@@ -244,7 +264,8 @@ async def _validate_token(mint: str, cfg: dict) -> tuple[bool, str]:
             # Check liquidity via DexScreener
             resp = await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
             if resp.status_code == 200:
-                pairs = resp.json().get("pairs") or []
+                ds = _httpx_response_json(resp)
+                pairs = ds.get("pairs") or [] if isinstance(ds, dict) else []
                 if not pairs:
                     return False, "No trading pairs found"
 
@@ -675,9 +696,13 @@ async def _run_delta_neutral_with_recovery(
     signal_data: Optional[dict],
 ) -> dict:
     """
-    True concurrent DEX buy + OKX short (gather). On legged fill:
-    - DEX ok / hedge fail → retry hedge; then emergency DEX sell + alert.
-    - Hedge ok / DEX fail → retry DEX; then emergency OKX flatten + alert.
+    Atomic-style entry: ``asyncio.gather(DEX buy ∥ OKX short)`` (true overlap).
+    OKX live path releases executor lock during REST so the DEX leg is not blocked.
+
+    Leg-risk (one side filled, one failed):
+    - DEX ok / hedge fail → serial hedge retries; then Jupiter unwind + alert.
+    - Hedge ok / DEX fail → DEX retries; then ``emergency_flatten_short_verified``
+      (multi-round close + exchange poll + reduce-only) in parallel with alert.
     """
     from self_monitor import trigger_alert
 
@@ -697,6 +722,7 @@ async def _run_delta_neutral_with_recovery(
     async def _hedge_leg() -> Any:
         return await execu.open_position_with_retry(hedge_symbol, "short", usd)
 
+    # OKX live open releases executor lock during REST so this overlaps real wall time with DEX.
     dex_r, hed_r = await asyncio.gather(
         _dex_leg(),
         _hedge_leg(),
@@ -728,25 +754,39 @@ async def _run_delta_neutral_with_recovery(
                 hedge_ok = True
                 break
         if dex_ok and not hedge_ok:
-            await trigger_alert(
+            pid = dex_r.get("id") if isinstance(dex_r, dict) else None
+            alert_long = trigger_alert(
                 "NAKED_LONG_RISK",
-                f"DEX filled but OKX short failed after {h_retries} retries mint={mint}. Emergency market flatten (Jupiter→SOL).",
+                f"DEX filled but OKX short failed after {h_retries} retries mint={mint}. "
+                f"Emergency market flatten (Jupiter→SOL).",
                 severity="critical",
             )
-            pid = dex_r.get("id") if isinstance(dex_r, dict) else None
             if pid:
+                ga0 = await asyncio.gather(
+                    alert_long,
+                    sell_token(pid, "emergency_hedge_failed"),
+                    return_exceptions=True,
+                )
+                if isinstance(ga0[0], BaseException):
+                    logger.error("trigger_alert naked long: %s", ga0[0], exc_info=True)
                 flat_r = None
-                for _e in range(5):
-                    flat_r = await sell_token(pid, "emergency_hedge_failed")
+                if not isinstance(ga0[1], BaseException):
+                    flat_r = ga0[1]
+                else:
+                    logger.error("first emergency sell: %s", ga0[1], exc_info=True)
+                for _e in range(4):
                     if flat_r:
                         break
                     await asyncio.sleep(0.5 * (_e + 1))
+                    flat_r = await sell_token(pid, "emergency_hedge_failed")
                 if not flat_r:
                     await trigger_alert(
                         "EMERGENCY_DEX_UNWIND_FAILED",
                         f"Could not market-close DEX spot position_id={pid} mint={mint[:12]}",
                         severity="critical",
                     )
+            else:
+                await alert_long
             return {
                 "ok": False,
                 "reason": "naked_long_rolled_back",
@@ -770,12 +810,28 @@ async def _run_delta_neutral_with_recovery(
                 dex_ok = True
                 break
         if hedge_ok and not dex_ok:
-            await trigger_alert(
+            alert_coro = trigger_alert(
                 "NAKED_SHORT_RISK",
-                f"OKX short on {hedge_symbol} but DEX buy failed after {d_retries} tries. Flattening hedge.",
+                f"OKX short on {hedge_symbol} but DEX buy failed after {d_retries} tries. "
+                f"Emergency verified flatten running.",
                 severity="critical",
             )
-            flat = await execu.close_position(hedge_symbol, reason="emergency_dex_failed")
+            flat_coro = execu.emergency_flatten_short_verified(
+                hedge_symbol, reason="emergency_dex_failed", max_rounds=8
+            )
+            ga = await asyncio.gather(alert_coro, flat_coro, return_exceptions=True)
+            flat = ga[1] if len(ga) > 1 else {"ok": False, "reason": "gather_short"}
+            if isinstance(flat, BaseException):
+                logger.error("emergency_flatten_short_verified raised: %s", flat, exc_info=True)
+                flat = {"ok": False, "reason": str(flat), "verified": False}
+            if isinstance(ga[0], BaseException):
+                logger.error("trigger_alert raised: %s", ga[0], exc_info=True)
+            if not (isinstance(flat, dict) and flat.get("verified")):
+                await trigger_alert(
+                    "OKX_UNWIND_UNVERIFIED",
+                    f"Hedge {hedge_symbol} may still be open on exchange after rollback: {flat!r}",
+                    severity="critical",
+                )
             return {
                 "ok": False,
                 "reason": "naked_short_flattened",

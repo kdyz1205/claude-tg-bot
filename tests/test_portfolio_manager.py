@@ -37,21 +37,58 @@ def test_format_portfolio_plain_okx_and_dex():
             "total_value_sol": 2.0,
         },
         "wallet": {
+            "ok": True,
+            "pubkey_short": "Test…Addr",
+            "sol_bal": 1.0,
+            "token_count": 1,
             "tokens": [
                 {
                     "label": "USDC",
                     "amount": 100.0,
                     "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
                 }
-            ]
+            ],
         },
         "last_error": "",
     }
     out = pm.format_portfolio_plain(snap)
-    assert "真实持仓摘要" in out
+    assert "OKX · 中心化所" in out
     assert "SOL-USDT-SWAP" in out
     assert "PEPE" in out
     assert "USDC" in out
+    assert "Polymarket · Polygon CLOB" in out
+
+
+def test_format_chain_snapshot_compact_tree():
+    import portfolio_manager as pm
+
+    mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    snap = {
+        "updated_at": 1.0,
+        "age_sec": 12.0,
+        "sol_price": 80.0,
+        "okx": {"has_keys": False, "ok": False, "positions": []},
+        "dex": {"positions": [], "total_value_sol": 0.0},
+        "wallet": {
+            "ok": True,
+            "pubkey_short": "Abcd…wxyz",
+            "sol_bal": 0.07,
+            "token_count": 2,
+            "tokens": [
+                {"label": "mɔ", "amount": 211.0, "mint": mint},
+            ],
+        },
+        "last_error": "",
+    }
+    out = pm.format_chain_snapshot(snap)
+    assert "按市场分栏" in out
+    assert "OKX · 中心化所" in out
+    assert "Solana · 链上钱包" in out
+    assert "DEX · 引擎/Jupiter 跟踪" in out
+    assert "Polymarket · Polygon CLOB" in out
+    assert "mɔ" in out
+    assert "$mɔ" not in out
+    assert mint[:4] in out and mint[-4:] in out
 
 
 @pytest.mark.asyncio
@@ -65,9 +102,11 @@ async def test_get_live_portfolio_summary_minimal(monkeypatch):
         "okx": {"has_keys": False, "ok": False, "positions": []},
         "dex": {"positions": [], "total_value_sol": 0.0},
         "wallet": {"tokens": []},
+        "poly": {"configured": False, "oracle_enabled": False, "recent": []},
         "last_error": "",
     }
 
     monkeypatch.setattr("trading.portfolio_snapshot.get_snapshot", lambda: dict(snap))
     text = await pm.get_live_portfolio_summary(refresh=False)
-    assert "当前真实持仓" in text
+    assert "真实持仓 · 分市场" in text
+    assert "Polymarket" in text
