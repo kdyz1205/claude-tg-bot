@@ -48,6 +48,8 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 DEFAULT_LIVE_CONFIG = {
     "enabled": False,
     "max_trade_pct": 15.0,       # max % of portfolio per trade
+    # Hard cap per buy/hedge leg (SOL). None = only max_trade_pct applies.
+    "max_trade_sol": None,
     "max_positions": 5,           # max concurrent positions
     "daily_loss_limit_pct": 10.0, # halt if daily loss exceeds this
     "stop_loss_pct": 3.0,         # per-trade stop loss
@@ -335,8 +337,14 @@ async def _check_risk_controls(amount_sol: float, cfg: dict) -> tuple[bool, str]
     if balance is None:
         return False, "Cannot fetch balance"
     max_trade = balance * cfg.get("max_trade_pct", 15.0) / 100
+    cap = cfg.get("max_trade_sol")
+    if cap is not None:
+        try:
+            max_trade = min(max_trade, float(cap))
+        except (TypeError, ValueError):
+            pass
     if amount_sol > max_trade:
-        return False, f"Trade {amount_sol:.4f} SOL > max {max_trade:.4f} SOL ({cfg['max_trade_pct']}%)"
+        return False, f"Trade {amount_sol:.4f} SOL > max {max_trade:.4f} SOL (pct {cfg.get('max_trade_pct', 15)}%{' + max_trade_sol cap' if cap is not None else ''})"
 
     # 4. Reserve
     min_reserve = cfg.get("min_sol_reserve", 0.05)
@@ -1010,6 +1018,12 @@ async def _neural_delta_neutral_once(send_func=None) -> None:
             balance * cfg.get("max_trade_pct", 15.0) / 100.0,
             balance - cfg.get("min_sol_reserve", 0.05),
         )
+        cap = cfg.get("max_trade_sol")
+        if cap is not None:
+            try:
+                trade_sol = min(trade_sol, float(cap))
+            except (TypeError, ValueError):
+                pass
         trade_sol = max(0.01, trade_sol)
         hedge_sym = cfg.get("neural_hedge_symbol") or "SOLUSDT"
         sigd = {
@@ -1376,6 +1390,12 @@ class LiveTrader:
             base_pct = cfg.get("max_trade_pct", 15.0) / 100
             trade_sol = balance * base_pct * regime_mult * (0.5 + 0.5 * confidence)
             trade_sol = min(trade_sol, balance - cfg.get("min_sol_reserve", 0.05))
+            cap = cfg.get("max_trade_sol")
+            if cap is not None:
+                try:
+                    trade_sol = min(trade_sol, float(cap))
+                except (TypeError, ValueError):
+                    pass
             trade_sol = max(trade_sol, 0.01)
 
             result = await buy_token(
@@ -1457,6 +1477,8 @@ _MINT_MAP = {
     "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
     "RAY": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
     "ORCA": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+    # Pixels (PIXEL) — verify mint in your wallet / Jupiter before large size
+    "PIXEL": "Di4B2JSRykk27QcD9oe9sjqff1kTW4mf23bfDePwEKLu",
     "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
     "WIF": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
     "JTO": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
