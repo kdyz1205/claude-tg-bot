@@ -2,13 +2,22 @@
 config.py — Central configuration for the Telegram bot.
 
 All settings can be overridden via environment variables in .env
+
+Dual-track strategy defaults: CEX (OKX / 低波动) vs On-chain (DEX / 狙击).
+Evolver tunings are merged from ``_evolver_strategy_overlay.json`` (see ``persist_evolver_strategy_overlay``).
 """
+import json
 import os
 from pathlib import Path
+from typing import Any
+
 from dotenv import load_dotenv
 
-# Always load .env from the same directory as this file
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+# 仓库根 .env（与 config.py 同目录）
+_repo_root = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=_repo_root / ".env", override=False)
+# 当前工作目录 .env：仅填充仓库 .env 里未出现的键（方便在别的文件夹放一份密钥）
+load_dotenv(override=False)
 
 # ─── Authentication ───────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -209,6 +218,119 @@ if _HELIUS_API_KEY:
 
 ONCHAIN_SOL_WSS = os.getenv("ONCHAIN_SOL_WSS", _DEFAULT_SOL_WSS).strip()
 SOLANA_RPC_HTTP = os.getenv("SOLANA_RPC_HTTP", _DEFAULT_SOL_HTTP).strip()
+# 可选：显式公钥（与 secure_wallet 解密后的地址应对齐）；仅用于日志/看板诊断
+ONCHAIN_WALLET_ADDRESS = os.getenv("ONCHAIN_WALLET_ADDRESS", "").strip()
+
+# ─── Dual-track strategy (CEX vs On-chain) ───────────────────────────────────
+# CEX: 工业级默认；On-chain: 狙击手默认。Evolver overlay 合并自 _evolver_strategy_overlay.json。
+# <evolver_strategy_dicts>
+_DEFAULT_CEX_STRATEGY: dict[str, Any] = {
+    "take_profit_pct": 5.0,
+    "stop_loss_pct": 2.0,
+    "max_slippage_bps": 5,  # 0.05%
+}
+_DEFAULT_ONCHAIN_STRATEGY: dict[str, Any] = {
+    "take_profit_pct": 100.0,
+    "stop_loss_pct": 30.0,
+    "max_slippage_bps": 1500,  # 15%
+}
+CEX_STRATEGY_CONFIG: dict[str, Any] = dict(_DEFAULT_CEX_STRATEGY)
+ONCHAIN_STRATEGY_CONFIG: dict[str, Any] = dict(_DEFAULT_ONCHAIN_STRATEGY)
+# </evolver_strategy_dicts>
+
+_EVOLVER_OVERLAY_FILE = Path(__file__).resolve().parent / "_evolver_strategy_overlay.json"
+
+# 模块级标量别名（随 CEX_STRATEGY_CONFIG / ONCHAIN_STRATEGY_CONFIG 与 overlay 刷新）
+CEX_STOP_LOSS_PCT: float = 2.0
+CEX_TAKE_PROFIT_PCT: float = 5.0
+CEX_SLIPPAGE_BPS: int = 5
+ONCHAIN_STOP_LOSS_PCT: float = 30.0
+ONCHAIN_TAKE_PROFIT_PCT: float = 100.0
+ONCHAIN_SLIPPAGE_BPS: int = 1500
+
+
+def _refresh_scalar_strategy_exports() -> None:
+    global CEX_STOP_LOSS_PCT, CEX_TAKE_PROFIT_PCT, CEX_SLIPPAGE_BPS
+    global ONCHAIN_STOP_LOSS_PCT, ONCHAIN_TAKE_PROFIT_PCT, ONCHAIN_SLIPPAGE_BPS
+    CEX_STOP_LOSS_PCT = float(CEX_STRATEGY_CONFIG.get("stop_loss_pct", 2.0))
+    CEX_TAKE_PROFIT_PCT = float(CEX_STRATEGY_CONFIG.get("take_profit_pct", 5.0))
+    CEX_SLIPPAGE_BPS = int(CEX_STRATEGY_CONFIG.get("max_slippage_bps", 5))
+    ONCHAIN_STOP_LOSS_PCT = float(ONCHAIN_STRATEGY_CONFIG.get("stop_loss_pct", 30.0))
+    ONCHAIN_TAKE_PROFIT_PCT = float(ONCHAIN_STRATEGY_CONFIG.get("take_profit_pct", 100.0))
+    ONCHAIN_SLIPPAGE_BPS = int(ONCHAIN_STRATEGY_CONFIG.get("max_slippage_bps", 1500))
+
+
+def _rebuild_strategy_configs_from_overlay() -> None:
+    global CEX_STRATEGY_CONFIG, ONCHAIN_STRATEGY_CONFIG
+    CEX_STRATEGY_CONFIG = dict(_DEFAULT_CEX_STRATEGY)
+    ONCHAIN_STRATEGY_CONFIG = dict(_DEFAULT_ONCHAIN_STRATEGY)
+    if _EVOLVER_OVERLAY_FILE.is_file():
+        try:
+            raw = json.loads(_EVOLVER_OVERLAY_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                if raw.get("cex"):
+                    CEX_STRATEGY_CONFIG = {**CEX_STRATEGY_CONFIG, **dict(raw["cex"])}
+                if raw.get("onchain"):
+                    ONCHAIN_STRATEGY_CONFIG = {
+                        **ONCHAIN_STRATEGY_CONFIG,
+                        **dict(raw["onchain"]),
+                    }
+        except Exception:
+            pass
+    _refresh_scalar_strategy_exports()
+
+
+def persist_evolver_strategy_overlay(
+    cex: dict[str, Any] | None = None,
+    onchain: dict[str, Any] | None = None,
+    *,
+    merge_existing: bool = True,
+) -> None:
+    """
+    Persist evolver-chosen parameters (JSON beside config.py). Reload in-process via
+    ``apply_evolver_overlay_now()``.
+    """
+    prev: dict[str, Any] = {"cex": {}, "onchain": {}}
+    if merge_existing and _EVOLVER_OVERLAY_FILE.is_file():
+        try:
+            raw = json.loads(_EVOLVER_OVERLAY_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                prev["cex"] = dict(raw.get("cex") or {})
+                prev["onchain"] = dict(raw.get("onchain") or {})
+        except Exception:
+            pass
+    if cex:
+        prev["cex"].update({k: v for k, v in cex.items() if v is not None})
+    if onchain:
+        prev["onchain"].update({k: v for k, v in onchain.items() if v is not None})
+    tmp = str(_EVOLVER_OVERLAY_FILE) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(prev, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, str(_EVOLVER_OVERLAY_FILE))
+
+
+def apply_evolver_overlay_now() -> None:
+    """Reload overlay from disk into module-level strategy dicts (same process)."""
+    _rebuild_strategy_configs_from_overlay()
+
+
+_rebuild_strategy_configs_from_overlay()
+
+
+def adjust_strategy_params_for_volatility(sol_atr_pct: float, *, low_vol_threshold: float = 1.5) -> dict[str, Any]:
+    """
+    Heuristic: SOL realized vol (ATR% proxy) low → tighten CEX stop-loss, loosen on-chain slippage.
+    Returns suggested patches for persist_evolver_strategy_overlay.
+    """
+    cex: dict[str, Any] = {}
+    onchain: dict[str, Any] = {}
+    if sol_atr_pct < low_vol_threshold:
+        cex["stop_loss_pct"] = max(0.5, float(CEX_STRATEGY_CONFIG.get("stop_loss_pct", 2.0)) * 0.85)
+        cap = int(ONCHAIN_STRATEGY_CONFIG.get("max_slippage_bps", 1500))
+        onchain["max_slippage_bps"] = min(2500, int(cap * 1.08))
+    return {"cex": cex, "onchain": onchain}
 
 # ─── Never-Die Fallback Chain ────────────────────────────────────────────────
 # The bot should NEVER stop responding. When one provider fails, switch to next.

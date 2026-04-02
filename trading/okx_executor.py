@@ -647,6 +647,13 @@ class OKXExecutor:
             self.state.equity = self.state.cash + sum(p.size for p in self.state.positions.values())
             self.state.peak_equity = max(self.state.peak_equity, self.state.equity)
             self.state.last_trade_time[symbol] = time.time()
+            if self.state.mode == "paper":
+                try:
+                    import live_trader as _lt
+
+                    _lt.apply_paper_cex_pnl(float(pnl_usd))
+                except Exception:
+                    log.debug("live_trader.apply_paper_cex_pnl skipped", exc_info=True)
             return {
                 "ok": True, "price": price,
                 "pnl_pct": round(pnl_pct, 2),

@@ -1148,6 +1148,134 @@ class InfiniteEvolver:
             except _asyncio.CancelledError:
                 return
 
+    async def _maybe_run_daily_dual_lanes(self) -> None:
+        """
+        每日一次双轨思辨：lane_cex（OKX OHLCV 参数扫描）+ lane_onchain（流动性代理），
+        并将启发式补丁写入 ``config`` 覆盖层 + 同步链上风控到 ``_live_config.json``。
+        """
+        from datetime import date
+
+        mark = BASE / "_dual_lane_last_date.txt"
+        today = date.today().isoformat()
+        try:
+            if mark.is_file() and mark.read_text(encoding="utf-8").strip() == today:
+                return
+        except OSError:
+            pass
+
+        n_cex = 0
+        best_sh = -999.0
+        try:
+            import copy
+            import random
+
+            from evolver_firewall import get_heavy_async_timeout_sec
+
+            from trading.backtest_engine import quick_backtest
+            from trading.okx_executor import AgentState
+
+            base_params = AgentState().strategy_params.copy()
+            bounds = {
+                "ma5_len": (3, 8), "ma8_len": (6, 12), "ema21_len": (15, 30),
+                "ma55_len": (40, 80), "bb_length": (15, 30), "bb_std_dev": (1.5, 4.0),
+                "dist_ma5_ma8": (0.5, 3.0), "dist_ma8_ema21": (1.0, 5.0),
+                "dist_ema21_ma55": (2.0, 8.0), "slope_len": (2, 5),
+                "slope_threshold": (0.02, 0.5), "atr_period": (7, 21),
+            }
+            int_params = {
+                "ma5_len", "ma8_len", "ema21_len", "ma55_len", "bb_length",
+                "atr_period", "slope_len",
+            }
+            _fuse = get_heavy_async_timeout_sec()
+            for _ in range(18):
+                mutant = copy.deepcopy(base_params)
+                keys = random.sample(list(bounds.keys()), min(3, len(bounds)))
+                for key in keys:
+                    lo, hi = bounds[key]
+                    if key in int_params:
+                        mutant[key] = random.randint(int(lo), int(hi))
+                    else:
+                        mutant[key] = round(random.uniform(lo, hi), 3)
+                if mutant["ma5_len"] >= mutant["ma8_len"]:
+                    mutant["ma8_len"] = mutant["ma5_len"] + 2
+                if mutant["ma8_len"] >= mutant["ema21_len"]:
+                    mutant["ema21_len"] = mutant["ma8_len"] + 5
+                if mutant["ema21_len"] >= mutant["ma55_len"]:
+                    mutant["ma55_len"] = mutant["ema21_len"] + 15
+                try:
+                    r = await _asyncio.wait_for(quick_backtest(mutant), timeout=_fuse)
+                    n_cex += 1
+                    sh = float(r.get("sharpe", -999))
+                    if sh > best_sh:
+                        best_sh = sh
+                except Exception:
+                    continue
+        except Exception as e:
+            log.warning("lane_cex: %s", e)
+
+        on_meta: dict = {"ok": False, "samples": 0}
+        try:
+            from trading.alpha_evolver import alpha_evolver
+
+            on_meta = await alpha_evolver.probe_onchain_liquidity_lane()
+        except Exception as e:
+            on_meta = {"ok": False, "samples": 0, "error": str(e)[:120]}
+        n_on = int(on_meta.get("samples") or 0)
+
+        atr_proxy = float(on_meta.get("range_pct_20bar") or 99.0)
+        try:
+            import config as bot_cfg
+
+            patches = bot_cfg.adjust_strategy_params_for_volatility(atr_proxy)
+            bot_cfg.persist_evolver_strategy_overlay(
+                cex=patches["cex"], onchain=patches["onchain"]
+            )
+            bot_cfg.apply_evolver_overlay_now()
+        except Exception as e:
+            log.warning("dual_lane persist overlay: %s", e)
+
+        try:
+            import config as _bcfg
+            import live_trader as lt
+
+            oc = _bcfg.ONCHAIN_STRATEGY_CONFIG
+            cfg = lt._load_config()
+            cfg["take_profit_pct"] = float(oc.get("take_profit_pct", cfg.get("take_profit_pct", 8)))
+            cfg["stop_loss_pct"] = float(oc.get("stop_loss_pct", cfg.get("stop_loss_pct", 3)))
+            cfg["max_slippage_bps"] = int(oc.get("max_slippage_bps", cfg.get("max_slippage_bps", 100)))
+            cx = _bcfg.CEX_STRATEGY_CONFIG
+            cfg["cex_take_profit_pct"] = float(cx.get("take_profit_pct", cfg.get("cex_take_profit_pct", 5)))
+            cfg["cex_stop_loss_pct"] = float(cx.get("stop_loss_pct", cfg.get("cex_stop_loss_pct", 2)))
+            cfg["cex_max_slippage_bps"] = int(cx.get("max_slippage_bps", cfg.get("cex_max_slippage_bps", 5)))
+            lt._save_config(cfg)
+        except Exception as e:
+            log.debug("dual_lane sync live_trader: %s", e)
+
+        reco_cex = "CEX 组建议：低波动下可略收紧止损以保护换手收益。"
+        if best_sh < 0.5:
+            reco_cex = "CEX 组建议：降低止盈线或放宽入场过滤以提高胜率。"
+        reco_on = "DEX 组建议：维持较宽滑点以防薄池踩空。"
+        try:
+            if float(on_meta.get("liquidity_stress_proxy") or 1.0) > 1.35:
+                reco_on = "DEX 组建议：流动性压力偏高，适度增加滑点预算。"
+        except (TypeError, ValueError):
+            pass
+
+        msg = (
+            f"长官，今日回测了约 {n_cex} 组 CEX 参数（OKX OHLCV）与 {n_on} 组链上波动代理样本。\n"
+            f"{reco_cex}\n{reco_on}"
+        )
+        log.info("%s", msg.replace("\n", " "))
+        if self._send:
+            try:
+                await self._send(msg[:3900])
+            except Exception:
+                pass
+        try:
+            mark.write_text(today, encoding="utf-8")
+        except OSError:
+            pass
+
     async def _run_offline_tune_strategy_grid(self) -> None:
         """``TUNE_STRATEGY``: cartesian grid on V6 params, offline OHLCV only, max CPU cores."""
         import dataclasses
@@ -1240,6 +1368,10 @@ class InfiniteEvolver:
 
     async def _sweep(self) -> None:
         """One full hypothesis → codegen OR V6-params-mutation → real backtest → promote cycle."""
+        try:
+            await self._maybe_run_daily_dual_lanes()
+        except Exception as e:
+            log.warning("daily dual lanes: %s", e)
         if consume_tune_strategy_directive():
             try:
                 await self._run_offline_tune_strategy_grid()

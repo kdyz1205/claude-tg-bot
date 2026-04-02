@@ -27,6 +27,13 @@ class OnchainWalletSkill(BaseSkill):
             logger.warning("sk_onchain_wallet: secure_wallet missing: %s", e)
             return {"ok": False, "error": "secure_wallet_import", "summary_text": ""}
 
+        if sw.wallet_exists():
+            print(
+                "[Cspace] 钥匙加载成功，正在尝试连接 Solana Mainnet...",
+                flush=True,
+            )
+            logger.info("[Cspace] 钥匙加载成功，正在尝试连接 Solana Mainnet...")
+
         from onchain_wallet_panel import build_wallet_snapshot, format_wallet_message
 
         chain_cache = payload.get("chain_cache")

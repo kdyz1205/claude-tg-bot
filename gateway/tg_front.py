@@ -24,6 +24,17 @@ except ImportError:  # pragma: no cover
 
 GW_CB = "gw"
 
+_SNAPSHOT_STALE_SEC = 60.0
+
+
+def _snapshot_stale(snap: dict | None) -> bool:
+    """快照仅作展示：过期则禁止把缓存数字当成新鲜行情（显示「扫描中」）。"""
+    if not snap:
+        return True
+    age = float(snap.get("age_sec") or 0)
+    upd = float(snap.get("updated_at") or 0)
+    return age > _SNAPSHOT_STALE_SEC or upd <= 0.0
+
 
 def escape_v2(text: str) -> str:
     if not text:
@@ -121,6 +132,8 @@ def _hedge_section_plain(snap: dict, open_live: list[dict]) -> str:
 
 def _okx_net_usd_plain(snap: dict) -> tuple[str, float]:
     """Label line + numeric USD (0 if unknown). OKX row only — no wallet fallback."""
+    if _snapshot_stale(snap):
+        return "扫描中…", 0.0
     ox = snap.get("okx") or {}
     if not ox.get("ok"):
         return "— （未接入 API 或未返回）", 0.0
@@ -131,15 +144,20 @@ def _okx_net_usd_plain(snap: dict) -> tuple[str, float]:
 
 
 def _chain_net_plain(snap: dict) -> tuple[str, float]:
+    if _snapshot_stale(snap):
+        return "扫描中…", 0.0
     w = snap.get("wallet") or {}
     sp = float(snap.get("sol_price") or 0)
     if not w.get("ok"):
+        hint = (w.get("rpc_message") or w.get("cspace_detail") or "").strip()
+        if hint:
+            return f"— （{hint}）", 0.0
         return "— （链上钱包未配置或未读）", 0.0
     sb = float(w.get("sol_bal", 0) or 0)
     if sp > 0:
         usd = sb * sp
-        return f"${usd:,.2f}（≈ {sb:.4f} SOL）", usd
-    return f"{sb:.4f} SOL（暂无 SOL/USD 价）", 0.0
+        return f"${usd:,.2f}（≈ {sb:.4f} SOL · 链上轨道）", usd
+    return f"{sb:.4f} SOL（暂无 SOL/USD 价 · 链上轨道）", 0.0
 
 
 def render_dashboard_plain_text(
@@ -190,6 +208,12 @@ def render_dashboard_plain_text(
     )
     if err:
         body += "\n引擎: " + str(err)[:280]
+    osync = snap.get("onchain_sync") if isinstance(snap.get("onchain_sync"), dict) else {}
+    st = "扫描中" if _snapshot_stale(snap) else str(osync.get("status") or "扫描中")
+    body += f"\n📡 链上同步状态: {st}"
+    det = "" if _snapshot_stale(snap) else (osync.get("detail") or "").strip()
+    if det:
+        body += f" ({det[:120]})"
     if len(body) > 4000:
         body = body[:3990] + "\n…"
     return body
@@ -243,6 +267,11 @@ def render_dashboard_text(
     cache_note = e(
         f"快照: OKX={'OK' if ox_age else '—'} · 内存缓存 {_num_v2(float(snap.get('age_sec') or 0), '.0f')}s 前"
     )
+    osync = snap.get("onchain_sync") if isinstance(snap.get("onchain_sync"), dict) else {}
+    sync_st = e("扫描中" if _snapshot_stale(snap) else str(osync.get("status") or "扫描中"))
+    sync_tail = ""
+    if not _snapshot_stale(snap) and (osync.get("detail") or "").strip():
+        sync_tail = "\n_" + e(str(osync.get("detail") or "")[:100]) + "_"
     body = (
         f"🤖 *奇点量化终端* \\| \\[{health_e}\\]\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -251,7 +280,8 @@ def render_dashboard_text(
         f"📈 *{e('今日盈亏')}:* {d_sign}\\${du_v} \\({emoji_pnl} {p_sign}{pct_v}%\\)\n"
         f"_{e('模式')}: {mode_note}_ · _{cache_note}_{wallet_hint}\n"
         f"{_hedge_section_v2(snap, open_live)}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 *{e('链上同步状态')}:* {sync_st}{sync_tail}"
     )
     if len(body) > 4000:
         body = body[:3990] + "\n…"
@@ -453,21 +483,35 @@ def render_risk_settings_text(mode: str, cfg: dict) -> str:
     m = (mode or "paper").lower()
     mts = cfg.get("max_trade_sol")
     mts_s = "null" if mts is None else f"{float(mts):.4f}"
+    cex_tp = float(cfg.get("cex_take_profit_pct", 0) or 0)
+    cex_sl = float(cfg.get("cex_stop_loss_pct", 0) or 0)
+    cex_bps = int(cfg.get("cex_max_slippage_bps", 0) or 0)
+    on_sl = float(cfg.get("stop_loss_pct", 0) or 0)
+    on_tp = float(cfg.get("take_profit_pct", 0) or 0)
+    on_bps = int(cfg.get("max_slippage_bps", 0) or 0)
+    p_cex = float(cfg.get("paper_cex_usdt", 0) or 0)
+    p_dex = float(cfg.get("paper_dex_sol", 0) or 0)
     lines = [
         f"🛡️ *{e('风险控制')}* \\(_{e('模式')}: {e('实盘' if m == 'live' else '模拟')}_\\)",
         "━━━━━━━━━━━━━━━━━━━━━━",
         "",
-        f"1\\. *MaxTradeSize* \\(`max\\_trade\\_pct`\\): `{float(cfg.get('max_trade_pct', 0) or 0):.1f}`% {e('单笔相对权益上限')}",
-        f"2\\. *MaxTradeSOL* \\(`max\\_trade\\_sol`\\): `{mts_s}` {e('SOL 硬顶，null=仅按百分比')}",
-        f"3\\. *MaxPosition* \\(`max\\_positions`\\): `{int(cfg.get('max_positions', 0) or 0)}` {e('最大并发仓位')}",
-        f"4\\. *DailyLossLimit* \\(`daily\\_loss\\_limit\\_pct`\\): `{float(cfg.get('daily_loss_limit_pct', 0) or 0):.1f}`%",
-        f"5\\. *StopLoss* \\(`stop\\_loss\\_pct`\\): `{float(cfg.get('stop_loss_pct', 0) or 0):.1f}`%",
-        f"6\\. *TakeProfit* \\(`take\\_profit\\_pct`\\): `{float(cfg.get('take_profit_pct', 0) or 0):.1f}`%",
-        f"7\\. *PairVolatilityThreshold* \\(`max\\_slippage\\_bps`\\): `{int(cfg.get('max_slippage_bps', 0) or 0)}` bps",
-        f"8\\. *MinLiquidity* \\(`min\\_liquidity\\_usd`\\): `{float(cfg.get('min_liquidity_usd', 0) or 0):,.0f}` USD",
-        f"9\\. *neural\\_execution:* `{'on' if cfg.get('neural_execution_enabled') else 'off'}`",
+        f"*{e('CEX 轨道')}* \\({e('OKX / 低滑点')}\\)",
+        f"· TP `{cex_tp:.1f}`% · SL `{cex_sl:.1f}`% · {e('滑点')} `{cex_bps}` bps",
+        f"· {e('模拟 USDT 权益')}: `{p_cex:,.2f}`",
         "",
-        "_" + e("点下方 ✏️ 回复数字即可热更新；无需改代码。") + "_",
+        f"*{e('链上轨道')}* \\({e('Jupiter / DEX 狙击')}\\)",
+        f"· {e('SOL 侧 TP')} `{on_tp:.1f}`% · {e('SL')} `{on_sl:.1f}`% · {e('滑点')} `{on_bps}` bps",
+        f"· {e('模拟 SOL 权益')}: `{p_dex:.4f}`",
+        "",
+        f"1\\. *MaxTradeSize* \\(`max\\_trade\\_pct`\\): `{float(cfg.get('max_trade_pct', 0) or 0):.1f}`% {e('链上单笔上限')}",
+        f"2\\. *MaxTradeSOL* \\(`max\\_trade\\_sol`\\): `{mts_s}`",
+        f"3\\. *MaxPosition* \\(`max\\_positions`\\): `{int(cfg.get('max_positions', 0) or 0)}`",
+        f"4\\. *DailyLossLimit* \\(`daily\\_loss\\_limit\\_pct`\\): `{float(cfg.get('daily_loss_limit_pct', 0) or 0):.1f}`% {e('仅链上日损')}",
+        f"5\\. *MinLiquidity* \\(`min\\_liquidity\\_usd`\\): `{float(cfg.get('min_liquidity_usd', 0) or 0):,.0f}` USD",
+        f"6\\. *neural\\_execution:* `{'on' if cfg.get('neural_execution_enabled') else 'off'}`",
+        "",
+        "_" + e("CEX 面板仅显示 CEX 滑点（bps）；链上 15% 级滑点只在「链上轨道」出现。") + "_",
+        "_" + e("点下方 ✏️ 热更新对应轨道参数。") + "_",
     ]
     return "\n".join(lines)
 
@@ -478,6 +522,7 @@ def build_risk_settings_keyboard(mode: str) -> InlineKeyboardMarkup | None:
         return None
     m = (mode or "paper").lower()
     re = f"{GW_CB}:risk_edit"
+    rq = f"{GW_CB}:risk_q"
     return InlineKeyboardMarkup(
         [
             [
@@ -489,11 +534,11 @@ def build_risk_settings_keyboard(mode: str) -> InlineKeyboardMarkup | None:
                 InlineKeyboardButton("✏️ DailyLoss", callback_data=f"{re}:daily_loss_limit_pct"),
             ],
             [
-                InlineKeyboardButton("✏️ SL%", callback_data=f"{re}:stop_loss_pct"),
-                InlineKeyboardButton("✏️ TP%", callback_data=f"{re}:take_profit_pct"),
+                InlineKeyboardButton("✏️ 止损 %（选轨道）", callback_data=f"{rq}:sl"),
+                InlineKeyboardButton("✏️ 止盈 %（选轨道）", callback_data=f"{rq}:tp"),
             ],
             [
-                InlineKeyboardButton("✏️ Slip bps", callback_data=f"{re}:max_slippage_bps"),
+                InlineKeyboardButton("✏️ 滑点 bps（选轨道）", callback_data=f"{rq}:slip"),
                 InlineKeyboardButton("✏️ MinLiq", callback_data=f"{re}:min_liquidity_usd"),
             ],
             [

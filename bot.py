@@ -330,6 +330,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             user_err = "网络超时（Telegram API）。请再点一次或稍后重试。"
         elif context.error and isinstance(context.error, NetworkError):
             user_err = "网络异常。请稍后重试。"
+        elif context.error and type(context.error).__name__ in (
+            "ConnectError",
+            "ReadTimeout",
+            "WriteTimeout",
+            "PoolTimeout",
+        ):
+            user_err = "网络不稳定（连接/读超时）。请稍后重试。"
     except ImportError:
         pass
 
@@ -353,30 +360,34 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     try:
-        await proactive_agent.push_error("unhandled", err_str, source="error_handler")
-    except Exception:
+        await asyncio.wait_for(
+            proactive_agent.push_error("unhandled", err_str, source="error_handler"),
+            timeout=3.0,
+        )
+    except (asyncio.TimeoutError, Exception):
         pass
 
-    # Try to notify the user
+    # Try to notify the user（限时，避免错误处理本身拖死事件循环）
     if isinstance(update, Update) and update.effective_chat:
-        try:
-            err_msg = user_err
-            # Strip chars that may cause Telegram to reject the message
-            import re as _re
-            err_msg = _re.sub(r'[<>&\x00-\x08\x0b\x0c\x0e-\x1f]', '', err_msg)
+        import re as _re
+
+        err_msg = _re.sub(r'[<>&\x00-\x08\x0b\x0c\x0e-\x1f]', '', user_err)
+
+        async def _send_err(body: str) -> None:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"⚠️ 内部错误: {err_msg}\n\n发消息继续使用。",
+                text=body[:900],
             )
-        except Exception:
-            # Last resort: send without the error details
+
+        for body in (
+            f"⚠️ 内部错误: {err_msg}\n\n发消息继续使用。",
+            "⚠️ 内部错误。发消息继续使用。",
+        ):
             try:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="⚠️ 内部错误。发消息继续使用。",
-                )
-            except Exception:
-                pass
+                await asyncio.wait_for(_send_err(body), timeout=18.0)
+                break
+            except (asyncio.TimeoutError, Exception):
+                continue
 
 
 # --- Safe send helpers -----------------------------------------------------------
@@ -2937,50 +2948,76 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Trading Dashboard Panel ──────────────────────────────────────────
 
-async def _build_trading_dashboard() -> str:
-    """Build the rich trading dashboard text."""
-    lines = []
+def build_trading_dashboard_text() -> str:
+    """
+    Rich /trade panel — **RAM only** via ``portfolio_snapshot.get_local_cache()``.
+    No HTTP, no RPC, no ``refresh_positions`` — stale cache shows 「扫描中」.
+    """
+    lines: list[str] = []
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("      💹 TRADING DASHBOARD")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
 
-    # ── Portfolio Summary ──
-    if _dex_available:
-        try:
-            now_ts = time.time()
-            if not hasattr(_build_trading_dashboard, "_dex_ts") or now_ts - _build_trading_dashboard._dex_ts > 15:
-                await asyncio.wait_for(_dex.refresh_positions(), timeout=3)
-                _build_trading_dashboard._dex_ts = now_ts
-        except Exception:
-            pass
-        positions = _dex.get_open_positions() if _dex else []
-        total_invested = sum(p.get("amount_sol", 0) for p in positions)
-        total_value = sum(p.get("current_value_sol", p.get("amount_sol", 0)) for p in positions)
-        total_pnl = total_value - total_invested
-        pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
-        pnl_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+    try:
+        from trading.portfolio_snapshot import get_local_cache
 
-        lines.append("\U0001f4bc PORTFOLIO")
-        lines.append(f"  Positions: {len(positions)}")
-        lines.append(f"  Invested:  {total_invested:.3f} SOL")
-        lines.append(f"  Value:     {total_value:.3f} SOL")
-        lines.append(f"  {pnl_emoji} PnL:      {total_pnl:+.4f} SOL ({pnl_pct:+.1f}%)")
+        snap = get_local_cache()
+    except Exception:
+        snap = {}
+    age = float(snap.get("age_sec") or 0)
+    updated = float(snap.get("updated_at") or 0)
+    stale = age > 60.0 or updated <= 0.0
+    if stale:
+        lines.append("⏳ 行情/快照：扫描中…（后台同步，不阻塞面板）")
         lines.append("")
 
-        # Top positions (up to 3)
-        if positions:
-            sorted_pos = sorted(positions, key=lambda p: abs(p.get("pnl_pct", 0)), reverse=True)[:3]
-            for p in sorted_pos:
-                pnl = p.get("pnl_pct", 0)
-                em = "\U0001f7e2" if pnl > 0 else "\U0001f534" if pnl < 0 else "\u26aa"
-                lines.append(f"  {em} {p.get('symbol', '?'):8s} {pnl:+6.1f}%  {p.get('amount_sol', 0):.2f} SOL")
+    # ── Portfolio Summary（内存 DEX 腿，绝不 await 网络）──
+    dex_b = snap.get("dex") if isinstance(snap, dict) else {}
+    if not isinstance(dex_b, dict):
+        dex_b = {}
+    positions = list(dex_b.get("positions") or [])
+    if _dex_available and not positions and not stale:
+        try:
+            positions = _dex.get_open_positions() if _dex else []
+        except Exception:
+            positions = []
+
+    if _dex_available:
+        lines.append("\U0001f4bc PORTFOLIO")
+        if stale and not positions:
+            lines.append("  扫描中…")
             lines.append("")
+        else:
+            total_invested = sum(float(p.get("amount_sol", 0) or 0) for p in positions)
+            total_value = sum(
+                float(p.get("current_value_sol", p.get("amount_sol", 0)) or 0) for p in positions
+            )
+            total_pnl = total_value - total_invested
+            pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+            pnl_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+            lines.append(f"  Positions: {len(positions)}")
+            lines.append(f"  Invested:  {total_invested:.3f} SOL")
+            lines.append(f"  Value:     {total_value:.3f} SOL")
+            lines.append(f"  {pnl_emoji} PnL:      {total_pnl:+.4f} SOL ({pnl_pct:+.1f}%)")
+            lines.append("")
+            if positions:
+                sorted_pos = sorted(
+                    positions, key=lambda p: abs(float(p.get("pnl_pct", 0) or 0)), reverse=True
+                )[:3]
+                for p in sorted_pos:
+                    pnl = float(p.get("pnl_pct", 0) or 0)
+                    em = "\U0001f7e2" if pnl > 0 else "\U0001f534" if pnl < 0 else "\u26aa"
+                    sym = str(p.get("symbol", "?"))[:8]
+                    lines.append(
+                        f"  {em} {sym:<8s} {pnl:+6.1f}%  {float(p.get('amount_sol', 0) or 0):.2f} SOL"
+                    )
+                lines.append("")
     else:
         lines.append("\U0001f4bc PORTFOLIO: DEX module not loaded")
         lines.append("")
 
-    # ── Trading Stats ──
+    # ── Trading Stats（本地统计文件，无网络）──
     if _dex_available:
         stats = _dex.get_trade_stats()
         lines.append("\U0001f4c8 STATS")
@@ -2997,7 +3034,7 @@ async def _build_trading_dashboard() -> str:
         try:
             cfg = _paper_trader._load_config()
             enabled = cfg.get("enabled", False)
-            trades = _paper_trader._load_trades()[-1000:]  # cap trades loaded
+            trades = _paper_trader._load_trades()[-1000:]
             open_trades = [t for t in trades if t.get("status") == "open"]
             closed_trades = [t for t in trades if t.get("status") == "closed"]
             paper_status = "\U0001f7e2 ON" if enabled else "\U0001f534 OFF"
@@ -3005,8 +3042,8 @@ async def _build_trading_dashboard() -> str:
             lines.append(f"  Open: {len(open_trades)}  |  Closed: {len(closed_trades)}")
             if closed_trades:
                 wins = sum(1 for t in closed_trades if (t.get("pnl_pct") or 0) > 0)
-                wr = wins / len(closed_trades) * 100 if closed_trades else 0
-                lines.append(f"  Win Rate: {wr:.0f}%  ({wins}W/{len(closed_trades)-wins}L)")
+                wrp = wins / len(closed_trades) * 100 if closed_trades else 0
+                lines.append(f"  Win Rate: {wrp:.0f}%  ({wins}W/{len(closed_trades)-wins}L)")
         except Exception:
             lines.append("\U0001f4dd PAPER MODE: Error loading")
     else:
@@ -3023,40 +3060,19 @@ async def _build_trading_dashboard() -> str:
         lines.append(f"  TP: +{s.get('default_tp_pct', 100)}%  |  SL: {s.get('default_sl_pct', -30)}%")
         lines.append("")
 
-    # ── OKX Quick Glance (cached, fast) ──
-    try:
-        import httpx
-        now_ts = time.time()
-        if not hasattr(_build_trading_dashboard, "_cache") or now_ts - _build_trading_dashboard._cache_ts > 30:
-            async with httpx.AsyncClient(timeout=3) as client:
-                tasks = [
-                    client.get(f"https://www.okx.com/api/v5/market/ticker?instId={s}-USDT-SWAP")
-                    for s in ("BTC", "ETH", "SOL")
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-            okx_cache = {}
-            for s, r in zip(("BTC", "ETH", "SOL"), results):
-                if isinstance(r, Exception):
-                    continue
-                d = r.json().get("data", [{}])[0]
-                if d:
-                    okx_cache[s] = d
-            _build_trading_dashboard._cache = okx_cache
-            _build_trading_dashboard._cache_ts = now_ts
+    # ── OKX / SOL 一览：仅内存快照（与后台 refresh_once 同源）──
+    lines.append("\U0001f30d OKX / SOL（内存）")
+    if stale:
+        lines.append("  扫描中…")
+    else:
+        sp = float(snap.get("sol_price") or 0) if isinstance(snap, dict) else 0.0
+        sc = float(snap.get("sol_chg_pct") or 0) if isinstance(snap, dict) else 0.0
+        if sp > 0:
+            em = "\U0001f7e2" if sc >= 0 else "\U0001f534"
+            lines.append(f"  {em} SOL    ${sp:>10,.2f}  {sc:+.1f}% (Ticker 快照)")
         else:
-            okx_cache = _build_trading_dashboard._cache
-
-        lines.append("\U0001f30d OKX MARKET")
-        for m, t in okx_cache.items():
-            price = float(t.get("last", 0) or 0)
-            open24 = float(t.get("open24h", 0) or 0)
-            chg = ((price - open24) / open24 * 100) if abs(open24) > 1e-8 else 0
-            em = "\U0001f7e2" if chg >= 0 else "\U0001f534"
-            lines.append(f"  {em} {m:<5} ${price:>10,.2f}  {chg:+.1f}%")
-        lines.append("")
-    except Exception:
-        lines.append("\U0001f30d OKX: offline")
-        lines.append("")
+            lines.append("  扫描中…")
+    lines.append("")
 
     # ── Live Trading Status ──
     if _live_available:
@@ -3069,6 +3085,11 @@ async def _build_trading_dashboard() -> str:
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     return "\n".join(lines)
+
+
+async def _build_trading_dashboard() -> str:
+    """Backward-compatible async wrapper — **no network** (see ``build_trading_dashboard_text``)."""
+    return build_trading_dashboard_text()
 
 
 def _build_dashboard_keyboard() -> InlineKeyboardMarkup:
@@ -3140,14 +3161,7 @@ async def trade_dashboard_command(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
 
-    try:
-        text = await asyncio.wait_for(_build_trading_dashboard(), timeout=75.0)
-    except asyncio.TimeoutError:
-        await _safe_reply(
-            update.message,
-            "⏳ /trade 面板数据拉取超时（75s）。请稍后重试，或先开 /chain 点刷新。",
-        )
-        return
+    text = build_trading_dashboard_text()
     if okx_lines:
         text = "\n".join(okx_lines) + "\n\n" + text
     kb = _build_dashboard_keyboard()
@@ -8492,11 +8506,14 @@ def create_application():
     # Jarvis 主控台 inline 按钮（gw:*）— 唯一保留的 Callback 表面
     import re as _re_gw
 
-    from gateway.telegram_bot import handle_gateway_callback
+    from gateway.telegram_bot import handle_gateway_callback, handle_mcap_watch_callback
     from gateway.tg_front import GW_CB
 
     _gw_cb_pat = _re_gw.compile(rf"^{_re_gw.escape(GW_CB)}:")
     app.add_handler(CallbackQueryHandler(handle_gateway_callback, pattern=_gw_cb_pat))
+
+    _mcapw_pat = _re_gw.compile(r"^mcapw:")
+    app.add_handler(CallbackQueryHandler(handle_mcap_watch_callback, pattern=_mcapw_pat))
 
     # Safety confirmations (kill / trade ack) — still required for inline 确认键
     app.add_handler(CallbackQueryHandler(handle_confirmation_callback))
@@ -8533,6 +8550,17 @@ def create_application():
             logger.info("Bot commands registered with Telegram")
         except Exception as e:
             logger.error(f"Failed to set bot commands: {e}")
+
+        # 预热 SessionStore，避免首条 /start 在 SessionStore() 读盘时卡住体感「无响应」
+        try:
+            from gateway.telegram_bot import _session_store_async
+
+            await asyncio.wait_for(_session_store_async(application), timeout=20.0)
+            logger.info("gateway SessionStore warmed (telegram_panel_mode / sessions)")
+        except asyncio.TimeoutError:
+            logger.warning("SessionStore warm timed out (continuing; /start may be slower once)")
+        except Exception as e:
+            logger.warning("SessionStore warm skipped: %s", e)
 
         # One-time auto prompt (disk marker + bot_data — survives Phoenix retries in same process)
         if _boot_ui_startup_already_notified():
@@ -9133,10 +9161,44 @@ def create_application():
         except Exception as e:
             logger.warning(f"ContinuousLearner failed to start: {e}")
 
+        # DexScreener 市值提醒轮询（自然语言登记见 gateway.try_mcap_watch_user_message）
+        try:
+            from trading.mcap_watch import configure_stop_event, run_watch_loop
+
+            _mcw_ev = asyncio.Event()
+            configure_stop_event(_mcw_ev)
+            _mcw_task = asyncio.create_task(
+                run_watch_loop(application.bot),
+                name="mcap_watch_loop",
+            )
+            _track_task(application.bot_data, _mcw_task)
+            application.bot_data["_mcap_watch_task"] = _mcw_task
+            logger.info("mcap_watch: background loop started")
+        except Exception as e:
+            logger.warning("mcap_watch loop not started: %s", e)
+
     app.post_init = post_init
 
     async def post_shutdown(application):
         """Clean up resources on bot shutdown."""
+        try:
+            from trading.mcap_watch import stop_watch_loop
+
+            stop_watch_loop()
+            _mcw_t = application.bot_data.pop("_mcap_watch_task", None)
+            if _mcw_t is not None and not _mcw_t.done():
+                try:
+                    await asyncio.wait_for(_mcw_t, timeout=8.0)
+                except asyncio.TimeoutError:
+                    _mcw_t.cancel()
+                    try:
+                        await _mcw_t
+                    except asyncio.CancelledError:
+                        pass
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            logger.debug("mcap_watch shutdown", exc_info=True)
         # Close Playwright browsers to prevent orphan processes
         try:
             from web_ai import close_web_ai

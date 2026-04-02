@@ -18,6 +18,10 @@ Telegram Gateway — PTB：极简全自动看板。
   ``JARVIS_QUEUE_SESSION_COMMANDER`` — 造物任务成功且产生文件变更时，向 ``jarvis_pending_commands`` 入队。
   ``JARVIS_QUEUE_DRAIN_SESSION`` — 入队项显式 ``drain_session``（覆盖路由表）。
   ``SESSION_COMMANDER_JARVIS_FILTER_SESSION`` — 本机 watch 只消费 resolve 后等于该名的任务（并行 drain）。
+  市值提醒：自然语言或 ``/mcap_watches`` / ``/mcap_unwatch N``；轮询 ``MCAP_WATCH_POLL_SEC``（默认 90）、
+  穿越滞回 ``MCAP_WATCH_HYSTERESIS``（默认 0.985）；数据为 DexScreener 参考市值。
+  Jarvis 闲聊默认最长等待见 ``JARVIS_CHAT_MAX_SEC``（默认 180）；单轮硬上限仍可用 ``JARVIS_CHAT_TIMEOUT_SEC`` 覆盖。
+  若出现「网络异常」类推送：多为 Telegram 瞬断或双进程抢 polling（勿同时开两个 ``run.py``）。
   ``AUTO_RESEARCH_LAB`` / ``AUTO_RESEARCH_LAB_ROTATE`` / ``AUTO_RESEARCH_SKIP_IDLE`` — 见 ``python auto_research.py``。
   配置总线：写 ``session_commander_config.json`` 的 ``active_skills``；God 引擎用 **watchdog** 监听 JSON 并 ``reload_skills``。
   斜杠：``/start`` 网关面板；``/trade``、``/t`` 委托 ``bot.trade_dashboard_command``。
@@ -33,11 +37,13 @@ import asyncio
 import logging
 import os
 import re
+import secrets
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from telegram import ForceReply, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
@@ -84,7 +90,19 @@ from tracker.session_store import SessionStore
 logger = logging.getLogger(__name__)
 
 _GW_RISK_PENDING_KEY = "_gw_risk_pending"
+_MCW_PENDING_KEY = "_mcap_watch_pending"
 _GW_EVOLVER = None  # infinite_evolver.InfiniteEvolver | None
+
+# 止盈/止损/滑点必须先选轨道（gw:risk_q → gw:risk_apply），禁止 CEX 误用链上土狗参数
+_RISK_BRANCH_KINDS: frozenset[str] = frozenset({"sl", "tp", "slip"})
+_RISK_APPLY_MAP: dict[tuple[str, str], str] = {
+    ("cex", "sl"): "cex_stop_loss_pct",
+    ("onchain", "sl"): "stop_loss_pct",
+    ("cex", "tp"): "cex_take_profit_pct",
+    ("onchain", "tp"): "take_profit_pct",
+    ("cex", "slip"): "cex_max_slippage_bps",
+    ("onchain", "slip"): "max_slippage_bps",
+}
 
 _RISK_EDIT_KEYS: frozenset[str] = frozenset(
     {
@@ -92,9 +110,6 @@ _RISK_EDIT_KEYS: frozenset[str] = frozenset(
         "max_trade_sol",
         "max_positions",
         "daily_loss_limit_pct",
-        "stop_loss_pct",
-        "take_profit_pct",
-        "max_slippage_bps",
         "min_liquidity_usd",
     }
 )
@@ -368,17 +383,28 @@ def _gw_risk_pending_map(application: Application) -> dict[int, str]:
     return application.bot_data.setdefault(_GW_RISK_PENDING_KEY, {})  # type: ignore[return-value]
 
 
+def _mcw_pending_map(application: Application) -> dict[int, Any]:
+    return application.bot_data.setdefault(_MCW_PENDING_KEY, {})  # type: ignore[return-value]
+
+
 def _risk_param_label(key: str) -> str:
     return {
         "max_trade_pct": "MaxTradeSize (%)",
         "max_trade_sol": "MaxTradeSOL",
         "max_positions": "MaxPosition",
         "daily_loss_limit_pct": "DailyLossLimit (%)",
-        "stop_loss_pct": "StopLoss (%)",
-        "take_profit_pct": "TakeProfit (%)",
-        "max_slippage_bps": "PairVolatility / 滑点 (bps)",
+        "stop_loss_pct": "链上 StopLoss (%)",
+        "take_profit_pct": "链上 TakeProfit (%)",
+        "max_slippage_bps": "链上 滑点 (bps)",
         "min_liquidity_usd": "MinLiquidity (USD)",
+        "cex_take_profit_pct": "CEX TakeProfit (%)",
+        "cex_stop_loss_pct": "CEX StopLoss (%)",
+        "cex_max_slippage_bps": "CEX 滑点 (bps)",
     }.get(key, key)
+
+
+def _risk_branch_cn(kind: str) -> str:
+    return {"sl": "止损 %", "tp": "止盈 %", "slip": "滑点 bps"}.get(kind, kind)
 
 
 def _format_cfg_value(cfg: dict, key: str) -> str:
@@ -427,7 +453,13 @@ def _coerce_risk_value(key: str, raw: str) -> tuple[bool, Any, str]:
 
     if key == "max_trade_pct" and not (0 < v <= 200):
         return False, None, "max_trade_pct 建议 (0, 200]"
-    if key in ("daily_loss_limit_pct", "stop_loss_pct", "take_profit_pct") and not (0 < v <= 100):
+    if key in (
+        "daily_loss_limit_pct",
+        "stop_loss_pct",
+        "take_profit_pct",
+        "cex_stop_loss_pct",
+        "cex_take_profit_pct",
+    ) and not (0 < v <= 100):
         return False, None, "百分比建议 (0, 100]"
     if key == "min_liquidity_usd" and v < 0:
         return False, None, "不能为负"
@@ -582,6 +614,10 @@ def _parse_gw_callback(data: str) -> tuple[str, str] | None:
         return ("manual_onchain", "")
     if rest.startswith("risk_edit:"):
         return ("risk_edit", rest[10:])
+    if rest.startswith("risk_q:"):
+        return ("risk_q", rest[7:])
+    if rest.startswith("risk_apply:"):
+        return ("risk_apply", rest[11:])
     if rest.startswith("lab:"):
         return ("lab", rest[4:])
     if rest == "risk":
@@ -622,7 +658,7 @@ def _dashboard_sync() -> tuple[dict, dict, dict]:
 
     import live_trader
 
-    snap = portfolio_snapshot.get_snapshot_for_gateway()
+    snap = portfolio_snapshot.get_local_cache()
     st = trade_scheduler.read_scheduler_state()
     stats = live_trader.get_live_stats()
     return snap, st, stats
@@ -841,6 +877,77 @@ async def _gw_panel_work(
                 pass
             await _edit_main_dashboard(bot, chat_id, message_id)
             return
+        if action == "risk_q":
+            if arg not in _RISK_BRANCH_KINDS:
+                await _edit_main_dashboard(bot, chat_id, message_id)
+                return
+            hint = _risk_branch_cn(arg)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "您要修改 [🏦 OKX（CEX）] 还是 [🔗 链上（DEX）] 的参数？\n"
+                        f"项目：{hint}\n"
+                        "点选下方按钮后继续。"
+                    )[:4096],
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "🏦 OKX（CEX 轨道）",
+                                    callback_data=f"{GW_CB}:risk_apply:cex:{arg}",
+                                ),
+                                InlineKeyboardButton(
+                                    "🔗 链上（DEX 轨道）",
+                                    callback_data=f"{GW_CB}:risk_apply:onchain:{arg}",
+                                ),
+                            ],
+                            [
+                                InlineKeyboardButton(
+                                    "↩️ 返回风控页",
+                                    callback_data=f"{GW_CB}:risk",
+                                ),
+                            ],
+                        ]
+                    ),
+                )
+            except Exception:
+                logger.exception("risk_q pick_track message")
+            return
+        if action == "risk_apply":
+            parts = arg.split(":", 1)
+            if len(parts) != 2:
+                await _edit_main_dashboard(bot, chat_id, message_id)
+                return
+            track, kind = parts[0].strip().lower(), parts[1].strip().lower()
+            fkey = _RISK_APPLY_MAP.get((track, kind))
+            if not fkey:
+                await _edit_main_dashboard(bot, chat_id, message_id)
+                return
+            import live_trader
+
+            cfg = live_trader._load_config()
+            cur = _format_cfg_value(cfg, fkey)
+            _gw_risk_pending_map(application)[uid] = fkey
+            label = _risk_param_label(fkey)
+            track_cn = "OKX·CEX" if track == "cex" else "链上·DEX"
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✏️ [{track_cn}] 调整 {label}（`{fkey}`）\n"
+                        f"当前值：{cur}\n"
+                        "请直接回复一条消息，内容为纯数值。"
+                        "\n· max_trade_sol 可回复 none 清空硬顶"
+                    )[:4096],
+                    reply_markup=ForceReply(
+                        selective=True,
+                        input_field_placeholder="输入数值",
+                    ),
+                )
+            except Exception:
+                logger.exception("risk_apply force_reply")
+            return
         if action == "risk_edit":
             if arg not in _RISK_EDIT_KEYS:
                 await _edit_main_dashboard(bot, chat_id, message_id)
@@ -966,13 +1073,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⛔ 未授权使用此网关机器人。")
         return
     mark_gateway_user_activity()
-    store = await _session_store_async(context.application)
-    USER_MODE = _normalize_mode(store.get_trade_mode(uid))
+    try:
+        store = await _session_store_async(context.application)
+        USER_MODE = _normalize_mode(store.get_trade_mode(uid))
+    except Exception:
+        logger.exception("cmd_start: session store failed; keeping USER_MODE=%s", USER_MODE)
+
     snap, st, stats = _dashboard_sync_fast_path()
     text = render_dashboard_text(USER_MODE, snap, st, stats)
     plain = render_dashboard_plain_text(USER_MODE, snap, st, stats)
     kb = build_dashboard_keyboard(bool(st.get("active")))
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             await update.message.reply_text(
                 text,
@@ -986,8 +1097,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 attempt + 1,
                 e,
             )
-            if attempt == 0:
-                await asyncio.sleep(0.75)
+            if attempt < 2:
+                await asyncio.sleep(0.8 + attempt * 0.7)
                 continue
             break
         except BadRequest as e:
@@ -996,7 +1107,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             logger.exception("cmd_start: unexpected error sending MarkdownV2 panel")
             break
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             await update.message.reply_text(plain[:4096], reply_markup=kb)
             return
@@ -1006,8 +1117,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 attempt + 1,
                 e,
             )
-            if attempt == 0:
-                await asyncio.sleep(0.75)
+            if attempt < 2:
+                await asyncio.sleep(0.8 + attempt * 0.7)
                 continue
             break
         except Exception as e:
@@ -1021,6 +1132,188 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except Exception:
         logger.exception("cmd_start: minimal stub send failed")
+
+
+async def try_mcap_watch_user_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int
+) -> bool:
+    """
+    市值提醒：列表 / 取消 / 自然语言登记（DexScreener 轮询）。
+    返回 True 表示已处理，勿再进 Jarvis。
+    """
+    if not update.message:
+        return False
+    from trading import mcap_watch as mw
+
+    text = (update.message.text or "").strip()
+    if not text:
+        return False
+
+    if mw.parse_list_intent(text):
+        await update.message.reply_text(mw.format_watch_list(uid))
+        return True
+
+    cancel_i = mw.parse_cancel_intent(text)
+    if cancel_i is not None:
+        ok = mw.delete_watch_by_user_index(uid, cancel_i)
+        await update.message.reply_text(
+            "✅ 已取消该序号提醒。"
+            if ok
+            else "❌ 序号无效，发送 /mcap_watches 查看列表。"
+        )
+        return True
+
+    parsed = mw.parse_mcap_watch_intent(text)
+    if not parsed:
+        return False
+
+    try:
+        candidates = await mw.dexscreener_search_candidates(parsed.token_query)
+    except Exception as e:
+        logger.exception("mcap_watch dex search")
+        await update.message.reply_text(f"❌ 搜索异常：{e!s}"[:800])
+        return True
+
+    if not candidates:
+        await update.message.reply_text(
+            f"未在 DexScreener 找到「{parsed.token_query}」。请发合约地址 / mint 再试。"
+        )
+        return True
+
+    chat_id = update.effective_chat.id
+    if len(candidates) == 1:
+        c0 = candidates[0]
+        if mw.has_active_duplicate(
+            uid, str(c0["address"]), parsed.threshold_usd, parsed.direction
+        ):
+            await update.message.reply_text(
+                "ℹ️ 已有相同标的、方向与阈值的未触发提醒，无需重复添加。"
+            )
+            return True
+        rec = mw.make_watch_record(
+            user_id=uid, chat_id=chat_id, candidate=c0, parsed=parsed
+        )
+        mw.add_watch(rec)
+        d_zh = "≥" if parsed.direction == "above" else "≤"
+        cur = float(c0.get("mcap") or 0)
+        await update.message.reply_text(
+            "✅ 已登记市值提醒\n"
+            f"{c0.get('symbol', '?')} ({c0.get('chain', '')}) 当前参考市值 "
+            f"${mw.format_usd_compact(cur)} USD\n"
+            f"触发条件：{d_zh} ${mw.format_usd_compact(parsed.threshold_usd)} USD\n"
+            f"后台约每 {int(mw.POLL_INTERVAL_SEC)}s 轮询 DexScreener（可设 MCAP_WATCH_POLL_SEC）。\n"
+            "/mcap_watches 查看列表。"
+        )
+        return True
+
+    nonce = secrets.token_hex(4)
+    _mcw_pending_map(context.application)[uid] = {
+        "nonce": nonce,
+        "expires": time.time() + mw.PENDING_TTL_SEC,
+        "candidates": candidates[:5],
+        "parsed": {
+            "token_query": parsed.token_query,
+            "threshold_usd": parsed.threshold_usd,
+            "direction": parsed.direction,
+            "anchor_usd": parsed.anchor_usd,
+            "source_text": parsed.source_text,
+        },
+    }
+    buttons: list[list[InlineKeyboardButton]] = []
+    for i, c in enumerate(candidates[:5]):
+        liq = float(c.get("liquidity_usd") or 0)
+        liq_k = max(liq / 1e3, 0.001)
+        sym = str(c.get("symbol") or "?")[:10]
+        ch = str(c.get("chain") or "")[:8]
+        label = f"{i + 1}.{sym} {ch} L${liq_k:.0f}k"
+        if len(label) > 56:
+            label = label[:53] + "…"
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=f"mcapw:p:{nonce}:{i}")]
+        )
+    cond = "市值突破" if parsed.direction == "above" else "市值跌破"
+    await update.message.reply_text(
+        f"找到多个池子，请点选对应代币（按流动性排序）：\n"
+        f"条件：{cond} ${mw.format_usd_compact(parsed.threshold_usd)} USD",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return True
+
+
+async def handle_mcap_watch_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.from_user or not query.message:
+        return
+    uid = query.from_user.id
+    if not _is_authorized(uid):
+        await query.answer("⛔ 未授权", show_alert=True)
+        return
+    data = query.data
+    if not data.startswith("mcapw:p:"):
+        return
+    parts = data.split(":")
+    if len(parts) != 4:
+        await query.answer()
+        return
+    _, _, nonce, idx_s = parts
+    try:
+        idx = int(idx_s)
+    except ValueError:
+        await query.answer()
+        return
+
+    from trading import mcap_watch as mw
+
+    pmap = _mcw_pending_map(context.application)
+    pend = pmap.get(uid)
+    if not pend or pend.get("nonce") != nonce:
+        await query.answer("已失效，请重发提醒指令", show_alert=True)
+        return
+    if time.time() > float(pend.get("expires") or 0):
+        pmap.pop(uid, None)
+        await query.answer("选择已超时", show_alert=True)
+        return
+
+    cands = pend.get("candidates") or []
+    if idx < 0 or idx >= len(cands):
+        await query.answer("无效选项", show_alert=True)
+        return
+
+    cand = cands[idx]
+    parsed = mw.parsed_watch_from_dict(pend.get("parsed") or {})
+    chat_id = query.message.chat_id
+
+    if mw.has_active_duplicate(
+        uid, str(cand["address"]), parsed.threshold_usd, parsed.direction
+    ):
+        pmap.pop(uid, None)
+        await query.answer("已有相同提醒", show_alert=True)
+        try:
+            await query.edit_message_text("ℹ️ 已有相同标的、方向与阈值的未触发提醒。")
+        except BadRequest:
+            pass
+        return
+
+    rec = mw.make_watch_record(
+        user_id=uid, chat_id=chat_id, candidate=cand, parsed=parsed
+    )
+    mw.add_watch(rec)
+    pmap.pop(uid, None)
+    await query.answer("已登记")
+    d_zh = "≥" if parsed.direction == "above" else "≤"
+    cur = float(cand.get("mcap") or 0)
+    try:
+        await query.edit_message_text(
+            "✅ 已登记市值提醒\n"
+            f"{cand.get('symbol', '?')} ({cand.get('chain', '')}) 当前参考市值 "
+            f"${mw.format_usd_compact(cur)} USD\n"
+            f"触发条件：{d_zh} ${mw.format_usd_compact(parsed.threshold_usd)} USD\n"
+            f"约每 {int(mw.POLL_INTERVAL_SEC)}s 轮询；/mcap_watches 查看列表。"
+        )
+    except BadRequest:
+        pass
 
 
 async def _jarvis_semantic_route(
@@ -1081,6 +1374,9 @@ async def _jarvis_semantic_route(
                     "引擎账本未作任何修改。"
                 )
             await update.message.reply_text(fail)
+        return
+
+    if await try_mcap_watch_user_message(update, context, uid):
         return
 
     from gateway.jarvis_semantic import (

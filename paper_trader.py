@@ -28,6 +28,21 @@ CONFIG_FILE = os.path.join(BASE_DIR, "_paper_config.json")
 _sol_price_cache = {"price": 83.0, "ts": 0}
 
 
+def _paper_ledger_hook(trade: dict, pnl_sol: float) -> None:
+    """CEX 纸面盈亏进 USDT 账本；链上纸面进 SOL 账本（与 live_trader 隔离）。"""
+    try:
+        import live_trader as lt
+    except Exception:
+        return
+    sym = str(trade.get("symbol") or "")
+    is_cex = "-USDT" in sym or trade.get("signal_source") == "pro_strategy"
+    if is_cex:
+        sp = _get_sol_price()
+        lt.apply_paper_cex_pnl(float(pnl_sol) * float(sp))
+    else:
+        lt.apply_paper_dex_pnl(float(pnl_sol))
+
+
 def _get_sol_price() -> float:
     """Get SOL/USD price with 60s cache."""
     import time as _t
@@ -294,6 +309,7 @@ def close_paper_trade(trade_id: str, current_price: float, reason: str) -> Optio
 
             _save_trades(trades)
             logger.info(f"Paper trade closed: {t['symbol']} | {reason} | PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)")
+            _paper_ledger_hook(t, pnl_sol)
             return t
     return None
 
@@ -397,15 +413,29 @@ async def check_and_update_trades(send_func=None) -> dict:
         trade["peak_pnl_pct"] = max(trade.get("peak_pnl_pct", 0), pnl_pct)
         trade["trough_pnl_pct"] = min(trade.get("trough_pnl_pct", 0), pnl_pct)
 
-        # Check take profit — CEX futures use tighter stops (FinAgent paper)
+        # Check take profit — CEX 轨道用 live_trader 的 cex_*；链上用 ONCHAIN 合并参数
         is_cex = "-USDT" in trade.get("symbol", "") or trade.get("signal_source") == "pro_strategy"
         if is_cex:
-            tp = cfg.get("cex_tp_pct", 4.0)   # 4% TP for futures
-            sl = cfg.get("cex_sl_pct", -2.0)   # 2% SL for futures (R:R = 2:1)
+            try:
+                import live_trader as lt
+
+                lcfg = lt._load_config()
+                tp = float(lcfg.get("cex_take_profit_pct", 5.0))
+                sl = -abs(float(lcfg.get("cex_stop_loss_pct", 2.0)))
+            except Exception:
+                tp = float(cfg.get("cex_tp_pct", 5.0))
+                sl = float(cfg.get("cex_sl_pct", -2.0))
             ts = cfg.get("cex_time_stop_hours", 48)
         else:
-            tp = cfg.get("take_profit_pct", 50.0)
-            sl = cfg.get("stop_loss_pct", -20.0)
+            try:
+                import live_trader as lt
+
+                lcfg = lt._load_config()
+                tp = float(lcfg.get("take_profit_pct", 50.0))
+                sl = -abs(float(lcfg.get("stop_loss_pct", 20.0)))
+            except Exception:
+                tp = cfg.get("take_profit_pct", 50.0)
+                sl = cfg.get("stop_loss_pct", -20.0)
             ts = cfg.get("time_stop_hours", 24)
 
         close_reason = None
@@ -435,6 +465,7 @@ async def check_and_update_trades(send_func=None) -> dict:
             trade["pnl_sol"] = round(pnl_sol, 4)
             closed_count += 1
             logger.info(f"Paper trade closed: {trade.get('symbol', '?')} | {close_reason} | PnL: {pnl_pct:+.1f}%")
+            _paper_ledger_hook(trade, pnl_sol)
 
             # Send notification
             if send_func:

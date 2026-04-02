@@ -36,6 +36,8 @@ _data: dict[str, Any] = {
         "sol_bal": 0.0,
         "token_count": 0,
         "tokens": [],
+        "rpc_message": "",
+        "cspace_detail": "",
     },
     "okx": {
         "ok": False,
@@ -56,9 +58,69 @@ _data: dict[str, Any] = {
         "recent": [],
     },
     "last_error": "",
+    "onchain_sync": {"status": "扫描中", "detail": ""},
 }
 
 _redis_warned = False
+_cspace_boot_logged = False
+
+
+async def _fetch_onchain_balance() -> dict[str, Any]:
+    """
+    Cspace / Solana 主网余额读取。RPC 失败或超时不得静默为 0 — 返回文案供面板展示。
+    """
+    out: dict[str, Any] = {
+        "ok": False,
+        "sol_bal": 0.0,
+        "pubkey_short": "",
+        "token_count": 0,
+        "tokens": [],
+        "rpc_message": "",
+        "cspace_detail": "",
+    }
+    try:
+        import secure_wallet as wallet
+    except ImportError:
+        out["rpc_message"] = "钱包模块不可用"
+        out["cspace_detail"] = out["rpc_message"]
+        return out
+
+    if not wallet.wallet_exists():
+        out["rpc_message"] = "钱包未配置"
+        return out
+
+    pk = ""
+    try:
+        pk = wallet.get_public_key() or ""
+    except Exception:
+        pk = ""
+    short_pk = f"{pk[:6]}…{pk[-4:]}" if len(pk) > 12 else (pk or "")
+    out["pubkey_short"] = short_pk
+
+    bal: float | None = None
+    try:
+        raw = await asyncio.wait_for(wallet.get_sol_balance(), timeout=6.0)
+        bal = float(raw) if raw is not None else None
+    except asyncio.TimeoutError:
+        out["rpc_message"] = "❌ RPC 超时"
+        out["cspace_detail"] = "Cspace：Solana RPC 超时"
+        logger.warning("portfolio_snapshot Cspace: SOL balance RPC timeout")
+        return out
+    except Exception as e:
+        msg = str(e)[:160]
+        out["rpc_message"] = f"❌ {msg}"
+        out["cspace_detail"] = f"Cspace 读取异常: {msg}"
+        logger.warning("portfolio_snapshot Cspace balance error: %s", e)
+        return out
+
+    if bal is None:
+        out["rpc_message"] = "❌ 余额不可用"
+        out["cspace_detail"] = "Cspace：节点未返回余额"
+        return out
+
+    out["ok"] = True
+    out["sol_bal"] = max(0.0, bal)
+    return out
 
 
 def _empty() -> dict[str, Any]:
@@ -72,6 +134,8 @@ def _empty() -> dict[str, Any]:
             "sol_bal": 0.0,
             "token_count": 0,
             "tokens": [],
+            "rpc_message": "",
+            "cspace_detail": "",
         },
         "okx": {
             "ok": False,
@@ -92,7 +156,41 @@ def _empty() -> dict[str, Any]:
             "recent": [],
         },
         "last_error": "",
+        "onchain_sync": {"status": "扫描中", "detail": ""},
     }
+
+
+def _compute_onchain_sync(snap: dict[str, Any], err_parts: list[str]) -> dict[str, Any]:
+    """主看板「链上同步状态」行：正常 / 超时 / 密钥错误 / 扫描中 / 未配置。"""
+    w = snap.get("wallet") if isinstance(snap.get("wallet"), dict) else {}
+    now = time.time()
+    updated = float(snap.get("updated_at") or 0)
+    age = max(0.0, now - updated) if updated > 0 else 999.0
+    rm = (w.get("rpc_message") or "").strip()
+    werr = (w.get("error") or "").strip()
+    detail = rm or werr
+
+    if w.get("ok"):
+        return {"status": "正常", "detail": ""}
+
+    if age > 60.0 or updated <= 0:
+        return {"status": "扫描中", "detail": detail or "等待后台轮询"}
+
+    if "超时" in rm or "timeout" in rm.lower():
+        return {"status": "超时", "detail": detail or "RPC 超时"}
+
+    if any(x in detail for x in ("403", "401", "Invalid")) or any(
+        x in detail.lower() for x in ("key", "secret", "decrypt", "password", "fernet")
+    ):
+        return {"status": "密钥错误", "detail": detail[:200]}
+
+    if "未配置" in rm or (not (w.get("pubkey_short") or "").strip() and not rm):
+        return {"status": "未配置", "detail": detail or "链上钱包未配置"}
+
+    if err_parts:
+        return {"status": "异常", "detail": ("; ".join(err_parts))[:220]}
+
+    return {"status": "异常", "detail": detail or "链上读取失败"}
 
 
 def _repo_root() -> Path:
@@ -482,6 +580,8 @@ async def refresh_once() -> None:
     if err_parts:
         snap["last_error"] = "; ".join(err_parts)[:500]
 
+    snap["onchain_sync"] = _compute_onchain_sync(snap, err_parts)
+
     with _lock:
         _data = snap
 
@@ -490,9 +590,66 @@ async def refresh_once() -> None:
 
 async def run_background_loop(interval_sec: float = 10.0) -> None:
     """Never returns; swallow errors and keep polling."""
+    global _cspace_boot_logged
     while True:
         try:
+            if not _cspace_boot_logged:
+                _cspace_boot_logged = True
+                try:
+                    import config as _cfg
+
+                    _addr = getattr(_cfg, "ONCHAIN_WALLET_ADDRESS", "") or ""
+                    _pk_dbg = ""
+                    try:
+                        import secure_wallet as _sw0
+
+                        if _sw0.wallet_exists():
+                            _pk_dbg = (_sw0.get_public_key() or "")[:12]
+                    except Exception as e:
+                        _pk_dbg = f"(pubkey_err:{e!s})"[:40]
+                    print(
+                        f"DEBUG: Loading keys from config... ONCHAIN_WALLET_ADDRESS={_addr!r} "
+                        f"secure_wallet_pubkey_prefix={_pk_dbg!r}",
+                        flush=True,
+                    )
+                    logger.info(
+                        "DEBUG: ONCHAIN_WALLET_ADDRESS=%r secure_wallet_prefix=%r",
+                        _addr,
+                        _pk_dbg,
+                    )
+                except Exception as e:
+                    logger.warning("DEBUG config wallet banner: %s", e)
+                try:
+                    import secure_wallet as _sw
+
+                    if _sw.wallet_exists():
+                        print(
+                            "[Cspace] 钥匙加载成功，正在尝试连接 Solana Mainnet...",
+                            flush=True,
+                        )
+                        logger.info(
+                            "[Cspace] 钥匙加载成功，正在尝试连接 Solana Mainnet..."
+                        )
+                    else:
+                        print(
+                            "[Cspace] 未检测到本地钱包文件，跳过主网余额轮询。",
+                            flush=True,
+                        )
+                except Exception as e:
+                    logger.debug("Cspace boot banner: %s", e)
             await refresh_once()
         except Exception as e:
-            logger.warning("portfolio_snapshot refresh_once: %s", e)
+            logger.exception("portfolio_snapshot refresh_once failed: %s", e)
+            err_msg = str(e)[:500]
+            try:
+                with _lock:
+                    _data["last_error"] = err_msg
+                    o = _data.get("onchain_sync")
+                    if not isinstance(o, dict):
+                        o = {}
+                    o["status"] = "异常"
+                    o["detail"] = err_msg
+                    _data["onchain_sync"] = o
+            except Exception:
+                logger.exception("portfolio_snapshot: failed to persist refresh error to snapshot")
         await asyncio.sleep(max(3.0, float(interval_sec)))

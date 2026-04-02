@@ -46,6 +46,7 @@ test_screenshot.jpg
 *.ogg
 *.bak
 *.ps1
+!start_bot.ps1
 
 # Runtime state files (bot generates these)
 _boot_ui_startup_prompt.sent
@@ -53,6 +54,7 @@ _paper_trades.json
 _pro_strategy_perf.json
 _dex_positions.json
 _dex_settings.json
+trading/_mcap_watches.json
 _onchain_alerted.json
 _vital_signs.json
 _watcher_state.json

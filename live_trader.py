@@ -19,6 +19,25 @@ import dex_trader
 logger = logging.getLogger(__name__)
 
 
+def _strategy_defaults_from_bot_config() -> dict:
+    """Merge dual-track defaults from ``config`` into live JSON keys."""
+    out: dict = {}
+    try:
+        import config as _cfg
+
+        oc = getattr(_cfg, "ONCHAIN_STRATEGY_CONFIG", None) or {}
+        out["take_profit_pct"] = float(oc.get("take_profit_pct", 8.0))
+        out["stop_loss_pct"] = float(oc.get("stop_loss_pct", 3.0))
+        out["max_slippage_bps"] = int(oc.get("max_slippage_bps", 100))
+        cx = getattr(_cfg, "CEX_STRATEGY_CONFIG", None) or {}
+        out["cex_take_profit_pct"] = float(cx.get("take_profit_pct", 5.0))
+        out["cex_stop_loss_pct"] = float(cx.get("stop_loss_pct", 2.0))
+        out["cex_max_slippage_bps"] = int(cx.get("max_slippage_bps", 5))
+    except Exception:
+        pass
+    return out
+
+
 def _httpx_response_json(resp: httpx.Response):
     try:
         return resp.json()
@@ -107,12 +126,40 @@ DEFAULT_LIVE_CONFIG = {
     "kelly_max_equity_fraction": 0.35,
     "kelly_signal_priors": {},
     "kelly_default_win_p": None,
+    # CEX 轨道（OKX / 模拟盘 USDT 账本，与链上 SOL 隔离）
+    "cex_take_profit_pct": 5.0,
+    "cex_stop_loss_pct": 2.0,
+    "cex_max_slippage_bps": 5,
+    "paper_cex_usdt": 10_000.0,
+    "paper_dex_sol": 2.0,
+    "daily_pnl_cex_usdt": 0.0,
+    "daily_pnl_dex_sol": 0.0,
 }
+
+
+DEFAULT_LIVE_CONFIG.update(_strategy_defaults_from_bot_config())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG & PERSISTENCE
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _migrate_dual_ledger(cfg: dict) -> None:
+    """Ensure DEX/CEX paper ledgers are split; legacy daily_pnl_sol → DEX only."""
+    if "daily_pnl_dex_sol" not in cfg and "daily_pnl_sol" in cfg:
+        cfg["daily_pnl_dex_sol"] = float(cfg.get("daily_pnl_sol", 0) or 0)
+    elif cfg.get("daily_pnl_dex_sol") is None:
+        cfg["daily_pnl_dex_sol"] = float(cfg.get("daily_pnl_sol", 0) or 0)
+    if cfg.get("daily_pnl_cex_usdt") is None:
+        cfg["daily_pnl_cex_usdt"] = 0.0
+    if cfg.get("paper_cex_usdt") is None:
+        cfg["paper_cex_usdt"] = 10_000.0
+    if cfg.get("paper_dex_sol") is None:
+        try:
+            cfg["paper_dex_sol"] = float(cfg.get("starting_balance_sol", 0) or 0) or 2.0
+        except (TypeError, ValueError):
+            cfg["paper_dex_sol"] = 2.0
+
 
 def _load_config() -> dict:
     try:
@@ -121,10 +168,31 @@ def _load_config() -> dict:
                 saved = json.load(f)
                 cfg = DEFAULT_LIVE_CONFIG.copy()
                 cfg.update(saved)
+                _migrate_dual_ledger(cfg)
                 return cfg
     except Exception:
         pass
-    return DEFAULT_LIVE_CONFIG.copy()
+    cfg = DEFAULT_LIVE_CONFIG.copy()
+    _migrate_dual_ledger(cfg)
+    return cfg
+
+
+def apply_paper_cex_pnl(usd_delta: float) -> None:
+    """Record CEX 模拟盘盈亏（USDT）；不修改链上/ DEX SOL 字段。"""
+    cfg = _load_config()
+    cfg["daily_pnl_cex_usdt"] = float(cfg.get("daily_pnl_cex_usdt", 0) or 0) + float(usd_delta)
+    cfg["paper_cex_usdt"] = max(0.0, float(cfg.get("paper_cex_usdt", 10_000) or 10_000) + float(usd_delta))
+    _save_config(cfg)
+
+
+def apply_paper_dex_pnl(sol_delta: float) -> None:
+    """Record 链上轨道模拟盘盈亏（SOL）；不修改 CEX USDT 账本。"""
+    cfg = _load_config()
+    d = float(cfg.get("daily_pnl_dex_sol", cfg.get("daily_pnl_sol", 0)) or 0) + float(sol_delta)
+    cfg["daily_pnl_dex_sol"] = d
+    cfg["daily_pnl_sol"] = d
+    cfg["paper_dex_sol"] = max(0.0, float(cfg.get("paper_dex_sol", 0) or 0) + float(sol_delta))
+    _save_config(cfg)
 
 
 def _save_config(cfg: dict):
@@ -336,15 +404,18 @@ async def _check_risk_controls(
     """Pre-trade risk check. Returns (allowed, reason)."""
     import secure_wallet
 
-    # 1. Daily loss limit
+    # 1. Daily loss limit（仅链上/DEX 账本；CEX 模拟盈亏单独累计）
     now = time.time()
     if now - cfg.get("daily_reset_ts", 0) > 86400:
         cfg["daily_pnl_sol"] = 0
+        cfg["daily_pnl_dex_sol"] = 0
+        cfg["daily_pnl_cex_usdt"] = 0
         cfg["daily_reset_ts"] = now
         _save_config(cfg)
 
     starting = cfg.get("starting_balance_sol", 2.0)
-    daily_loss_pct = abs(min(cfg.get("daily_pnl_sol", 0), 0)) / max(starting, 0.01) * 100
+    daily_dex = float(cfg.get("daily_pnl_dex_sol", cfg.get("daily_pnl_sol", 0)) or 0)
+    daily_loss_pct = abs(min(daily_dex, 0)) / max(starting, 0.01) * 100
     if daily_loss_pct >= cfg.get("daily_loss_limit_pct", 10.0):
         return False, f"Daily loss limit hit ({daily_loss_pct:.1f}% >= {cfg['daily_loss_limit_pct']}%)"
 
@@ -639,8 +710,10 @@ async def sell_token(position_id: str, reason: str = "manual") -> Optional[dict]
 
     _save_positions(positions)
 
-    # Update daily PnL
-    cfg["daily_pnl_sol"] = cfg.get("daily_pnl_sol", 0) + pnl_sol
+    # Update daily PnL（链上轨道 only）
+    prev_d = float(cfg.get("daily_pnl_dex_sol", cfg.get("daily_pnl_sol", 0)) or 0)
+    cfg["daily_pnl_dex_sol"] = prev_d + pnl_sol
+    cfg["daily_pnl_sol"] = cfg["daily_pnl_dex_sol"]
     _save_config(cfg)
 
     try:
@@ -812,6 +885,7 @@ async def force_resync_ledger() -> dict:
         now = time.time()
         cfg["starting_balance_sol"] = round(bal_f, 9)
         cfg["daily_pnl_sol"] = 0.0
+        cfg["daily_pnl_dex_sol"] = 0.0
         cfg["daily_reset_ts"] = now
         cfg["ledger_stats_epoch_ts"] = now
         _save_config(cfg)

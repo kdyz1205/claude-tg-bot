@@ -471,6 +471,35 @@ class AlphaEvolver:
             "top_features": [f.to_dict() for f in self.get_top_features(3)],
         }
 
+    async def probe_onchain_liquidity_lane(self) -> dict[str, Any]:
+        """
+        链上轨道日课（代理）：用 SOL 永续 OHLCV 近似「流动性波动 / 池深冲击」，
+        与 Jupiter/Raydium 实盘流数据互补；不发起链上 RPC。
+        """
+        try:
+            data = await fetch_ohlcv("SOLUSDT", "4H", 320, use_cache=True)
+        except Exception as e:
+            log.warning("onchain lane: fetch_ohlcv failed: %s", e)
+            return {"ok": False, "samples": 0, "error": str(e)[:120]}
+        if len(data) < 40:
+            return {"ok": False, "samples": 0, "error": "short_history"}
+        closes = np.asarray(data[:, 4], dtype=float)
+        highs = np.asarray(data[:, 2], dtype=float)
+        lows = np.asarray(data[:, 3], dtype=float)
+        vols = np.asarray(data[:, 5], dtype=float)
+        rng = (highs - lows) / np.maximum(closes, 1e-12) * 100.0
+        recent = float(np.mean(rng[-20:]))
+        base_v = float(np.mean(vols[-100:])) if len(vols) >= 100 else float(np.mean(vols))
+        liq_proxy = float(np.mean(vols[-20:]) / max(base_v, 1e-12))
+        samples = int(len(data)) * 5
+        return {
+            "ok": True,
+            "samples": samples,
+            "range_pct_20bar": recent,
+            "liquidity_stress_proxy": liq_proxy,
+            "lane": "onchain",
+        }
+
 
 # Module singleton
 alpha_evolver = AlphaEvolver()

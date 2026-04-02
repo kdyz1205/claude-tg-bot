@@ -586,6 +586,12 @@ async def _browser_shadow_reply(system_prompt: str, user_text: str) -> tuple[str
 
 
 def _jarvis_chat_timeout_sec() -> float:
+    """
+    单轮 CHAT 等待主 CLI 的上限秒数。
+    显式设置 ``JARVIS_CHAT_TIMEOUT_SEC`` 时完全按该值（上限 600）。
+    否则在 ``API_REQUEST_TIMEOUT_SEC`` 基础上再受 ``JARVIS_CHAT_MAX_SEC``（默认 180）约束，
+    避免长时间「已读不回」像死机；需要更长可设 ``JARVIS_CHAT_TIMEOUT_SEC=600``。
+    """
     try:
         raw = (os.environ.get("JARVIS_CHAT_TIMEOUT_SEC") or "").strip()
         if raw:
@@ -595,9 +601,15 @@ def _jarvis_chat_timeout_sec() -> float:
     try:
         import config
 
-        return max(30.0, float(getattr(config, "API_REQUEST_TIMEOUT_SEC", 120.0)))
+        base = max(30.0, float(getattr(config, "API_REQUEST_TIMEOUT_SEC", 120.0)))
     except Exception:
-        return 120.0
+        base = 120.0
+    try:
+        cap = float((os.environ.get("JARVIS_CHAT_MAX_SEC") or "180").strip())
+    except (TypeError, ValueError):
+        cap = 180.0
+    cap = max(45.0, min(600.0, cap))
+    return max(15.0, min(cap, base))
 
 
 async def _jarvis_apply_cli_outcome(
