@@ -783,30 +783,81 @@ async def _run_engine_start(bot, chat_id: int, message_id: int) -> None:
 
 
 async def _run_engine_stop(bot, chat_id: int, message_id: int) -> None:
+    """
+    停止调度 + hard_kill。对 stop / OKX 平仓加超时，避免卡死导致按钮「按了没反应」。
+    """
     global _TS
-    try:
-        if _TS is not None and _TS.running:
-            await _TS.stop()
+    ok_n = 0
+    note = ""
+
+    async def _stop_scheduler() -> None:
+        if _TS is None or not _TS.running:
+            return
+        await _TS.stop()
+
+    async def _do_hard_kill() -> int:
         from trading.hard_risk_kill import hard_kill
         from trading.okx_executor import OKXExecutor
 
         ex = OKXExecutor()
         r = await hard_kill(ex, reason="telegram_gateway_emergency_stop")
-        ok_n = int(r.get("ok_closes", 0) or 0)
+        return int(r.get("ok_closes", 0) or 0)
+
+    try:
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"⏹ 已停止调度并请求 OKX 平仓，成功腿数：{ok_n}。",
+            await asyncio.wait_for(_stop_scheduler(), timeout=45.0)
+        except asyncio.TimeoutError:
+            logger.error("engine_stop: TradeScheduler.stop timed out (45s)")
+            note = "调度停止超时，已强制切断 running 标记。"
+            if _TS is not None:
+                _TS._running = False
+                if getattr(_TS, "_task", None):
+                    _TS._task.cancel()
+                    _TS._task = None
+                try:
+                    import trade_scheduler as _ts_mod
+
+                    st = dict(_ts_mod.read_scheduler_state())
+                    st["active"] = False
+                    _ts_mod._save_state(st)
+                except Exception:
+                    logger.debug("engine_stop: force scheduler state save failed", exc_info=True)
+
+        try:
+            ok_n = await asyncio.wait_for(_do_hard_kill(), timeout=90.0)
+        except asyncio.TimeoutError:
+            logger.error("engine_stop: hard_kill timed out (90s)")
+            note = (
+                (note + " " if note else "")
+                + "OKX 平仓请求超时，请登录交易所核对持仓。"
             )
+
+        try:
+            if note:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏹ 停止流程结束（部分步骤超时）\n{note}\n平仓成功腿数（已完成部分）：{ok_n}",
+                )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏹ 已停止调度并请求 OKX 平仓，成功腿数：{ok_n}。",
+                )
         except Exception:
             pass
     except Exception as e:
         logger.exception("engine_stop: %s", e)
         try:
-            await bot.send_message(chat_id=chat_id, text=f"❌ 停止/平仓异常：{e!s}"[:4096])
+            await bot.send_message(
+                chat_id=chat_id, text=f"❌ 停止/平仓异常：{e!s}"[:4096]
+            )
         except Exception:
             pass
-    await _edit_main_dashboard(bot, chat_id, message_id)
+    finally:
+        try:
+            await _edit_main_dashboard(bot, chat_id, message_id)
+        except Exception:
+            logger.exception("engine_stop: dashboard refresh failed")
 
 
 async def _run_refresh_assets(bot, chat_id: int, message_id: int) -> None:
@@ -1583,14 +1634,21 @@ async def handle_gateway_callback(
         await query.answer()
         return
 
-    await query.answer()
+    action, arg = parsed
+    # 长按后 Telegram 会等 answer；重型操作放后台前给即时反馈，避免像「按钮坏了」
+    if action == "engine_stop":
+        await query.answer("正在停止全引擎…", show_alert=False)
+    elif action == "engine_start":
+        await query.answer("正在启动…", show_alert=False)
+    elif action == "refresh":
+        await query.answer("已排队刷新快照…", show_alert=False)
+    else:
+        await query.answer()
 
     bot = context.bot
     application = context.application
     chat_id = query.message.chat_id
     message_id = query.message.message_id
-
-    action, arg = parsed
     _gw_schedule(
         application,
         _gw_panel_work(application, bot, chat_id, message_id, uid, action, arg),
